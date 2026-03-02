@@ -235,7 +235,7 @@ def process_and_respond(user_id):
         
         # Instancia o modelo com a instrução ATUALIZADA
         model = genai.GenerativeModel(
-            model_name='gemini-2.0-flash',
+            model_name='gemini-3-flash-preview',
             tools=[consultar_estoque_supabase],
             system_instruction=system_instruction_dinamica
         )
