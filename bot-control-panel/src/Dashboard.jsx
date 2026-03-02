@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { supabase } from './lib/supabase'
-import { Activity, Save, RefreshCw, Power, GripVertical, Plus, Trash2, ChevronDown, ChevronRight, Puzzle } from 'lucide-react'
+import { Activity, Save, RefreshCw, Power, GripVertical, Plus, Trash2, ChevronDown, ChevronRight, Puzzle, MessageSquare, ArrowLeft } from 'lucide-react'
 
 // ==================== HELPERS ====================
 
@@ -63,8 +63,8 @@ function PromptBlock({ block, index, onUpdate, onDelete, onDragStart, onDragOver
             onDragOver={(e) => onDragOver(e, index)}
             onDrop={(e) => onDrop(e, index)}
             className={`group bg-slate-900/70 border rounded-xl transition-all duration-200 ${isDragTarget
-                    ? 'border-purple-500 shadow-lg shadow-purple-500/10 scale-[1.01]'
-                    : 'border-slate-700/50 hover:border-slate-600'
+                ? 'border-purple-500 shadow-lg shadow-purple-500/10 scale-[1.01]'
+                : 'border-slate-700/50 hover:border-slate-600'
                 }`}
         >
             {/* HEADER */}
@@ -136,6 +136,7 @@ export default function Dashboard() {
     const [dragIndex, setDragIndex] = useState(null)
     const [dragOverIndex, setDragOverIndex] = useState(null)
     const [saveSuccess, setSaveSuccess] = useState(false)
+    const [selectedConversation, setSelectedConversation] = useState(null)
 
     useEffect(() => {
         fetchConfig()
@@ -144,7 +145,7 @@ export default function Dashboard() {
         const channel = supabase
             .channel('public:chat_history')
             .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_history' }, payload => {
-                setLogs(current => [payload.new, ...current].slice(0, 50))
+                setLogs(current => [payload.new, ...current].slice(0, 200))
             })
             .subscribe()
 
@@ -177,8 +178,46 @@ export default function Dashboard() {
             .from('chat_history')
             .select('*')
             .order('created_at', { ascending: false })
-            .limit(20)
+            .limit(200)
         if (data) setLogs(data)
+    }
+
+    function groupLogsToConversations(logs) {
+        const grouped = {}
+        for (const log of logs) {
+            const uid = log.user_id || 'desconhecido'
+            if (!grouped[uid]) grouped[uid] = []
+            grouped[uid].push(log)
+        }
+        return Object.entries(grouped)
+            .map(([userId, messages]) => ({
+                userId,
+                messages: messages.sort((a, b) => new Date(a.created_at) - new Date(b.created_at)),
+                lastMessage: messages[0],
+                messageCount: messages.length
+            }))
+            .sort((a, b) => new Date(b.lastMessage.created_at) - new Date(a.lastMessage.created_at))
+    }
+
+    const conversations = groupLogsToConversations(logs)
+    const activeConvo = conversations.find(c => c.userId === selectedConversation)
+
+    function formatPhone(userId) {
+        if (!userId || userId.length < 10) return userId
+        const clean = userId.replace(/\D/g, '')
+        if (clean.length === 13) return `+${clean.slice(0, 2)} (${clean.slice(2, 4)}) ${clean.slice(4, 9)}-${clean.slice(9)}`
+        if (clean.length === 12) return `+${clean.slice(0, 2)} (${clean.slice(2, 4)}) ${clean.slice(4, 8)}-${clean.slice(8)}`
+        return userId
+    }
+
+    function timeAgo(dateStr) {
+        const diff = Date.now() - new Date(dateStr).getTime()
+        const mins = Math.floor(diff / 60000)
+        if (mins < 1) return 'agora'
+        if (mins < 60) return `${mins}min`
+        const hours = Math.floor(mins / 60)
+        if (hours < 24) return `${hours}h`
+        return `${Math.floor(hours / 24)}d`
     }
 
     async function toggleBot() {
@@ -305,8 +344,8 @@ export default function Dashboard() {
                                     onClick={savePrompt}
                                     disabled={saving}
                                     className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all text-sm font-medium disabled:opacity-50 ${saveSuccess
-                                            ? 'bg-green-600 text-white'
-                                            : 'bg-purple-600 hover:bg-purple-500 text-white'
+                                        ? 'bg-green-600 text-white'
+                                        : 'bg-purple-600 hover:bg-purple-500 text-white'
                                         }`}
                                 >
                                     <Save size={16} />
@@ -345,31 +384,89 @@ export default function Dashboard() {
                         </div>
                     </div>
 
-                    {/* RIGHT — LOGS */}
+                    {/* RIGHT — CONVERSAS */}
                     <div className="space-y-4">
                         <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-5 backdrop-blur-md">
                             <div className="flex justify-between items-center mb-4">
-                                <h2 className="font-semibold text-lg text-blue-400">Live Logs</h2>
+                                {selectedConversation ? (
+                                    <button
+                                        onClick={() => setSelectedConversation(null)}
+                                        className="flex items-center gap-2 text-blue-400 hover:text-blue-300 transition-colors"
+                                    >
+                                        <ArrowLeft size={16} />
+                                        <span className="font-semibold text-lg">Voltar</span>
+                                    </button>
+                                ) : (
+                                    <div className="flex items-center gap-2">
+                                        <MessageSquare size={18} className="text-blue-400" />
+                                        <h2 className="font-semibold text-lg text-blue-400">Conversas</h2>
+                                        <span className="text-xs text-slate-500 ml-1">{conversations.length}</span>
+                                    </div>
+                                )}
                                 <button onClick={fetchLogs} className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 transition-colors">
                                     <RefreshCw size={16} />
                                 </button>
                             </div>
 
                             <div className="space-y-2 max-h-[600px] overflow-y-auto pr-1">
-                                {logs.length === 0 && <p className="text-slate-500 text-center py-10 text-sm">Nenhum log recente.</p>}
-
-                                {logs.map((log) => (
-                                    <div key={log.id} className="p-3 bg-slate-950/50 border border-slate-800 rounded-xl text-xs space-y-1.5">
-                                        <div className="flex justify-between items-start text-slate-500">
-                                            <span>{new Date(log.created_at).toLocaleTimeString()}</span>
-                                            <span className={`px-2 py-0.5 rounded-full ${log.role === 'user' ? 'bg-blue-500/10 text-blue-400' : 'bg-green-500/10 text-green-400'}`}>
-                                                {log.role}
-                                            </span>
-                                        </div>
-                                        <p className="text-slate-300 break-words leading-relaxed">{log.content}</p>
-                                        <div className="text-[10px] text-slate-600 text-right font-mono">ID: {log.user_id}</div>
-                                    </div>
-                                ))}
+                                {!selectedConversation ? (
+                                    /* LISTA DE CONVERSAS */
+                                    conversations.length === 0 ? (
+                                        <p className="text-slate-500 text-center py-10 text-sm">Nenhuma conversa recente.</p>
+                                    ) : (
+                                        conversations.map((convo) => (
+                                            <button
+                                                key={convo.userId}
+                                                onClick={() => setSelectedConversation(convo.userId)}
+                                                className="w-full text-left p-3 bg-slate-950/50 border border-slate-800 rounded-xl hover:border-blue-500/30 hover:bg-slate-900/80 transition-all group"
+                                            >
+                                                <div className="flex justify-between items-start mb-1.5">
+                                                    <span className="text-sm font-medium text-slate-200 group-hover:text-blue-300 transition-colors">
+                                                        {formatPhone(convo.userId)}
+                                                    </span>
+                                                    <span className="text-[10px] text-slate-500">
+                                                        {timeAgo(convo.lastMessage.created_at)}
+                                                    </span>
+                                                </div>
+                                                <p className="text-xs text-slate-400 truncate leading-relaxed">
+                                                    {convo.lastMessage.role === 'model' ? '🤖 ' : '👤 '}
+                                                    {convo.lastMessage.content?.slice(0, 80)}{convo.lastMessage.content?.length > 80 ? '...' : ''}
+                                                </p>
+                                                <div className="flex justify-between items-center mt-2">
+                                                    <span className="text-[10px] text-slate-600">
+                                                        {convo.messageCount} mensagem{convo.messageCount !== 1 ? 's' : ''}
+                                                    </span>
+                                                    <ChevronRight size={12} className="text-slate-600 group-hover:text-blue-400 transition-colors" />
+                                                </div>
+                                            </button>
+                                        ))
+                                    )
+                                ) : (
+                                    /* THREAD DA CONVERSA */
+                                    activeConvo ? (
+                                        <>
+                                            <div className="text-center mb-3">
+                                                <span className="text-xs text-slate-500 bg-slate-800/50 px-3 py-1 rounded-full">
+                                                    {formatPhone(activeConvo.userId)} · {activeConvo.messageCount} msgs
+                                                </span>
+                                            </div>
+                                            {activeConvo.messages.map((msg) => (
+                                                <div
+                                                    key={msg.id}
+                                                    className={`p-3 rounded-xl text-xs space-y-1 max-w-[90%] ${msg.role === 'user'
+                                                            ? 'bg-blue-500/10 border border-blue-500/20 ml-auto'
+                                                            : 'bg-slate-950/70 border border-slate-800 mr-auto'
+                                                        }`}
+                                                >
+                                                    <p className="text-slate-300 break-words leading-relaxed whitespace-pre-wrap">{msg.content}</p>
+                                                    <div className={`text-[10px] ${msg.role === 'user' ? 'text-blue-400/50 text-right' : 'text-slate-600'}`}>
+                                                        {new Date(msg.created_at).toLocaleTimeString()}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </>
+                                    ) : <p className="text-slate-500 text-center py-10 text-sm">Conversa não encontrada.</p>
+                                )}
                             </div>
                         </div>
                     </div>
