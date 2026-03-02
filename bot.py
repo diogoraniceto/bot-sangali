@@ -32,7 +32,7 @@ def get_embedding(text):
     """Gera o vetor semântico para a busca no banco."""
     try:
         result = genai.embed_content(
-            model="models/embedding-001",
+            model="models/gemini-embedding-001",
             content=text,
             task_type="retrieval_query"
         )
