@@ -1,7 +1,7 @@
 # bot_sangali
 
-# Bot Control Panel
-bot-control-panel/
+# Bot Control Panel (node_modules excluded)
+bot-control-panel/node_modules/
 
 # Environment variables
 .env
