@@ -1,0 +1,15 @@
+# bot_sangali
+
+# Bot Control Panel
+bot-control-panel/
+
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
