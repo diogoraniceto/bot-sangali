@@ -12,10 +12,10 @@ _env_path = os.path.join(_script_dir, "bot-control-panel", ".env")
 if os.path.exists(_env_path):
     load_dotenv(_env_path)
 
-# --- Logging mínimo para arquivo ---
-_log_file = os.path.join(_script_dir, "sync_erp.log")
-_handler = logging.FileHandler(_log_file)
-_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+# --- Logging para o console (Railway) ---
+import sys
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(asctime)s | %(name)s | %(message)s", datefmt="%H:%M:%S"))
 log = logging.getLogger("sync_erp")
 if not log.handlers:
     log.addHandler(_handler)
