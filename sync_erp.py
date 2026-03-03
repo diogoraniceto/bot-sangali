@@ -65,7 +65,7 @@ def carregar_estado_atual_do_banco():
 
     while True:
         resp = supabase_client.table("produtos_estoque") \
-            .select("id_unico, nome, estoque, preco") \
+            .select("id_unico, nome, estoque, preco, preco_varejo, preco_atacado") \
             .range(offset, offset + PAGE_SIZE - 1) \
             .execute()
 
@@ -76,7 +76,9 @@ def carregar_estado_atual_do_banco():
             estado[row["id_unico"]] = {
                 "nome": row["nome"],
                 "estoque": float(row["estoque"] or 0),
-                "preco": float(row["preco"] or 0)
+                "preco": float(row["preco"] or 0),
+                "preco_varejo": float(row.get("preco_varejo") or 0),
+                "preco_atacado": float(row.get("preco_atacado") or 0)
             }
 
         if len(resp.data) < PAGE_SIZE:
@@ -136,14 +138,50 @@ def sync_otimizado():
                 base_nome = produto['nome']
                 variacoes = produto.get('variacoes', [])
 
+                # Extrai precos do produto base
+                prod_preco_varejo = 0.0
+                prod_preco_atacado = 0.0
+                prod_preco_base = float(produto.get('valor_venda') or 0)
+                
+                valores_prod = produto.get('valores', [])
+                for v in valores_prod:
+                    if v.get('nome_tipo') == 'Varejo':
+                        prod_preco_varejo = float(v.get('valor_venda') or 0)
+                    elif v.get('nome_tipo') == 'Atacado':
+                        prod_preco_atacado = float(v.get('valor_venda') or 0)
+                
+                if not prod_preco_varejo: prod_preco_varejo = prod_preco_base
+                if not prod_preco_atacado: prod_preco_atacado = prod_preco_varejo
+
                 registros_produto = []
 
                 if variacoes and isinstance(variacoes, list):
                     for item in variacoes:
                         variacao = item.get('variacao', {})
-                        tamanho = str(variacao.get('nome', 'Único')).strip().upper()
+                        tamanho = str(variacao.get('nome') or 'ÚNICO').strip().upper()
+                        # Correção para tamanhos que vêm vazios
+                        if not tamanho: tamanho = 'ÚNICO'
+                        
                         qtd = float(variacao.get('estoque') or 0)
-                        preco = float(variacao.get('valor_venda') or produto.get('valor_venda') or 0)
+                        
+                        var_preco_varejo = 0.0
+                        var_preco_atacado = 0.0
+                        var_preco_base = float(variacao.get('valor_venda') or 0)
+                        
+                        valores_var = variacao.get('valores', [])
+                        if valores_var:
+                            for v in valores_var:
+                                if v.get('nome_tipo') == 'Varejo':
+                                    var_preco_varejo = float(v.get('valor_venda') or 0)
+                                elif v.get('nome_tipo') == 'Atacado':
+                                    var_preco_atacado = float(v.get('valor_venda') or 0)
+                        else:
+                            var_preco_varejo = var_preco_base
+                            var_preco_atacado = var_preco_base
+                            
+                        # Fallback: se a variação não tem preço, usa o preço do produto
+                        final_varejo = var_preco_varejo if var_preco_varejo > 0 else prod_preco_varejo
+                        final_atacado = var_preco_atacado if var_preco_atacado > 0 else prod_preco_atacado
 
                         if qtd > 0:
                             registros_produto.append({
@@ -151,12 +189,13 @@ def sync_otimizado():
                                 "id_produto": p_id,
                                 "nome": base_nome,
                                 "tamanho": tamanho,
-                                "preco": preco,
+                                "preco": final_varejo, # retrocompatibilidade
+                                "preco_varejo": final_varejo,
+                                "preco_atacado": final_atacado,
                                 "estoque": qtd
                             })
                 else:
                     qtd = float(produto.get('estoque', 0))
-                    preco = float(produto.get('valor_venda', 0))
 
                     if qtd > 0:
                         registros_produto.append({
@@ -164,7 +203,9 @@ def sync_otimizado():
                             "id_produto": p_id,
                             "nome": base_nome,
                             "tamanho": "ÚNICO",
-                            "preco": preco,
+                            "preco": prod_preco_varejo,
+                            "preco_varejo": prod_preco_varejo,
+                            "preco_atacado": prod_preco_atacado,
                             "estoque": qtd
                         })
 
@@ -194,7 +235,10 @@ def sync_otimizado():
                         total_embeddings_gerados += 1
                         batch_upsert.append(reg)
 
-                    elif existente["estoque"] != reg["estoque"] or existente["preco"] != reg["preco"]:
+                    elif (existente["estoque"] != reg["estoque"] or 
+                          existente["preco"] != reg["preco"] or
+                          existente["preco_varejo"] != reg["preco_varejo"] or
+                          existente["preco_atacado"] != reg["preco_atacado"]):
                         # Estoque ou preço MUDOU -> atualiza SEM regerar embedding
                         batch_upsert.append(reg)
 
