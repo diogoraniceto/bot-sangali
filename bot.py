@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 from google.api_core.exceptions import GoogleAPICallError
 from supabase import create_client, Client
+from apscheduler.schedulers.background import BackgroundScheduler
+from sync_erp import sync_otimizado
 
 # ================= CONFIGURAÇÕES =================
 
@@ -353,5 +355,11 @@ def webhook(evento, tipo):
     return jsonify({"status": "buffering"}), 200
 
 if __name__ == '__main__':
+    # Inicia o scheduler de sincronização com o ERP (a cada 2 minutos)
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(sync_otimizado, 'interval', minutes=2, misfire_grace_time=60)
+    scheduler.start()
+    print("⏰ Scheduler de sync ERP iniciado (a cada 2 min)")
+
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host='0.0.0.0', port=port)

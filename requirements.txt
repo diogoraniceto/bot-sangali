@@ -4,3 +4,4 @@ google-generativeai
 google-api-core
 supabase
 requests
+apscheduler
