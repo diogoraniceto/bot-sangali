@@ -171,6 +171,7 @@ export default function Dashboard() {
     const [lastSyncDate, setLastSyncDate] = useState(null)
     const [viewMode, setViewMode] = useState('gallery') // 'table' | 'gallery'
     const [imageFilter, setImageFilter] = useState('all') // 'all' | 'missing' | 'present'
+    const [lojaFilter, setLojaFilter] = useState('all')
     const fileInputRef = useRef(null)
     const [uploadingProductId, setUploadingProductId] = useState(null)
 
@@ -511,6 +512,12 @@ export default function Dashboard() {
         setSortConfig({ key, direction })
     }
 
+    const lojasDisponiveis = useMemo(() => {
+        const set = new Set()
+        estoque.forEach(item => { if (item.loja) set.add(item.loja) })
+        return [...set].sort()
+    }, [estoque])
+
     const filteredEsortedEstoque = useMemo(() => {
         return [...estoque]
             .filter(item => {
@@ -520,6 +527,9 @@ export default function Dashboard() {
                     item.id_produto?.toLowerCase().includes(query) ||
                     item.tamanho?.toLowerCase().includes(query)
                 )
+
+                // Filter by store
+                if (lojaFilter !== 'all' && item.loja !== lojaFilter) return false
 
                 // Filter by image health
                 if (imageFilter === 'missing') {
@@ -543,7 +553,7 @@ export default function Dashboard() {
                     ? a[sortConfig.key] - b[sortConfig.key]
                     : b[sortConfig.key] - a[sortConfig.key]
             })
-    }, [estoque, estoqueSearch, imageFilter, sortConfig])
+    }, [estoque, estoqueSearch, imageFilter, lojaFilter, sortConfig])
 
     if (loading) return (
         <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#0A0A0A] text-slate-500 dark:text-slate-400 text-sm font-sans">
@@ -890,6 +900,18 @@ export default function Dashboard() {
                                         Filtro
                                     </button>
 
+                                    {/* Filtro de loja */}
+                                    <select
+                                        value={lojaFilter}
+                                        onChange={(e) => setLojaFilter(e.target.value)}
+                                        className="px-3 py-2 border rounded-lg text-xs font-semibold transition-colors bg-white dark:bg-[#0F0F0F] border-slate-300 dark:border-[#1E1E1E] text-slate-600 dark:text-[#A1A1AA] focus:outline-none focus:border-purple-500/50 shadow-sm cursor-pointer"
+                                    >
+                                        <option value="all">Todas as Lojas</option>
+                                        {lojasDisponiveis.map(loja => (
+                                            <option key={loja} value={loja}>{loja}</option>
+                                        ))}
+                                    </select>
+
                                     <div className="relative">
                                         <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 dark:text-[#71717A] transition-colors" />
                                         <input
@@ -923,6 +945,7 @@ export default function Dashboard() {
                                             <thead className="sticky top-0 z-10 bg-slate-50 dark:bg-[#0A0A0A] shadow-[0_1px_0_0_#e2e8f0] dark:shadow-[0_1px_0_0_#1E1E1E] transition-colors">
                                                 <tr className="text-slate-500 dark:text-[#A1A1AA] text-[11px] uppercase tracking-wider font-semibold transition-colors">
                                                     {[
+                                                        { key: 'loja', label: 'loja' },
                                                         { key: 'id_produto', label: 'id_produto' },
                                                         { key: 'id_variacao', label: 'id_variacao' },
                                                         { key: 'nome', label: 'nome' },
@@ -953,6 +976,7 @@ export default function Dashboard() {
                                             <tbody className="divide-y divide-slate-100 dark:divide-[#1E1E1E]/50 transition-colors">
                                                 {filteredEsortedEstoque.map((item) => (
                                                     <tr key={item.id_unico} className="hover:bg-slate-50 dark:hover:bg-[#141414] transition-colors group">
+                                                        <td className="px-5 py-3.5 text-slate-600 dark:text-[#A1A1AA] text-[11px] font-medium whitespace-nowrap">{item.loja || '-'}</td>
                                                         <td className="px-5 py-3.5 text-slate-500 dark:text-[#71717A] font-mono text-[10px]">{item.id_produto || '-'}</td>
                                                         <td className="px-5 py-3.5 text-slate-500 dark:text-[#71717A] font-mono text-[10px]">{item.id_variacao || '-'}</td>
                                                         <td className="px-5 py-3.5 font-medium text-slate-800 dark:text-slate-200 whitespace-nowrap">{item.nome || '-'}</td>
@@ -981,7 +1005,7 @@ export default function Dashboard() {
                                                 ))}
                                                 {filteredEsortedEstoque.length === 0 && (
                                                     <tr>
-                                                        <td colSpan="9" className="px-5 py-8 text-center text-slate-500 dark:text-[#71717A] text-xs">
+                                                        <td colSpan="10" className="px-5 py-8 text-center text-slate-500 dark:text-[#71717A] text-xs">
                                                             Nenhum produto encontrado.
                                                         </td>
                                                     </tr>
@@ -1034,7 +1058,14 @@ export default function Dashboard() {
 
                                                         {/* Details */}
                                                         <div className="p-3 flex flex-col flex-1">
-                                                            <p className="font-mono text-[9px] text-slate-400 dark:text-[#71717A] mb-1">{item.id_produto}</p>
+                                                            <div className="flex items-center justify-between mb-1">
+                                                                <p className="font-mono text-[9px] text-slate-400 dark:text-[#71717A]">{item.id_produto}</p>
+                                                                {item.loja && (
+                                                                    <span className="text-[8px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20">
+                                                                        {item.loja}
+                                                                    </span>
+                                                                )}
+                                                            </div>
                                                             <h3 className="font-semibold text-[11px] text-slate-800 dark:text-slate-200 line-clamp-2 leading-snug flex-1 flex-grow mb-2" title={item.nome}>{item.nome || 'Produto Sem Nome'}</h3>
 
                                                             <div className="flex items-center justify-between mt-auto pt-2 border-t border-slate-100 dark:border-[#1E1E1E]">
