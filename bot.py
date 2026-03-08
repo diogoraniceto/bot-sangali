@@ -358,10 +358,10 @@ def webhook(evento, tipo):
 if __name__ == '__main__':
     # Inicia os schedulers de sincronização
     scheduler = BackgroundScheduler()
-    scheduler.add_job(sync_otimizado, 'interval', minutes=2, misfire_grace_time=60)
+    scheduler.add_job(sync_otimizado, 'interval', minutes=5, misfire_grace_time=120)
     scheduler.add_job(sync_images, 'cron', hour=9, minute=0, misfire_grace_time=3600)
     scheduler.start()
-    print("⏰ Schedulers iniciados: ERP (2 min) | Imagens (diário 6h BRT)")
+    print("⏰ Schedulers iniciados: ERP (5 min) | Imagens (diário 6h BRT)")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host='0.0.0.0', port=port)
