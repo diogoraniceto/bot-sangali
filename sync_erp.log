@@ -1,0 +1,3 @@
+2026-03-03 01:09:51 | HTTP Request: GET https://uaxraccxizldcvuwjitt.supabase.co/rest/v1/produtos_estoque?select=id_unico%2Cnome%2Cestoque%2Cpreco&offset=0&limit=1000 "HTTP/2 200 OK"
+2026-03-03 01:09:51 | HTTP Request: GET https://uaxraccxizldcvuwjitt.supabase.co/rest/v1/produtos_estoque?select=id_unico%2Cnome%2Cestoque%2Cpreco&offset=1000&limit=1000 "HTTP/2 200 OK"
+2026-03-03 01:09:56 | SYNC OK | 6.3s total | banco:1.0s api:5.2s embed:0.0s upsert:0.0s | processados:506 upserts:0 embeds_novos:0 skipped:1054 zerados:0
