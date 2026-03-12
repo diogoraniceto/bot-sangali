@@ -332,8 +332,9 @@ def enviar_mensagem_whatsapp(numero, texto):
     except Exception as e:
         print(f"Erro de conexão Uazapi: {e}")
 
+@app.route('/webhook', methods=['POST'])
 @app.route('/webhook/<evento>/<tipo>', methods=['POST'])
-def webhook(evento, tipo):
+def webhook(evento=None, tipo=None):
     data = request.json
     msg_data = data.get('message', {})
     if msg_data.get('fromMe'): return jsonify({"status": "ignored"}), 200
