@@ -81,7 +81,7 @@ def carregar_estado_atual_do_banco():
 
     while True:
         resp = supabase_client.table("produtos_estoque") \
-            .select("id_unico, nome, estoque, preco, preco_varejo, preco_atacado, id_loja") \
+            .select("id_unico, nome, estoque, preco, preco_varejo, preco_atacado, id_loja, grupo_id, nome_grupo") \
             .range(offset, offset + PAGE_SIZE - 1) \
             .execute()
 
@@ -95,7 +95,9 @@ def carregar_estado_atual_do_banco():
                 "preco": float(row["preco"] or 0),
                 "preco_varejo": float(row.get("preco_varejo") or 0),
                 "preco_atacado": float(row.get("preco_atacado") or 0),
-                "id_loja": row.get("id_loja")
+                "id_loja": row.get("id_loja"),
+                "grupo_id": row.get("grupo_id"),
+                "nome_grupo": row.get("nome_grupo")
             }
 
         if len(resp.data) < PAGE_SIZE:
@@ -167,6 +169,8 @@ def sync_otimizado():
                     p_id = produto['id']
                     base_nome = produto['nome']
                     variacoes = produto.get('variacoes', [])
+                    grupo_id = produto.get('grupo_id')
+                    nome_grupo = produto.get('nome_grupo')
 
                     # Extrai precos do produto base
                     prod_preco_varejo = 0.0
@@ -222,7 +226,9 @@ def sync_otimizado():
                                     "preco": final_varejo,
                                     "preco_varejo": final_varejo,
                                     "preco_atacado": final_atacado,
-                                    "estoque": qtd
+                                    "estoque": qtd,
+                                    "grupo_id": grupo_id,
+                                    "nome_grupo": nome_grupo
                                 })
                     else:
                         qtd = float(produto.get('estoque', 0))
@@ -238,7 +244,9 @@ def sync_otimizado():
                                 "preco": prod_preco_varejo,
                                 "preco_varejo": prod_preco_varejo,
                                 "preco_atacado": prod_preco_atacado,
-                                "estoque": qtd
+                                "estoque": qtd,
+                                "grupo_id": grupo_id,
+                                "nome_grupo": nome_grupo
                             })
 
                     for reg in registros_produto:
@@ -268,7 +276,9 @@ def sync_otimizado():
                         elif (existente["estoque"] != reg["estoque"] or
                               existente["preco"] != reg["preco"] or
                               existente["preco_varejo"] != reg["preco_varejo"] or
-                              existente["preco_atacado"] != reg["preco_atacado"]):
+                              existente["preco_atacado"] != reg["preco_atacado"] or
+                              existente.get("grupo_id") != reg["grupo_id"] or
+                              existente.get("nome_grupo") != reg["nome_grupo"]):
                             batch_upsert.append(reg)
 
                         else:

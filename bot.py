@@ -110,15 +110,19 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
                 if p.endswith('S'):
                     palavras_chave.add(p[:-1]) # "CUECAS" -> "CUECA"
 
+            GRUPO_PRIORITARIO = "PRODUTOS MAIS VENDIDOS"
             for p in produtos_candidatos:
                 score_boost = 0
                 nome_prod = p.get('nome', '').upper()
                 for termo in palavras_chave:
                     if termo in nome_prod:
                         score_boost += 1
+                # Boost comercial: bestsellers sempre acima de matches por palavra-chave
+                if (p.get('nome_grupo') or '').upper() == GRUPO_PRIORITARIO:
+                    score_boost += 10
                 p['_score_boost'] = score_boost
-            
-            # Ordena: Quem tem mais palavras chave vai pro topo. 
+
+            # Ordena: Quem tem mais palavras chave vai pro topo.
             # O Python's sort é estável, então se empatar no boost, mantém a ordem original (semântica)
             produtos_candidatos.sort(key=lambda x: x['_score_boost'], reverse=True)
             print(f"[HYBRID] Reordenado! Palavras-chave usadas: {palavras_chave}")
