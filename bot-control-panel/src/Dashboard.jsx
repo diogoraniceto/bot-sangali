@@ -175,6 +175,11 @@ export default function Dashboard() {
     const fileInputRef = useRef(null)
     const [uploadingProductId, setUploadingProductId] = useState(null)
 
+    // Handoff / Atendente humano
+    const [operatorNumber, setOperatorNumber] = useState('')
+    const [savingOperator, setSavingOperator] = useState(false)
+    const [operatorSaved, setOperatorSaved] = useState(false)
+
     useEffect(() => {
         fetchConfig()
         fetchLogs()
@@ -227,6 +232,7 @@ export default function Dashboard() {
             if (data) {
                 setConfig(data)
                 setBlocks(parsePromptToBlocks(data.system_prompt || ""))
+                setOperatorNumber(data.operator_number || '')
             }
         } catch (error) {
             console.error('Error fetching config:', error)
@@ -433,6 +439,26 @@ export default function Dashboard() {
             setConfig({ ...config, is_active: newState })
         } catch (error) {
             alert('Erro ao atualizar status: ' + error.message)
+        }
+    }
+
+    async function saveOperatorNumber() {
+        setSavingOperator(true)
+        try {
+            const cleaned = (operatorNumber || '').replace(/\D/g, '')
+            const { error } = await supabase
+                .from('bot_settings')
+                .update({ operator_number: cleaned || null, updated_at: new Date() })
+                .eq('id', 1)
+            if (error) throw error
+            setConfig({ ...config, operator_number: cleaned })
+            setOperatorNumber(cleaned)
+            setOperatorSaved(true)
+            setTimeout(() => setOperatorSaved(false), 2000)
+        } catch (error) {
+            alert('Erro ao salvar número do atendente: ' + error.message)
+        } finally {
+            setSavingOperator(false)
         }
     }
 
@@ -644,6 +670,35 @@ export default function Dashboard() {
                                 >
                                     <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all duration-300 shadow-sm ${config?.is_active ? 'left-[22px]' : 'left-1'}`}></div>
                                 </button>
+                            </div>
+
+                            {/* Atendente humano (handoff) */}
+                            <div className="bg-white dark:bg-[#0F0F0F] border border-slate-200 dark:border-[#1E1E1E] rounded-xl p-6 shadow-sm transition-colors">
+                                <div className="flex flex-col gap-1 mb-4">
+                                    <h3 className="text-slate-800 dark:text-slate-200 font-semibold text-[15px]">Atendente humano</h3>
+                                    <p className="text-slate-500 dark:text-[#71717A] text-[13px] font-medium">
+                                        Número que receberá o resumo quando o bot transferir a conversa.
+                                    </p>
+                                </div>
+                                <div className="flex items-center gap-3">
+                                    <input
+                                        type="tel"
+                                        placeholder="5511999998888"
+                                        value={operatorNumber}
+                                        onChange={(e) => setOperatorNumber(e.target.value)}
+                                        className="flex-1 bg-slate-50 dark:bg-[#0A0A0A] border border-slate-200 dark:border-[#1E1E1E] rounded-lg px-3 py-2 text-sm text-slate-800 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-[#71717A] focus:outline-none focus:border-purple-500"
+                                    />
+                                    <button
+                                        onClick={saveOperatorNumber}
+                                        disabled={savingOperator}
+                                        className="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-semibold transition-colors cursor-pointer"
+                                    >
+                                        {savingOperator ? 'Salvando...' : operatorSaved ? 'Salvo ✓' : 'Salvar'}
+                                    </button>
+                                </div>
+                                <p className="text-slate-400 dark:text-[#71717A] text-[11px] mt-2">
+                                    Formato internacional sem "+" (ex: 5511999998888).
+                                </p>
                             </div>
 
                             {/* Metrics Grids */}

@@ -194,6 +194,85 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
     
     return {"status": "sucesso", "produtos": selecao}
 
+# ================= HANDOFF PARA ATENDENTE HUMANO =================
+
+def _montar_mensagem_operador(user_id, motivo, resumo, produtos_interesse):
+    linhas = [
+        "🔔 Transferência — Sangali Bot",
+        "",
+        f"Cliente: {user_id}",
+        f"Motivo: {motivo}",
+    ]
+    if produtos_interesse:
+        linhas.append(f"Produtos de interesse: {produtos_interesse}")
+    linhas += ["", "Resumo:", resumo, "", "Últimas mensagens:"]
+
+    try:
+        historico = get_history(user_id, limit=8)
+        for msg in historico:
+            quem = "cliente" if msg["role"] == "user" else "bot"
+            texto = msg["parts"][0] if msg.get("parts") else ""
+            texto_curto = (texto[:200] + "…") if len(texto) > 200 else texto
+            linhas.append(f"[{quem}] {texto_curto}")
+    except Exception as e:
+        print(f"⚠️ Erro ao montar histórico para operador: {e}")
+
+    return "\n".join(linhas)
+
+
+def criar_tool_transferir(user_id):
+    """Retorna a função tool amarrada ao user_id da conversa atual."""
+
+    def transferir_para_atendente(motivo: str, resumo: str, produtos_interesse: str = ""):
+        """
+        Aciona a transferência da conversa para um atendente humano.
+
+        Use quando:
+        (1) o cliente pedir explicitamente para falar com um humano/atendente/vendedor;
+        (2) a venda estiver quase fechando e for necessário confirmar uma variação
+            que o bot não tem (ex: cor);
+        (3) o cliente demonstrar irritação clara ou houver confusão repetida
+            (2 ou mais mal-entendidos seguidos).
+
+        Args:
+            motivo: curto e categórico. Ex: "fechamento_venda", "pedido_humano",
+                    "confusao_repetida".
+            resumo: 2 a 4 frases descrevendo o que aconteceu na conversa e o que
+                    o atendente precisa saber para continuar.
+            produtos_interesse: nomes/códigos dos produtos mencionados, separados
+                                por vírgula. Vazio se não aplicável.
+        """
+        try:
+            config = supabase.table("bot_settings").select("operator_number").eq("id", 1).single().execute()
+            operator_number = (config.data or {}).get("operator_number") if config else None
+        except Exception as e:
+            print(f"❌ Erro ao ler operator_number: {e}")
+            return {"status": "erro", "msg": "Configuração do atendente não encontrada."}
+
+        if not operator_number:
+            print("⚠️ operator_number não configurado em bot_settings.")
+            return {"status": "erro", "msg": "Número do atendente não configurado."}
+
+        texto = _montar_mensagem_operador(user_id, motivo, resumo, produtos_interesse)
+        enviar_mensagem_whatsapp(operator_number, texto)
+
+        try:
+            supabase.table("conversation_handoffs").insert({
+                "user_id": user_id,
+                "motivo": motivo,
+                "resumo": resumo,
+                "produtos_interesse": produtos_interesse,
+                "operator_number": operator_number,
+            }).execute()
+        except Exception as e:
+            print(f"⚠️ Erro ao registrar handoff: {e}")
+
+        print(f"🤝 Handoff disparado para {operator_number} | user={user_id} | motivo={motivo}")
+        return {"status": "ok"}
+
+    return transferir_para_atendente
+
+
 # ================= CONFIGURAÇÃO DA IA (MODELO) =================
 
 # O modelo será inicializado dinamicamente dentro da função process_and_respond
@@ -238,9 +317,10 @@ def process_and_respond(user_id):
              system_instruction_dinamica = "Você é um assistente útil."
         
         # Instancia o modelo com a instrução ATUALIZADA
+        transferir_para_atendente = criar_tool_transferir(user_id)
         model = genai.GenerativeModel(
             model_name='gemini-3-flash-preview',
-            tools=[consultar_estoque_supabase],
+            tools=[consultar_estoque_supabase, transferir_para_atendente],
             system_instruction=system_instruction_dinamica
         )
 
