@@ -164,14 +164,21 @@ export default function Dashboard() {
     const messagesEndRef = useRef(null)
 
     // Estoque State
+    const ESTOQUE_PAGE_SIZE = 50
     const [estoque, setEstoque] = useState([])
+    const [estoqueTotal, setEstoqueTotal] = useState(0)
+    const [estoquePage, setEstoquePage] = useState(0)
     const [estoqueSearch, setEstoqueSearch] = useState('')
+    const [estoqueSearchDebounced, setEstoqueSearchDebounced] = useState('')
     const [sortConfig, setSortConfig] = useState({ key: 'nome', direction: 'asc' })
     const [isFetchingEstoque, setIsFetchingEstoque] = useState(false)
     const [lastSyncDate, setLastSyncDate] = useState(null)
     const [viewMode, setViewMode] = useState('gallery') // 'table' | 'gallery'
     const [imageFilter, setImageFilter] = useState('all') // 'all' | 'missing' | 'present'
     const [lojaFilter, setLojaFilter] = useState('all')
+    const [lojasList, setLojasList] = useState([])
+    const [imagensMap, setImagensMap] = useState({})
+    const [idsComImagem, setIdsComImagem] = useState([])
     const fileInputRef = useRef(null)
     const [uploadingProductId, setUploadingProductId] = useState(null)
 
@@ -187,7 +194,7 @@ export default function Dashboard() {
         const channel = supabase
             .channel('public:chat_history')
             .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_history' }, payload => {
-                setLogs(current => [payload.new, ...current].slice(0, 200))
+                setLogs(current => [payload.new, ...current].slice(0, 50))
             })
             .subscribe()
 
@@ -213,11 +220,28 @@ export default function Dashboard() {
         }
     }, [activeSidebarItem, selectedConversation, logs])
 
+    // Debounce da busca para evitar uma query por tecla
     useEffect(() => {
-        if (activeSidebarItem === 'estoque' && estoque.length === 0) {
-            fetchEstoque()
-        }
+        const t = setTimeout(() => setEstoqueSearchDebounced(estoqueSearch.trim()), 300)
+        return () => clearTimeout(t)
+    }, [estoqueSearch])
+
+    // Resetar para a primeira página sempre que filtros/busca/sort mudarem
+    useEffect(() => {
+        setEstoquePage(0)
+    }, [estoqueSearchDebounced, lojaFilter, imageFilter, sortConfig])
+
+    // Carregar metadados leves (lojas, imagens, last_sync) ao entrar na aba Estoque
+    useEffect(() => {
+        if (activeSidebarItem !== 'estoque') return
+        loadEstoqueMetadados()
     }, [activeSidebarItem])
+
+    // (Re)carregar página atual quando filtros, sort, página ou metadados mudam
+    useEffect(() => {
+        if (activeSidebarItem !== 'estoque') return
+        fetchEstoquePage()
+    }, [activeSidebarItem, estoqueSearchDebounced, lojaFilter, imageFilter, sortConfig, estoquePage, idsComImagem])
 
     async function fetchConfig() {
         try {
@@ -244,92 +268,164 @@ export default function Dashboard() {
     async function fetchLogs() {
         const { data } = await supabase
             .from('chat_history')
-            .select('*')
+            .select('id, user_id, role, content, created_at')
             .order('created_at', { ascending: false })
-            .limit(200)
+            .limit(50)
         if (data) setLogs(data)
     }
 
-    async function fetchEstoque() {
+    // ============ CACHE (sessionStorage, TTL 5min) ============
+    const ESTOQUE_CACHE_PREFIX = 'vx_estoque:v1'
+    const ESTOQUE_CACHE_TTL_MS = 5 * 60 * 1000
+
+    function cacheGet(key) {
+        try {
+            const raw = sessionStorage.getItem(`${ESTOQUE_CACHE_PREFIX}:${key}`)
+            if (!raw) return null
+            const { data, ts } = JSON.parse(raw)
+            if (Date.now() - ts > ESTOQUE_CACHE_TTL_MS) return null
+            return data
+        } catch { return null }
+    }
+    function cacheSet(key, data) {
+        try {
+            sessionStorage.setItem(`${ESTOQUE_CACHE_PREFIX}:${key}`, JSON.stringify({ data, ts: Date.now() }))
+        } catch {}
+    }
+    function cacheClearAll() {
+        try {
+            for (let i = sessionStorage.length - 1; i >= 0; i--) {
+                const k = sessionStorage.key(i)
+                if (k && k.startsWith(ESTOQUE_CACHE_PREFIX)) sessionStorage.removeItem(k)
+            }
+        } catch {}
+    }
+
+    // ============ METADADOS (lojas distintas, mapa de imagens, último sync) ============
+    async function loadEstoqueMetadados({ useCache = true } = {}) {
+        // Imagens (id_produto -> url). Tabela pequena (~3k linhas), busca uma vez por sessão.
+        let imagens = useCache ? cacheGet('imagens') : null
+        if (!imagens) {
+            const { data } = await supabase
+                .from('produtos_imagens')
+                .select('produto_id, imagem_url')
+                .range(0, 9999)
+            imagens = {}
+            if (data) {
+                for (const row of data) {
+                    if (row.produto_id && row.imagem_url && !imagens[row.produto_id]) {
+                        imagens[row.produto_id] = row.imagem_url
+                    }
+                }
+                cacheSet('imagens', imagens)
+            }
+        }
+        setImagensMap(imagens)
+        setIdsComImagem(Object.keys(imagens))
+
+        // Lojas distintas
+        let lojas = useCache ? cacheGet('lojas') : null
+        if (!lojas) {
+            const { data } = await supabase
+                .from('produtos_estoque')
+                .select('loja')
+                .not('loja', 'is', null)
+                .range(0, 9999)
+            const set = new Set()
+            if (data) for (const r of data) if (r.loja) set.add(r.loja)
+            lojas = [...set].sort()
+            cacheSet('lojas', lojas)
+        }
+        setLojasList(lojas)
+
+        // Última sincronização
+        let lastSync = useCache ? cacheGet('lastSync') : null
+        if (!lastSync) {
+            const { data } = await supabase
+                .from('produtos_estoque')
+                .select('last_sync')
+                .order('last_sync', { ascending: false })
+                .limit(1)
+            lastSync = data && data[0]?.last_sync ? data[0].last_sync : null
+            if (lastSync) cacheSet('lastSync', lastSync)
+        }
+        setLastSyncDate(lastSync ? new Date(lastSync) : null)
+    }
+
+    // ============ PAGINAÇÃO SERVER-SIDE ============
+    // Colunas ordenáveis existentes em produtos_estoque (evita ordenar por coluna inexistente).
+    const ESTOQUE_SORT_ALLOWED = new Set([
+        'loja', 'id_produto', 'nome', 'tamanho', 'preco',
+        'preco_varejo', 'preco_atacado', 'estoque', 'last_sync'
+    ])
+
+    function buildPageCacheKey() {
+        return `page:${estoqueSearchDebounced}|${lojaFilter}|${imageFilter}|${sortConfig.key}:${sortConfig.direction}|${estoquePage}`
+    }
+
+    async function fetchEstoquePage() {
+        const cacheKey = buildPageCacheKey()
+        const cached = cacheGet(cacheKey)
+        if (cached) {
+            setEstoque(cached.items)
+            setEstoqueTotal(cached.total)
+            return
+        }
+
         try {
             setIsFetchingEstoque(true)
 
-            let allEstoque = []
-            let start = 0
-            const step = 1000
+            const cols = 'id_unico, id_produto, id_loja, loja, nome, tamanho, preco, preco_varejo, preco_atacado, estoque, grupo_id, nome_grupo, last_sync'
+            let q = supabase
+                .from('produtos_estoque')
+                .select(cols, { count: 'exact' })
 
-            while (true) {
-                const { data, error } = await supabase
-                    .from('produtos_estoque')
-                    .select('*')
-                    .range(start, start + step - 1)
+            if (estoqueSearchDebounced) {
+                const safe = estoqueSearchDebounced.replace(/[,()%]/g, ' ')
+                q = q.or(`nome.ilike.%${safe}%,id_produto.ilike.%${safe}%,tamanho.ilike.%${safe}%`)
+            }
+            if (lojaFilter !== 'all') q = q.eq('loja', lojaFilter)
 
-                if (error) throw error
-                if (data && data.length > 0) {
-                    allEstoque = [...allEstoque, ...data]
+            if (idsComImagem.length > 0) {
+                if (imageFilter === 'present') {
+                    q = q.in('id_produto', idsComImagem)
+                } else if (imageFilter === 'missing') {
+                    // .not('id_produto', 'in', '("a","b")') — formato Postgrest
+                    const list = idsComImagem.map(id => `"${String(id).replace(/"/g, '\\"')}"`).join(',')
+                    q = q.not('id_produto', 'in', `(${list})`)
                 }
-
-                if (!data || data.length < step) {
-                    break
-                }
-
-                start += step
             }
 
-            // Fetch das imagens na tabela separada
-            let allImages = []
-            let startImg = 0
-            while (true) {
-                const { data, error } = await supabase
-                    .from('produtos_imagens')
-                    .select('produto_id, imagem_url')
-                    .range(startImg, startImg + step - 1)
+            const sortKey = ESTOQUE_SORT_ALLOWED.has(sortConfig.key) ? sortConfig.key : 'nome'
+            q = q.order(sortKey, { ascending: sortConfig.direction === 'asc', nullsFirst: false })
 
-                if (error) {
-                    console.warn("Tabela produtos_imagens não pôde ser listada ou não existe ainda:", error)
-                    break
-                }
-                if (data && data.length > 0) {
-                    allImages = [...allImages, ...data]
-                }
-                if (!data || data.length < step) break
-                startImg += step
-            }
+            const from = estoquePage * ESTOQUE_PAGE_SIZE
+            const to = from + ESTOQUE_PAGE_SIZE - 1
+            q = q.range(from, to)
 
-            // Criar um mapa rápido para atrelar a imagem ao produto_id correspondente
-            const imageMap = {}
-            allImages.forEach(img => {
-                if (!imageMap[img.produto_id] && img.imagem_url) {
-                    imageMap[img.produto_id] = img.imagem_url
-                }
-            })
+            const { data, error, count } = await q
+            if (error) throw error
 
-            // Mesclar as imagens no estado do estoque
-            allEstoque = allEstoque.map(item => {
-                if (!item) return null
-                return {
-                    ...item,
-                    imagem_url: imageMap[item.id_produto] || null
-                }
-            }).filter(Boolean)
+            const items = (data || []).map(item => ({
+                ...item,
+                imagem_url: imagensMap[item.id_produto] || null
+            }))
 
-            if (allEstoque.length > 0) {
-                setEstoque(allEstoque)
-                const mostRecent = allEstoque.reduce((latest, item) => {
-                    if (!item.last_sync) return latest
-                    const itemDate = new Date(item.last_sync)
-                    if (!latest) return itemDate
-                    return itemDate > latest ? itemDate : latest
-                }, null)
-                setLastSyncDate(mostRecent)
-            } else {
-                setEstoque([])
-            }
+            setEstoque(items)
+            setEstoqueTotal(count || 0)
+            cacheSet(cacheKey, { items, total: count || 0 })
         } catch (error) {
-            console.error('Error fetching estoque:', error)
+            console.error('Error fetching estoque page:', error)
         } finally {
             setIsFetchingEstoque(false)
         }
+    }
+
+    async function refreshEstoque() {
+        cacheClearAll()
+        setEstoquePage(0)
+        await loadEstoqueMetadados({ useCache: false })
+        // fetchEstoquePage será chamado pelo effect quando idsComImagem atualizar
     }
 
     async function handleImageUpload(e, produtoId) {
@@ -376,10 +472,23 @@ export default function Dashboard() {
                 if (insertError) throw insertError
             }
 
-            // Atualizar UI State
+            // Atualizar UI State + mapa de imagens + cache
             setEstoque(prev => prev.map(item =>
                 item.id_produto === produtoId ? { ...item, imagem_url: publicUrl } : item
             ))
+            setImagensMap(prev => {
+                const next = { ...prev, [produtoId]: publicUrl }
+                cacheSet('imagens', next)
+                return next
+            })
+            setIdsComImagem(prev => prev.includes(produtoId) ? prev : [...prev, produtoId])
+            // Invalida cache de páginas (filtros por imagem podem mudar)
+            try {
+                for (let i = sessionStorage.length - 1; i >= 0; i--) {
+                    const k = sessionStorage.key(i)
+                    if (k && k.startsWith(`${ESTOQUE_CACHE_PREFIX}:page:`)) sessionStorage.removeItem(k)
+                }
+            } catch {}
 
         } catch (error) {
             alert('Erro ao fazer upload da imagem: ' + error.message)
@@ -538,48 +647,8 @@ export default function Dashboard() {
         setSortConfig({ key, direction })
     }
 
-    const lojasDisponiveis = useMemo(() => {
-        const set = new Set()
-        estoque.forEach(item => { if (item.loja) set.add(item.loja) })
-        return [...set].sort()
-    }, [estoque])
-
-    const filteredEsortedEstoque = useMemo(() => {
-        return [...estoque]
-            .filter(item => {
-                const query = estoqueSearch.toLowerCase()
-                const matchesSearch = (
-                    item.nome?.toLowerCase().includes(query) ||
-                    item.id_produto?.toLowerCase().includes(query) ||
-                    item.tamanho?.toLowerCase().includes(query)
-                )
-
-                // Filter by store
-                if (lojaFilter !== 'all' && item.loja !== lojaFilter) return false
-
-                // Filter by image health
-                if (imageFilter === 'missing') {
-                    return matchesSearch && !item.imagem_url
-                } else if (imageFilter === 'present') {
-                    return matchesSearch && item.imagem_url
-                }
-                return matchesSearch
-            })
-            .sort((a, b) => {
-                if (a[sortConfig.key] === null || a[sortConfig.key] === undefined) return 1
-                if (b[sortConfig.key] === null || b[sortConfig.key] === undefined) return -1
-
-                if (typeof a[sortConfig.key] === 'string') {
-                    return sortConfig.direction === 'asc'
-                        ? a[sortConfig.key].localeCompare(b[sortConfig.key])
-                        : b[sortConfig.key].localeCompare(a[sortConfig.key])
-                }
-
-                return sortConfig.direction === 'asc'
-                    ? a[sortConfig.key] - b[sortConfig.key]
-                    : b[sortConfig.key] - a[sortConfig.key]
-            })
-    }, [estoque, estoqueSearch, imageFilter, lojaFilter, sortConfig])
+    // Filtragem/ordenação são feitas no servidor. `estoque` já contém a página corrente.
+    const estoqueTotalPages = Math.max(1, Math.ceil(estoqueTotal / ESTOQUE_PAGE_SIZE))
 
     if (loading) return (
         <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#0A0A0A] text-slate-500 dark:text-slate-400 text-sm font-sans">
@@ -902,7 +971,7 @@ export default function Dashboard() {
                                     <h2 className="text-xl font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2 transition-colors">
                                         Controle de Estoque
                                         <span className="text-[10px] bg-purple-50 dark:bg-[#1E1430] text-purple-600 dark:text-purple-400 border border-purple-200 dark:border-purple-500/20 px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold transition-colors">
-                                            {estoque.length} ITENS
+                                            {estoqueTotal} ITENS
                                         </span>
                                     </h2>
                                     <p className="text-slate-500 dark:text-[#A1A1AA] text-xs mt-1 transition-colors">
@@ -962,7 +1031,7 @@ export default function Dashboard() {
                                         className="px-3 py-2 border rounded-lg text-xs font-semibold transition-colors bg-white dark:bg-[#0F0F0F] border-slate-300 dark:border-[#1E1E1E] text-slate-600 dark:text-[#A1A1AA] focus:outline-none focus:border-purple-500/50 shadow-sm cursor-pointer"
                                     >
                                         <option value="all">Todas as Lojas</option>
-                                        {lojasDisponiveis.map(loja => (
+                                        {lojasList.map(loja => (
                                             <option key={loja} value={loja}>{loja}</option>
                                         ))}
                                     </select>
@@ -978,10 +1047,10 @@ export default function Dashboard() {
                                         />
                                     </div>
                                     <button
-                                        onClick={fetchEstoque}
+                                        onClick={refreshEstoque}
                                         disabled={isFetchingEstoque}
                                         className="p-2 border border-slate-300 dark:border-[#1E1E1E] bg-white dark:bg-[#0F0F0F] rounded-lg text-slate-500 dark:text-[#71717A] hover:text-slate-800 dark:hover:text-slate-300 hover:bg-slate-50 dark:hover:bg-[#1A1A1A] transition-colors cursor-pointer disabled:opacity-50 shadow-sm"
-                                        title="Sincronizar dados"
+                                        title="Atualizar (limpa cache)"
                                     >
                                         <RefreshCw size={16} className={isFetchingEstoque ? 'animate-spin' : ''} />
                                     </button>
@@ -1029,7 +1098,7 @@ export default function Dashboard() {
                                                 </tr>
                                             </thead>
                                             <tbody className="divide-y divide-slate-100 dark:divide-[#1E1E1E]/50 transition-colors">
-                                                {filteredEsortedEstoque.map((item) => (
+                                                {estoque.map((item) => (
                                                     <tr key={item.id_unico} className="hover:bg-slate-50 dark:hover:bg-[#141414] transition-colors group">
                                                         <td className="px-5 py-3.5 text-slate-600 dark:text-[#A1A1AA] text-[11px] font-medium whitespace-nowrap">{item.loja || '-'}</td>
                                                         <td className="px-5 py-3.5 text-slate-500 dark:text-[#71717A] font-mono text-[10px]">{item.id_produto || '-'}</td>
@@ -1058,7 +1127,7 @@ export default function Dashboard() {
                                                         </td>
                                                     </tr>
                                                 ))}
-                                                {filteredEsortedEstoque.length === 0 && (
+                                                {estoque.length === 0 && (
                                                     <tr>
                                                         <td colSpan="10" className="px-5 py-8 text-center text-slate-500 dark:text-[#71717A] text-xs">
                                                             Nenhum produto encontrado.
@@ -1070,14 +1139,14 @@ export default function Dashboard() {
                                     </div>
                                 ) : (
                                     <div className="overflow-auto custom-scrollbar flex-1 min-h-0 p-6 relative">
-                                        {filteredEsortedEstoque.length === 0 ? (
+                                        {estoque.length === 0 ? (
                                             <div className="flex flex-col items-center justify-center p-12 text-slate-500 dark:text-[#71717A] border-2 border-dashed border-slate-200 dark:border-[#333] rounded-2xl h-full">
                                                 <ImagePlus size={32} className="mb-4 text-slate-300 dark:text-[#555]" />
                                                 <p className="text-sm font-medium">Nenhum produto encontrado.</p>
                                             </div>
                                         ) : (
                                             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
-                                                {filteredEsortedEstoque.map(item => (
+                                                {estoque.map(item => (
                                                     <div key={item.id_unico} className={`bg-white dark:bg-[#0F0F0F] border rounded-xl overflow-hidden shadow-sm hover:shadow-md transition-all flex flex-col group ${item.estoque > 0 && !item.imagem_url ? 'border-amber-300 dark:border-amber-500/50 shadow-[0_0_10px_rgba(251,191,36,0.2)]' : 'border-slate-200 dark:border-[#222]'}`}>
                                                         {/* Image Space */}
                                                         <div className="aspect-square w-full bg-slate-50 dark:bg-[#111] relative overflow-hidden group/image">
@@ -1139,6 +1208,38 @@ export default function Dashboard() {
                                     </div>
                                 )}
                             </div>
+
+                            {/* PAGINAÇÃO */}
+                            {estoqueTotal > 0 && (
+                                <div className="flex items-center justify-between mt-4 shrink-0 text-xs text-slate-500 dark:text-[#A1A1AA]">
+                                    <div>
+                                        Página <span className="font-semibold text-slate-700 dark:text-slate-200">{estoquePage + 1}</span> de <span className="font-semibold text-slate-700 dark:text-slate-200">{estoqueTotalPages}</span>
+                                        {' '}· {estoque.length} itens nesta página
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                        <button
+                                            onClick={() => setEstoquePage(0)}
+                                            disabled={estoquePage === 0 || isFetchingEstoque}
+                                            className="px-3 py-1.5 border border-slate-300 dark:border-[#1E1E1E] bg-white dark:bg-[#0F0F0F] rounded-lg hover:bg-slate-50 dark:hover:bg-[#1A1A1A] transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+                                        >« Primeira</button>
+                                        <button
+                                            onClick={() => setEstoquePage(p => Math.max(0, p - 1))}
+                                            disabled={estoquePage === 0 || isFetchingEstoque}
+                                            className="px-3 py-1.5 border border-slate-300 dark:border-[#1E1E1E] bg-white dark:bg-[#0F0F0F] rounded-lg hover:bg-slate-50 dark:hover:bg-[#1A1A1A] transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+                                        >‹ Anterior</button>
+                                        <button
+                                            onClick={() => setEstoquePage(p => Math.min(estoqueTotalPages - 1, p + 1))}
+                                            disabled={estoquePage >= estoqueTotalPages - 1 || isFetchingEstoque}
+                                            className="px-3 py-1.5 border border-slate-300 dark:border-[#1E1E1E] bg-white dark:bg-[#0F0F0F] rounded-lg hover:bg-slate-50 dark:hover:bg-[#1A1A1A] transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+                                        >Próxima ›</button>
+                                        <button
+                                            onClick={() => setEstoquePage(estoqueTotalPages - 1)}
+                                            disabled={estoquePage >= estoqueTotalPages - 1 || isFetchingEstoque}
+                                            className="px-3 py-1.5 border border-slate-300 dark:border-[#1E1E1E] bg-white dark:bg-[#0F0F0F] rounded-lg hover:bg-slate-50 dark:hover:bg-[#1A1A1A] transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+                                        >Última »</button>
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     )}
 
