@@ -22,6 +22,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 UAZAPI_URL = os.getenv("UAZAPI_URL")
 UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN")
+MELHOR_ENVIO_TOKEN = os.getenv("MELHOR_ENVIO_TOKEN")
+MELHOR_ENVIO_URL = "https://www.melhorenvio.com.br/api/v2/me/shipment/calculate"
 
 app = Flask(__name__)
 genai.configure(api_key=GEMINI_API_KEY)
@@ -198,6 +200,137 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
     
     return {"status": "sucesso", "produtos": selecao}
 
+# ================= FERRAMENTA: CALCULAR FRETE ESTIMADO =================
+
+# (keywords, peso_g, altura_cm, largura_cm, comprimento_cm)
+_PESO_TABLE = [
+    (["cueca", "boxer", "slip"],             80,  3, 20, 15),
+    (["calcinha", "fio dental", "tanga"],    60,  2, 18, 12),
+    (["sutiã", "sutia", "top", "bralette"], 120,  4, 25, 20),
+    (["conjunto"],                           200,  5, 25, 20),
+    (["body", "bodysuit"],                   200,  5, 28, 22),
+    (["legging", "calça"],                   350,  5, 30, 25),
+    (["meia", "soquete"],                     60,  3, 15, 10),
+    (["camisola", "camiseta"],               250,  4, 30, 25),
+]
+_PESO_DEFAULT = (150, 4, 22, 18)
+
+
+def _estimar_pacote(nome_produto: str, quantidade: int = 1):
+    nome_lower = nome_produto.lower()
+    peso_u, h, w, l = _PESO_DEFAULT
+    for keywords, pw, ph, pw2, pl in _PESO_TABLE:
+        if any(kw in nome_lower for kw in keywords):
+            peso_u, h, w, l = pw, ph, pw2, pl
+            break
+    peso_total = peso_u * max(quantidade, 1)
+    if quantidade > 1:
+        h = h + (quantidade - 1) * 2
+        w = w + (quantidade - 1) * 1
+    # Melhor Envio mínimos: 11x16x2cm, 300g
+    return max(peso_total, 300), max(h, 2), max(w, 16), max(l, 11)
+
+
+def _validar_cep(cep: str):
+    limpo = re.sub(r'\D', '', cep or '')
+    return limpo if len(limpo) == 8 else None
+
+
+def _fallback_frete():
+    return {
+        "status": "indisponivel",
+        "msg": "Não consegui calcular o frete agora. Nossa equipe confirma o valor exato na hora do envio. Posso te transferir para um atendente? 😊"
+    }
+
+
+def calcular_frete_estimado(cep_destino: str, nome_produto: str, quantidade: int = 1):
+    """
+    Estima o custo de frete da Sangali até o CEP do cliente.
+
+    Use esta ferramenta quando o cliente perguntar sobre frete, entrega, prazo ou custo de envio.
+    IMPORTANTE: Chame esta ferramenta SOMENTE após o cliente informar o CEP.
+    Se o CEP ainda não foi fornecido na conversa, pergunte ao cliente antes de usar esta ferramenta.
+
+    Args:
+        cep_destino:  CEP do cliente (ex: "29900-161" ou "29900161").
+        nome_produto: Produto principal de interesse (ex: "cueca boxer", "conjunto", "legging").
+        quantidade:   Quantidade de itens estimados no pedido (padrão 1).
+    """
+    cep_limpo = _validar_cep(cep_destino)
+    if not cep_limpo:
+        return {"status": "erro_cep", "msg": "CEP inválido. Informe o CEP com 8 dígitos, ex: 87013-000."}
+
+    try:
+        cfg = supabase.table("bot_settings").select("cep_origem").eq("id", 1).single().execute()
+        cep_origem = _validar_cep((cfg.data or {}).get("cep_origem", ""))
+    except Exception as e:
+        print(f"⚠️ Frete: erro ao buscar cep_origem: {e}")
+        cep_origem = None
+
+    if not cep_origem:
+        return {"status": "erro_config", "msg": "Configuração da loja ausente. Transfira para atendente."}
+
+    peso_g, alt, larg, comp = _estimar_pacote(nome_produto, quantidade)
+    print(f"📦 Frete: cep_destino={cep_limpo} | produto='{nome_produto}' qtd={quantidade} | pacote={peso_g}g {alt}x{larg}x{comp}cm")
+
+    payload = {
+        "from": {"postal_code": cep_origem},
+        "to":   {"postal_code": cep_limpo},
+        "package": {
+            "height": alt,
+            "width":  larg,
+            "length": comp,
+            "weight": round(peso_g / 1000, 3)
+        },
+        "options": {"insurance_value": 0, "receipt": False, "own_hand": False},
+        "services": ""
+    }
+    headers = {
+        "Authorization": f"Bearer {MELHOR_ENVIO_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "SangaliBot/1.0 (contato@sangali.com.br)"
+    }
+
+    try:
+        resp = requests.post(MELHOR_ENVIO_URL, json=payload, headers=headers, timeout=10)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        print(f"⚠️ Frete: falha de conexão: {e}")
+        return _fallback_frete()
+
+    if resp.status_code != 200:
+        print(f"⚠️ Frete: status {resp.status_code} | {resp.text[:200]}")
+        return _fallback_frete()
+
+    try:
+        servicos = resp.json()
+    except Exception:
+        return _fallback_frete()
+
+    opcoes = [
+        {
+            "servico":    s.get("name", ""),
+            "preco":      float(s["price"]),
+            "prazo_dias": s.get("delivery_time")
+        }
+        for s in servicos
+        if not s.get("error") and s.get("price") is not None
+    ]
+
+    if not opcoes:
+        return _fallback_frete()
+
+    opcoes.sort(key=lambda x: x["preco"])
+    print(f"✅ Frete: {len(opcoes)} opções encontradas para {cep_limpo}")
+
+    return {
+        "status": "sucesso",
+        "cep_destino": f"{cep_limpo[:5]}-{cep_limpo[5:]}",
+        "opcoes": opcoes[:5],
+        "disclaimer": "⚠️ Valor ESTIMADO. O frete exato é calculado após pesagem real do pacote no momento do despacho."
+    }
+
+
 # ================= HANDOFF PARA ATENDENTE HUMANO =================
 
 def _montar_mensagem_operador(user_id, motivo, resumo, produtos_interesse):
@@ -324,7 +457,7 @@ def process_and_respond(user_id):
         transferir_para_atendente = criar_tool_transferir(user_id)
         model = genai.GenerativeModel(
             model_name='gemini-3-flash-preview',
-            tools=[consultar_estoque_supabase, transferir_para_atendente],
+            tools=[consultar_estoque_supabase, transferir_para_atendente, calcular_frete_estimado],
             system_instruction=system_instruction_dinamica
         )
 
