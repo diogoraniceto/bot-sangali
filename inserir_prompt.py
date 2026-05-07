@@ -18,7 +18,7 @@ prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), prompt_fi
 with open(prompt_path, "r", encoding="utf-8") as f:
     prompt = f.read()
 
-print(f"📂 Lendo prompt de: {prompt_path} ({len(prompt)} chars)")
+print(f"[i] Lendo prompt de: {prompt_path} ({len(prompt)} chars)")
 
 result = supabase.table("bot_settings").update({"system_prompt": prompt}).eq("id", 1).execute()
-print(f"✅ Prompt atualizado em bot_settings (id=1). Registros: {len(result.data)}")
+print(f"[ok] Prompt atualizado em bot_settings (id=1). Registros: {len(result.data)}")

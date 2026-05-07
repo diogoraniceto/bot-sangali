@@ -228,7 +228,7 @@ def consultar_produto_por_id(id_produto: int):
         resp = (
             supabase.table("produtos_estoque")
             .select("id_unico, id_produto, id_loja, loja, nome, tamanho, preco_varejo, preco_atacado, estoque, grupo_id, nome_grupo")
-            .eq("id_produto", id_produto)
+            .eq("id_produto", str(id_produto))
             .gt("estoque", 0)
             .execute()
         )
@@ -338,7 +338,7 @@ def calcular_total(itens_json: str, modo: str = "varejo", primeira_compra: bool 
         resp = (
             supabase.table("produtos_estoque")
             .select("id_produto, nome, preco_varejo, preco_atacado")
-            .in_("id_produto", ids)
+            .in_("id_produto", [str(i) for i in ids])
             .execute()
         )
         rows = resp.data or []
@@ -529,7 +529,7 @@ def calcular_frete_estimado(cep_destino: str, id_produto: int = None, quantidade
     nome_para_peso = None
     if id_produto:
         try:
-            r = supabase.table("produtos_estoque").select("nome, nome_grupo").eq("id_produto", int(id_produto)).limit(1).execute()
+            r = supabase.table("produtos_estoque").select("nome, nome_grupo").eq("id_produto", str(id_produto)).limit(1).execute()
             if r.data:
                 nome_para_peso = (r.data[0].get("nome") or "") + " " + (r.data[0].get("nome_grupo") or "")
         except Exception as e:
@@ -755,24 +755,29 @@ def extrair_produtos_de_tool_results(chat_history):
             if tool_name == 'consultar_estoque_supabase':
                 for prod in payload.get('produtos', []) or []:
                     pid = prod.get('id_produto')
-                    if pid is not None:
-                        cache[int(pid)] = {
-                            "nome": prod.get('nome'),
-                            "preco": prod.get('preco') or prod.get('preco_varejo'),
-                            "preco_varejo": prod.get('preco_varejo'),
-                            "preco_atacado": prod.get('preco_atacado'),
-                            "imagem": prod.get('imagem'),
-                            "tamanho": prod.get('tamanho'),
-                            "id_unico": prod.get('id_unico'),
-                        }
+                    try:
+                        key = int(pid)
+                    except (TypeError, ValueError):
+                        continue
+                    cache[key] = {
+                        "nome": prod.get('nome'),
+                        "preco": prod.get('preco') or prod.get('preco_varejo'),
+                        "preco_varejo": prod.get('preco_varejo'),
+                        "preco_atacado": prod.get('preco_atacado'),
+                        "imagem": prod.get('imagem'),
+                        "tamanho": prod.get('tamanho'),
+                        "id_unico": prod.get('id_unico'),
+                    }
             elif tool_name == 'consultar_produto_por_id':
                 produto = payload.get('produto') or {}
                 pid = produto.get('id_produto')
-                if pid is None:
+                try:
+                    key = int(pid)
+                except (TypeError, ValueError):
                     continue
                 variacoes = produto.get('variacoes') or []
                 primeira = variacoes[0] if variacoes else {}
-                cache[int(pid)] = {
+                cache[key] = {
                     "nome": produto.get('nome'),
                     "preco": primeira.get('preco_varejo'),
                     "preco_varejo": primeira.get('preco_varejo'),
