@@ -188,6 +188,255 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
     print(f"[SEMÂNTICO] Retornando {len(selecao)} itens.")
     return {"status": "sucesso", "produtos": selecao}
 
+# ================= FERRAMENTAS DE CONSULTA DETERMINÍSTICA =================
+
+def consultar_produto_por_id(id_produto: int):
+    """
+    Lê o produto direto do banco por id, com todas as variações ativas (estoque > 0).
+
+    Use esta ferramenta SEMPRE que precisar revalidar preço, estoque ou tamanhos
+    disponíveis de um produto que já apareceu na conversa antes de citar
+    valor ao cliente. Ela é a fonte da verdade — não confie em preços
+    lembrados de turnos anteriores.
+
+    Args:
+        id_produto: o id numérico do produto (campo id_produto da tabela produtos_estoque).
+
+    Returns:
+        {status, produto: {id_produto, nome, nome_grupo, variacoes: [{id_unico, tamanho, preco_varejo, preco_atacado, estoque, loja}]}}
+    """
+    try:
+        resp = (
+            supabase.table("produtos_estoque")
+            .select("id_unico, id_produto, id_loja, loja, nome, tamanho, preco_varejo, preco_atacado, estoque, grupo_id, nome_grupo")
+            .eq("id_produto", id_produto)
+            .gt("estoque", 0)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as e:
+        print(f"❌ Erro consultar_produto_por_id({id_produto}): {e}")
+        return {"status": "erro", "msg": "Erro ao consultar produto."}
+
+    if not rows:
+        return {"status": "nao_encontrado", "msg": f"Produto {id_produto} sem estoque ou inexistente."}
+
+    base = rows[0]
+    variacoes = [
+        {
+            "id_unico": r["id_unico"],
+            "tamanho": r.get("tamanho"),
+            "preco_varejo": float(r.get("preco_varejo") or 0),
+            "preco_atacado": float(r.get("preco_atacado") or 0),
+            "estoque": float(r.get("estoque") or 0),
+            "loja": r.get("loja"),
+        }
+        for r in rows
+    ]
+    return {
+        "status": "sucesso",
+        "produto": {
+            "id_produto": base["id_produto"],
+            "nome": base.get("nome"),
+            "nome_grupo": base.get("nome_grupo"),
+            "variacoes": variacoes,
+        },
+    }
+
+
+# Defaults caso bot_settings não tenha configurado os parâmetros de atacado.
+_ATACADO_DEFAULT = {
+    "desconto_avista": 0.30,
+    "desconto_aprazo": 0.25,
+    "minimo_primeira_compra": 600.0,
+    "minimo_proxima_compra": 400.0,
+    "parcelas_max": 6,
+}
+
+
+def _ler_config_atacado():
+    """Lê parâmetros de atacado de bot_settings com fallback para defaults."""
+    try:
+        cfg = supabase.table("bot_settings").select(
+            "atacado_desconto_avista, atacado_desconto_aprazo, atacado_minimo_primeira, atacado_minimo_proxima, atacado_parcelas_max"
+        ).eq("id", 1).single().execute()
+        d = cfg.data or {}
+    except Exception:
+        d = {}
+    return {
+        "desconto_avista": float(d.get("atacado_desconto_avista") or _ATACADO_DEFAULT["desconto_avista"]),
+        "desconto_aprazo": float(d.get("atacado_desconto_aprazo") or _ATACADO_DEFAULT["desconto_aprazo"]),
+        "minimo_primeira_compra": float(d.get("atacado_minimo_primeira") or _ATACADO_DEFAULT["minimo_primeira_compra"]),
+        "minimo_proxima_compra": float(d.get("atacado_minimo_proxima") or _ATACADO_DEFAULT["minimo_proxima_compra"]),
+        "parcelas_max": int(d.get("atacado_parcelas_max") or _ATACADO_DEFAULT["parcelas_max"]),
+    }
+
+
+def calcular_total(itens_json: str, modo: str = "varejo", primeira_compra: bool = False):
+    """
+    Calcula o total de um carrinho, com desconto correto por modo e validação de mínimo.
+
+    Use esta ferramenta SEMPRE antes de citar valor agregado, total, desconto
+    ou parcelado para o cliente. Não calcule de cabeça — chame aqui.
+
+    Args:
+        itens_json: JSON string de uma lista de itens, no formato
+                    '[{"id_produto": 123, "qtd": 2}, {"id_produto": 456, "qtd": 1}]'.
+                    Use os id_produto retornados por consultar_estoque_supabase.
+        modo: "varejo" | "atacado_avista" | "atacado_aprazo".
+              "varejo" = preço cheio. "atacado_avista" = preço de atacado em pix/dinheiro.
+              "atacado_aprazo" = preço de atacado parcelado.
+        primeira_compra: True se é a primeira compra do cliente no atacado
+                         (mínimo R$ 600). False se já comprou antes (mínimo R$ 400).
+                         Ignorado em modo varejo.
+
+    Returns:
+        {status, subtotal_varejo, total, desconto, minimo_exigido, minimo_atingido,
+         falta_para_minimo, parcelado_6x, itens_detalhados: [...]}
+    """
+    try:
+        itens = json.loads(itens_json) if isinstance(itens_json, str) else itens_json
+        if not isinstance(itens, list) or not itens:
+            return {"status": "erro", "msg": "itens_json deve ser uma lista não vazia."}
+    except json.JSONDecodeError as e:
+        return {"status": "erro", "msg": f"itens_json inválido: {e}"}
+
+    ids = []
+    qtd_por_id = {}
+    for item in itens:
+        try:
+            pid = int(item["id_produto"])
+            qtd = max(1, int(item.get("qtd", 1)))
+            ids.append(pid)
+            qtd_por_id[pid] = qtd_por_id.get(pid, 0) + qtd
+        except (KeyError, TypeError, ValueError):
+            return {"status": "erro", "msg": f"item inválido: {item}. Esperado {{id_produto, qtd}}."}
+
+    if modo not in ("varejo", "atacado_avista", "atacado_aprazo"):
+        return {"status": "erro", "msg": f"modo inválido: {modo}"}
+
+    try:
+        resp = (
+            supabase.table("produtos_estoque")
+            .select("id_produto, nome, preco_varejo, preco_atacado")
+            .in_("id_produto", ids)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as e:
+        print(f"❌ Erro calcular_total: {e}")
+        return {"status": "erro", "msg": "Erro ao consultar produtos."}
+
+    precos = {}
+    for r in rows:
+        pid = int(r["id_produto"])
+        if pid not in precos:
+            precos[pid] = {
+                "nome": r.get("nome"),
+                "preco_varejo": float(r.get("preco_varejo") or 0),
+                "preco_atacado": float(r.get("preco_atacado") or 0),
+            }
+
+    cfg = _ler_config_atacado()
+    subtotal_varejo = 0.0
+    subtotal_atacado_avista = 0.0
+    subtotal_atacado_aprazo = 0.0
+    detalhes = []
+    nao_encontrados = []
+
+    for pid, qtd in qtd_por_id.items():
+        info = precos.get(pid)
+        if not info:
+            nao_encontrados.append(pid)
+            continue
+        pv = info["preco_varejo"]
+        pa = info["preco_atacado"] or pv * (1 - cfg["desconto_avista"])
+        # à prazo derivado de varejo com desconto separado:
+        pap = pv * (1 - cfg["desconto_aprazo"])
+
+        subtotal_varejo += pv * qtd
+        subtotal_atacado_avista += pa * qtd
+        subtotal_atacado_aprazo += pap * qtd
+        detalhes.append({
+            "id_produto": pid,
+            "nome": info["nome"],
+            "qtd": qtd,
+            "preco_varejo_unit": round(pv, 2),
+            "preco_atacado_avista_unit": round(pa, 2),
+            "preco_atacado_aprazo_unit": round(pap, 2),
+        })
+
+    if nao_encontrados:
+        return {"status": "erro", "msg": f"id_produto não encontrado(s): {nao_encontrados}"}
+
+    if modo == "varejo":
+        total = subtotal_varejo
+        minimo = 0.0
+    elif modo == "atacado_avista":
+        total = subtotal_atacado_avista
+        minimo = cfg["minimo_primeira_compra"] if primeira_compra else cfg["minimo_proxima_compra"]
+    else:  # atacado_aprazo
+        total = subtotal_atacado_aprazo
+        minimo = cfg["minimo_primeira_compra"] if primeira_compra else cfg["minimo_proxima_compra"]
+
+    desconto = subtotal_varejo - total if modo != "varejo" else 0.0
+    minimo_atingido = total >= minimo if minimo > 0 else True
+    falta = max(0.0, minimo - total) if minimo > 0 else 0.0
+    parcela = total / cfg["parcelas_max"] if cfg["parcelas_max"] > 0 else total
+
+    return {
+        "status": "sucesso",
+        "modo": modo,
+        "primeira_compra": primeira_compra,
+        "subtotal_varejo": round(subtotal_varejo, 2),
+        "total": round(total, 2),
+        "desconto": round(desconto, 2),
+        "minimo_exigido": round(minimo, 2),
+        "minimo_atingido": minimo_atingido,
+        "falta_para_minimo": round(falta, 2),
+        "parcelado": {"parcelas": cfg["parcelas_max"], "valor_parcela": round(parcela, 2)} if modo == "atacado_aprazo" else None,
+        "itens_detalhados": detalhes,
+    }
+
+
+def verificar_promocao_hoje():
+    """
+    Verifica se há promoção ativa hoje (Dia S e similares).
+
+    Use esta ferramenta SEMPRE antes de mencionar Dia S, desconto promocional
+    ou qualquer oferta atrelada a dia da semana. Nunca afirme que existe
+    promoção sem chamar essa tool primeiro.
+
+    Returns:
+        {status, hoje_dia_semana, promocoes: [{nome, categoria, percentual, formas_pagamento, troca_permitida, observacao}]}
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+        # America/Sao_Paulo = UTC-3
+        agora = datetime.now(timezone(timedelta(hours=-3)))
+        # Postgres extract(dow): 0=domingo. Python weekday(): 0=segunda.
+        # Vamos usar o padrão Postgres: 0=dom, 1=seg, ..., 6=sab.
+        dow = (agora.weekday() + 1) % 7
+
+        resp = (
+            supabase.table("promocoes_ativas")
+            .select("nome, categoria, percentual, formas_pagamento, troca_permitida, observacao")
+            .eq("dia_semana", dow)
+            .eq("ativa", True)
+            .execute()
+        )
+        promos = resp.data or []
+    except Exception as e:
+        print(f"❌ Erro verificar_promocao_hoje: {e}")
+        return {"status": "erro", "msg": "Erro ao consultar promoções."}
+
+    return {
+        "status": "sucesso",
+        "hoje_dia_semana": dow,
+        "promocoes": promos,
+    }
+
+
 # ================= FERRAMENTA: CALCULAR FRETE ESTIMADO =================
 
 # (keywords, peso_g, altura_cm, largura_cm, comprimento_cm)
@@ -231,22 +480,47 @@ def _fallback_frete():
     }
 
 
-def calcular_frete_estimado(cep_destino: str, nome_produto: str, quantidade: int = 1):
+def calcular_frete_estimado(cep_destino: str, id_produto: int = None, quantidade: int = 1, nome_produto: str = None):
     """
     Estima o custo de frete da Sangali até o CEP do cliente.
 
     Use esta ferramenta quando o cliente perguntar sobre frete, entrega, prazo ou custo de envio.
     IMPORTANTE: Chame esta ferramenta SOMENTE após o cliente informar o CEP.
-    Se o CEP ainda não foi fornecido na conversa, pergunte ao cliente antes de usar esta ferramenta.
+
+    Forneça preferencialmente o `id_produto` (mais preciso). `nome_produto`
+    só deve ser usado se você não souber o id ainda.
 
     Args:
         cep_destino:  CEP do cliente (ex: "29900-161" ou "29900161").
-        nome_produto: Produto principal de interesse (ex: "cueca boxer", "conjunto", "legging").
-        quantidade:   Quantidade de itens estimados no pedido (padrão 1).
+        id_produto:   id numérico do produto principal (do consultar_estoque_supabase).
+                      Determinístico — peso/dimensão lidos do banco.
+        quantidade:   Quantidade de itens estimados (padrão 1, máximo 50).
+        nome_produto: Fallback textual quando id_produto desconhecido.
+                      Usado para classificar peso por keyword.
     """
     cep_limpo = _validar_cep(cep_destino)
     if not cep_limpo:
         return {"status": "erro_cep", "msg": "CEP inválido. Informe o CEP com 8 dígitos, ex: 87013-000."}
+
+    try:
+        quantidade = max(1, min(50, int(quantidade)))
+    except (TypeError, ValueError):
+        quantidade = 1
+
+    nome_para_peso = None
+    if id_produto:
+        try:
+            r = supabase.table("produtos_estoque").select("nome, nome_grupo").eq("id_produto", int(id_produto)).limit(1).execute()
+            if r.data:
+                nome_para_peso = (r.data[0].get("nome") or "") + " " + (r.data[0].get("nome_grupo") or "")
+        except Exception as e:
+            print(f"⚠️ Frete: lookup id_produto={id_produto} falhou: {e}")
+
+    if not nome_para_peso:
+        nome_para_peso = nome_produto or ""
+
+    if not nome_para_peso:
+        return {"status": "erro", "msg": "Informe id_produto ou nome_produto para estimar o pacote."}
 
     try:
         cfg = supabase.table("bot_settings").select("cep_origem").eq("id", 1).single().execute()
@@ -258,8 +532,8 @@ def calcular_frete_estimado(cep_destino: str, nome_produto: str, quantidade: int
     if not cep_origem:
         return {"status": "erro_config", "msg": "Configuração da loja ausente. Transfira para atendente."}
 
-    peso_g, alt, larg, comp = _estimar_pacote(nome_produto, quantidade)
-    print(f"📦 Frete: cep_destino={cep_limpo} | produto='{nome_produto}' qtd={quantidade} | pacote={peso_g}g {alt}x{larg}x{comp}cm")
+    peso_g, alt, larg, comp = _estimar_pacote(nome_para_peso, quantidade)
+    print(f"📦 Frete: cep_destino={cep_limpo} | id={id_produto} nome='{nome_para_peso[:40]}' qtd={quantidade} | pacote={peso_g}g {alt}x{larg}x{comp}cm")
 
     payload = {
         "from": {"postal_code": cep_origem},
@@ -445,7 +719,14 @@ def process_and_respond(user_id):
         transferir_para_atendente = criar_tool_transferir(user_id)
         model = genai.GenerativeModel(
             model_name='gemini-3-flash-preview',
-            tools=[consultar_estoque_supabase, transferir_para_atendente, calcular_frete_estimado],
+            tools=[
+                consultar_estoque_supabase,
+                consultar_produto_por_id,
+                calcular_total,
+                verificar_promocao_hoje,
+                transferir_para_atendente,
+                calcular_frete_estimado,
+            ],
             system_instruction=system_instruction_dinamica
         )
 
