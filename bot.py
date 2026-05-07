@@ -90,9 +90,9 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
     try:
         rpc_params = {
             'query_embedding': vetor_busca,
-            'match_threshold': 0.4, # Sensibilidade da similaridade
-            'match_count': 50,      # Trazemos 50 candidatos (já filtrados por tamanho no banco)
-            'filtro_tamanho': tamanho_alvo # <--- PRE-FILTERING: O Banco já filtra o tamanho!
+            'match_threshold': 0.5,
+            'match_count': 10,
+            'filtro_tamanho': tamanho_alvo
         }
         response = supabase.rpc('buscar_produtos_semantico', rpc_params).execute()
         produtos_candidatos = response.data
@@ -154,18 +154,8 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
             except Exception as e:
                 print(f"⚠️ Erro ao buscar imagens: {e}")
         
-        print(f"\n--- DEBUG: TOP {len(produtos_candidatos)} SEMELHANÇAS ENCONTRADAS ---")
-        try:
-            with open("matches.txt", "w", encoding="utf-8") as f:
-                f.write(f"--- DEBUG: TOP {len(produtos_candidatos)} SEMELHANÇAS ENCONTRADAS ---\n")
-                for i, p in enumerate(produtos_candidatos):
-                    line = f"{i+1}. {p.get('nome')} | Tamanho: {p.get('tamanho')} | Preço: {p.get('preco')}"
-                    print(line)
-                    f.write(line + "\n")
-                f.write("----------------------------------------------------------------\n")
-        except Exception as e:
-            print(f"Erro ao gravar log: {e}")
-        print("----------------------------------------------------------------\n")
+        for i, p in enumerate(produtos_candidatos):
+            print(f"  {i+1}. {p.get('nome')} | T:{p.get('tamanho')} | R$ {p.get('preco')}")
     except Exception as e:
         print(f"❌ Erro RPC: {e}")
         return {"status": "erro", "msg": "Erro ao consultar banco de dados."}
@@ -186,18 +176,16 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
     if not validados:
         return {"status": "vazio", "msg": f"Não encontrei nada disponível no tamanho {tamanho_alvo}."}
 
-    # 4. Curadoria Final (DELEGADA PARA A IA)
-    # Retornamos todo o TOP 50 para a IA ter o máximo de opções para escolher
-    selecao = validados[:50]
-    
-    # Deduplica (caso raro de duplicatas no banco)
-    selecao = [dict(t) for t in {tuple(d.items()) for d in selecao}]
+    # 4. Top-K final preservando ordem do boost (set destruía ordenação)
+    vistos = set()
+    selecao = []
+    for p in validados[:10]:
+        chave = p.get('id_unico')
+        if chave and chave not in vistos:
+            vistos.add(chave)
+            selecao.append(p)
 
-    print(f"[SEMÂNTICO] Sucesso! Retornando {len(selecao)} itens selecionados.")
-    # DEBUG: Verificar se imagens estão indo para a IA
-    for s in selecao:
-        print(f"DEBUG TOOL: Produto {s['id_produto']} - Imagem: {s.get('imagem')}")
-    
+    print(f"[SEMÂNTICO] Retornando {len(selecao)} itens.")
     return {"status": "sucesso", "produtos": selecao}
 
 # ================= FERRAMENTA: CALCULAR FRETE ESTIMADO =================
@@ -467,13 +455,6 @@ def process_and_respond(user_id):
         resposta_texto = response.text
         print(f"DEBUG OUTPUT: '{resposta_texto}'")
 
-        # DEBUG: Salva resposta crua em arquivo para análise
-        try:
-            with open("bot_response_debug.txt", "w", encoding="utf-8") as f:
-                f.write(resposta_texto)
-        except:
-            pass
-
         save_message(user_id, "model", resposta_texto)
         
         # NOVA LÓGICA: Split para separar textos e imagens de forma linear e robusta.
@@ -576,10 +557,10 @@ def webhook(evento=None, tipo=None):
 if __name__ == '__main__':
     # Inicia os schedulers de sincronização
     scheduler = BackgroundScheduler()
-    scheduler.add_job(sync_otimizado, 'interval', minutes=5, misfire_grace_time=120)
+    scheduler.add_job(sync_otimizado, 'interval', minutes=30, misfire_grace_time=300)
     scheduler.add_job(sync_images, 'cron', hour=9, minute=0, misfire_grace_time=3600)
     scheduler.start()
-    print("⏰ Schedulers iniciados: ERP (5 min) | Imagens (diário 6h BRT)")
+    print("⏰ Schedulers iniciados: ERP (30 min) | Imagens (diário 6h BRT)")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host='0.0.0.0', port=port)
