@@ -337,7 +337,7 @@ def calcular_total(itens_json: str, modo: str = "varejo", primeira_compra: bool 
     try:
         resp = (
             supabase.table("produtos_estoque")
-            .select("id_produto, nome, preco_varejo, preco_atacado")
+            .select("id_produto, nome, preco_varejo, preco_atacado, preco_atacado_aprazo")
             .in_("id_produto", [str(i) for i in ids])
             .execute()
         )
@@ -354,6 +354,7 @@ def calcular_total(itens_json: str, modo: str = "varejo", primeira_compra: bool 
                 "nome": r.get("nome"),
                 "preco_varejo": float(r.get("preco_varejo") or 0),
                 "preco_atacado": float(r.get("preco_atacado") or 0),
+                "preco_atacado_aprazo": float(r.get("preco_atacado_aprazo") or 0),
             }
 
     cfg = _ler_config_atacado()
@@ -369,9 +370,13 @@ def calcular_total(itens_json: str, modo: str = "varejo", primeira_compra: bool 
             nao_encontrados.append(pid)
             continue
         pv = info["preco_varejo"]
-        pa = info["preco_atacado"] or pv * (1 - cfg["desconto_avista"])
-        # à prazo derivado de varejo com desconto separado:
-        pap = pv * (1 - cfg["desconto_aprazo"])
+        # Atacado à vista: lê do DB. Se ausente ou igual ao varejo (cadastro
+        # incompleto no ERP), aplica desconto configurável.
+        pa_raw = info["preco_atacado"]
+        pa = pa_raw if pa_raw and pa_raw < pv else pv * (1 - cfg["desconto_avista"])
+        # Atacado a prazo: lê do DB. Mesmo critério de fallback.
+        pap_raw = info["preco_atacado_aprazo"]
+        pap = pap_raw if pap_raw and pap_raw < pv else pv * (1 - cfg["desconto_aprazo"])
 
         subtotal_varejo += pv * qtd
         subtotal_atacado_avista += pa * qtd

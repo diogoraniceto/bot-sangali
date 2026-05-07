@@ -73,15 +73,80 @@ def get_lojas():
         return []
 
 
+def _strip_acentos_upper(s):
+    """Normaliza string para comparação: uppercase + strip de acentos comuns."""
+    if not s:
+        return ""
+    t = s.upper().strip()
+    repl = (('Á','A'),('À','A'),('Â','A'),('Ã','A'),('Ä','A'),
+            ('É','E'),('È','E'),('Ê','E'),('Ë','E'),
+            ('Í','I'),('Ì','I'),('Î','I'),('Ï','I'),
+            ('Ó','O'),('Ò','O'),('Ô','O'),('Õ','O'),('Ö','O'),
+            ('Ú','U'),('Ù','U'),('Û','U'),('Ü','U'),
+            ('Ç','C'),('Ñ','N'))
+    for src, dst in repl:
+        t = t.replace(src, dst)
+    return t
+
+
+def _classificar_tipo_preco(nome_tipo):
+    """Classifica nome_tipo cru da API GestãoClick em chave canônica.
+
+    A API retorna 4 tipos por produto:
+        VAREJO CRÉDITO   -> 'varejo'           (preço de tabela / crédito)
+        VAREJO A VISTA   -> 'varejo_avista'    (varejo com desconto à vista)
+        ATACADO A VISTA  -> 'atacado_avista'   (atacado à vista, melhor preço)
+        ATACADO CRÉDITO  -> 'atacado_aprazo'   (atacado parcelado)
+
+    Retorna None se nome_tipo não casa com nenhum padrão conhecido.
+    """
+    t = _strip_acentos_upper(nome_tipo)
+    if not t:
+        return None
+    tem_varejo = 'VAREJO' in t
+    tem_atacado = 'ATACADO' in t
+    tem_vista = 'VISTA' in t
+    if tem_varejo and not tem_atacado:
+        return 'varejo_avista' if tem_vista else 'varejo'
+    if tem_atacado and not tem_varejo:
+        return 'atacado_avista' if tem_vista else 'atacado_aprazo'
+    return None
+
+
+def _extrair_precos(valores_list, valor_venda_base):
+    """Dado o array `valores` (do produto ou da variação) e o valor_venda base,
+    retorna dict com as 4 chaves de preço, com fallbacks coerentes.
+    """
+    out = {'varejo': 0.0, 'varejo_avista': 0.0, 'atacado_avista': 0.0, 'atacado_aprazo': 0.0}
+    for v in (valores_list or []):
+        chave = _classificar_tipo_preco(v.get('nome_tipo'))
+        if chave is None:
+            continue
+        try:
+            out[chave] = float(v.get('valor_venda') or 0)
+        except (TypeError, ValueError):
+            pass
+    base = float(valor_venda_base or 0)
+    if not out['varejo']:
+        out['varejo'] = base
+    if not out['varejo_avista']:
+        out['varejo_avista'] = out['varejo']
+    if not out['atacado_avista']:
+        out['atacado_avista'] = out['varejo']
+    if not out['atacado_aprazo']:
+        out['atacado_aprazo'] = out['atacado_avista']
+    return out
+
+
 def carregar_estado_atual_do_banco():
-    """Carrega todos os registros do banco: id_unico -> {nome, estoque, preco, id_loja}."""
+    """Carrega todos os registros do banco: id_unico -> {nome, estoque, preço, id_loja}."""
     estado = {}
     offset = 0
     PAGE_SIZE = 1000
 
     while True:
         resp = supabase_client.table("produtos_estoque") \
-            .select("id_unico, nome, estoque, preco, preco_varejo, preco_atacado, id_loja, grupo_id, nome_grupo") \
+            .select("id_unico, nome, estoque, preco, preco_varejo, preco_varejo_avista, preco_atacado, preco_atacado_aprazo, id_loja, grupo_id, nome_grupo") \
             .range(offset, offset + PAGE_SIZE - 1) \
             .execute()
 
@@ -94,7 +159,9 @@ def carregar_estado_atual_do_banco():
                 "estoque": float(row["estoque"] or 0),
                 "preco": float(row["preco"] or 0),
                 "preco_varejo": float(row.get("preco_varejo") or 0),
+                "preco_varejo_avista": float(row.get("preco_varejo_avista") or 0),
                 "preco_atacado": float(row.get("preco_atacado") or 0),
+                "preco_atacado_aprazo": float(row.get("preco_atacado_aprazo") or 0),
                 "id_loja": row.get("id_loja"),
                 "grupo_id": row.get("grupo_id"),
                 "nome_grupo": row.get("nome_grupo")
@@ -172,20 +239,11 @@ def sync_otimizado():
                     grupo_id = produto.get('grupo_id')
                     nome_grupo = produto.get('nome_grupo')
 
-                    # Extrai precos do produto base
-                    prod_preco_varejo = 0.0
-                    prod_preco_atacado = 0.0
-                    prod_preco_base = float(produto.get('valor_venda') or 0)
-
-                    valores_prod = produto.get('valores', [])
-                    for v in valores_prod:
-                        if v.get('nome_tipo') == 'Varejo':
-                            prod_preco_varejo = float(v.get('valor_venda') or 0)
-                        elif v.get('nome_tipo') == 'Atacado':
-                            prod_preco_atacado = float(v.get('valor_venda') or 0)
-
-                    if not prod_preco_varejo: prod_preco_varejo = prod_preco_base
-                    if not prod_preco_atacado: prod_preco_atacado = prod_preco_varejo
+                    # Extrai os 4 preços do produto base
+                    precos_prod = _extrair_precos(
+                        produto.get('valores', []),
+                        produto.get('valor_venda')
+                    )
 
                     registros_produto = []
 
@@ -197,23 +255,18 @@ def sync_otimizado():
 
                             qtd = float(variacao.get('estoque') or 0)
 
-                            var_preco_varejo = 0.0
-                            var_preco_atacado = 0.0
-                            var_preco_base = float(variacao.get('valor_venda') or 0)
-
-                            valores_var = variacao.get('valores', [])
+                            # Variação tem seus próprios valores; senão herda do produto base
+                            valores_var = variacao.get('valores') or []
+                            base_var = variacao.get('valor_venda') or produto.get('valor_venda')
                             if valores_var:
-                                for v in valores_var:
-                                    if v.get('nome_tipo') == 'Varejo':
-                                        var_preco_varejo = float(v.get('valor_venda') or 0)
-                                    elif v.get('nome_tipo') == 'Atacado':
-                                        var_preco_atacado = float(v.get('valor_venda') or 0)
+                                precos_var = _extrair_precos(valores_var, base_var)
                             else:
-                                var_preco_varejo = var_preco_base
-                                var_preco_atacado = var_preco_base
+                                precos_var = dict(precos_prod)
 
-                            final_varejo = var_preco_varejo if var_preco_varejo > 0 else prod_preco_varejo
-                            final_atacado = var_preco_atacado if var_preco_atacado > 0 else prod_preco_atacado
+                            final = {
+                                k: (precos_var[k] if precos_var[k] > 0 else precos_prod[k])
+                                for k in ('varejo','varejo_avista','atacado_avista','atacado_aprazo')
+                            }
 
                             if qtd > 0:
                                 registros_produto.append({
@@ -223,9 +276,11 @@ def sync_otimizado():
                                     "loja": loja_nome,
                                     "nome": base_nome,
                                     "tamanho": tamanho,
-                                    "preco": final_varejo,
-                                    "preco_varejo": final_varejo,
-                                    "preco_atacado": final_atacado,
+                                    "preco": final['varejo'],
+                                    "preco_varejo": final['varejo'],
+                                    "preco_varejo_avista": final['varejo_avista'],
+                                    "preco_atacado": final['atacado_avista'],
+                                    "preco_atacado_aprazo": final['atacado_aprazo'],
                                     "estoque": qtd,
                                     "grupo_id": grupo_id,
                                     "nome_grupo": nome_grupo
@@ -241,9 +296,11 @@ def sync_otimizado():
                                 "loja": loja_nome,
                                 "nome": base_nome,
                                 "tamanho": "ÚNICO",
-                                "preco": prod_preco_varejo,
-                                "preco_varejo": prod_preco_varejo,
-                                "preco_atacado": prod_preco_atacado,
+                                "preco": precos_prod['varejo'],
+                                "preco_varejo": precos_prod['varejo'],
+                                "preco_varejo_avista": precos_prod['varejo_avista'],
+                                "preco_atacado": precos_prod['atacado_avista'],
+                                "preco_atacado_aprazo": precos_prod['atacado_aprazo'],
                                 "estoque": qtd,
                                 "grupo_id": grupo_id,
                                 "nome_grupo": nome_grupo
@@ -276,7 +333,9 @@ def sync_otimizado():
                         elif (existente["estoque"] != reg["estoque"] or
                               existente["preco"] != reg["preco"] or
                               existente["preco_varejo"] != reg["preco_varejo"] or
+                              existente.get("preco_varejo_avista", 0) != reg["preco_varejo_avista"] or
                               existente["preco_atacado"] != reg["preco_atacado"] or
+                              existente.get("preco_atacado_aprazo", 0) != reg["preco_atacado_aprazo"] or
                               existente.get("grupo_id") != reg["grupo_id"] or
                               existente.get("nome_grupo") != reg["nome_grupo"]):
                             batch_upsert.append(reg)
