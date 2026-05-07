@@ -56,18 +56,37 @@ def save_message(user_id, role, content):
         "content": content
     }).execute()
 
-def get_history(user_id, limit=10):
+def get_history(user_id, limit=30):
     response = supabase.table("chat_history") \
         .select("role, content") \
         .eq("user_id", user_id) \
         .order("created_at", desc=True) \
         .limit(limit) \
         .execute()
-    
+
     history = []
     for msg in reversed(response.data):
         history.append({"role": msg["role"], "parts": [msg["content"]]})
     return history
+
+
+def log_turn(user_id, user_input, tool_calls, final_output, latency_ms, model_name, output_format, fallback_used, error=None):
+    """Insere registro estruturado em bot_turns. Falha silenciosa — não bloqueia resposta."""
+    try:
+        supabase.table("bot_turns").insert({
+            "user_id": user_id,
+            "user_input": user_input,
+            "tool_calls": tool_calls,
+            "final_output": final_output,
+            "latency_ms": latency_ms,
+            "model": model_name,
+            "output_format": output_format,
+            "fallback_used": fallback_used,
+            "error": error,
+        }).execute()
+    except Exception as e:
+        # Tabela pode não existir ainda (migration 0003 não aplicada). Não bloqueia o bot.
+        print(f"⚠️ log_turn falhou (bot_turns existe?): {e}")
 
 # ================= NOVA FERRAMENTA DE BUSCA (SUPABASE) =================
 
@@ -90,9 +109,9 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
     try:
         rpc_params = {
             'query_embedding': vetor_busca,
-            'match_threshold': 0.4, # Sensibilidade da similaridade
-            'match_count': 50,      # Trazemos 50 candidatos (já filtrados por tamanho no banco)
-            'filtro_tamanho': tamanho_alvo # <--- PRE-FILTERING: O Banco já filtra o tamanho!
+            'match_threshold': 0.5,
+            'match_count': 10,
+            'filtro_tamanho': tamanho_alvo
         }
         response = supabase.rpc('buscar_produtos_semantico', rpc_params).execute()
         produtos_candidatos = response.data
@@ -154,18 +173,8 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
             except Exception as e:
                 print(f"⚠️ Erro ao buscar imagens: {e}")
         
-        print(f"\n--- DEBUG: TOP {len(produtos_candidatos)} SEMELHANÇAS ENCONTRADAS ---")
-        try:
-            with open("matches.txt", "w", encoding="utf-8") as f:
-                f.write(f"--- DEBUG: TOP {len(produtos_candidatos)} SEMELHANÇAS ENCONTRADAS ---\n")
-                for i, p in enumerate(produtos_candidatos):
-                    line = f"{i+1}. {p.get('nome')} | Tamanho: {p.get('tamanho')} | Preço: {p.get('preco')}"
-                    print(line)
-                    f.write(line + "\n")
-                f.write("----------------------------------------------------------------\n")
-        except Exception as e:
-            print(f"Erro ao gravar log: {e}")
-        print("----------------------------------------------------------------\n")
+        for i, p in enumerate(produtos_candidatos):
+            print(f"  {i+1}. {p.get('nome')} | T:{p.get('tamanho')} | R$ {p.get('preco')}")
     except Exception as e:
         print(f"❌ Erro RPC: {e}")
         return {"status": "erro", "msg": "Erro ao consultar banco de dados."}
@@ -186,19 +195,266 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
     if not validados:
         return {"status": "vazio", "msg": f"Não encontrei nada disponível no tamanho {tamanho_alvo}."}
 
-    # 4. Curadoria Final (DELEGADA PARA A IA)
-    # Retornamos todo o TOP 50 para a IA ter o máximo de opções para escolher
-    selecao = validados[:50]
-    
-    # Deduplica (caso raro de duplicatas no banco)
-    selecao = [dict(t) for t in {tuple(d.items()) for d in selecao}]
+    # 4. Top-K final preservando ordem do boost (set destruía ordenação)
+    vistos = set()
+    selecao = []
+    for p in validados[:10]:
+        chave = p.get('id_unico')
+        if chave and chave not in vistos:
+            vistos.add(chave)
+            selecao.append(p)
 
-    print(f"[SEMÂNTICO] Sucesso! Retornando {len(selecao)} itens selecionados.")
-    # DEBUG: Verificar se imagens estão indo para a IA
-    for s in selecao:
-        print(f"DEBUG TOOL: Produto {s['id_produto']} - Imagem: {s.get('imagem')}")
-    
+    print(f"[SEMÂNTICO] Retornando {len(selecao)} itens.")
     return {"status": "sucesso", "produtos": selecao}
+
+# ================= FERRAMENTAS DE CONSULTA DETERMINÍSTICA =================
+
+def consultar_produto_por_id(id_produto: int):
+    """
+    Lê o produto direto do banco por id, com todas as variações ativas (estoque > 0).
+
+    Use esta ferramenta SEMPRE que precisar revalidar preço, estoque ou tamanhos
+    disponíveis de um produto que já apareceu na conversa antes de citar
+    valor ao cliente. Ela é a fonte da verdade — não confie em preços
+    lembrados de turnos anteriores.
+
+    Args:
+        id_produto: o id numérico do produto (campo id_produto da tabela produtos_estoque).
+
+    Returns:
+        {status, produto: {id_produto, nome, nome_grupo, variacoes: [{id_unico, tamanho, preco_varejo, preco_atacado, estoque, loja}]}}
+    """
+    try:
+        resp = (
+            supabase.table("produtos_estoque")
+            .select("id_unico, id_produto, id_loja, loja, nome, tamanho, preco_varejo, preco_atacado, estoque, grupo_id, nome_grupo")
+            .eq("id_produto", str(id_produto))
+            .gt("estoque", 0)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as e:
+        print(f"❌ Erro consultar_produto_por_id({id_produto}): {e}")
+        return {"status": "erro", "msg": "Erro ao consultar produto."}
+
+    if not rows:
+        return {"status": "nao_encontrado", "msg": f"Produto {id_produto} sem estoque ou inexistente."}
+
+    base = rows[0]
+    variacoes = [
+        {
+            "id_unico": r["id_unico"],
+            "tamanho": r.get("tamanho"),
+            "preco_varejo": float(r.get("preco_varejo") or 0),
+            "preco_atacado": float(r.get("preco_atacado") or 0),
+            "estoque": float(r.get("estoque") or 0),
+            "loja": r.get("loja"),
+        }
+        for r in rows
+    ]
+    return {
+        "status": "sucesso",
+        "produto": {
+            "id_produto": base["id_produto"],
+            "nome": base.get("nome"),
+            "nome_grupo": base.get("nome_grupo"),
+            "variacoes": variacoes,
+        },
+    }
+
+
+# Defaults caso bot_settings não tenha configurado os parâmetros de atacado.
+_ATACADO_DEFAULT = {
+    "desconto_avista": 0.30,
+    "desconto_aprazo": 0.25,
+    "minimo_primeira_compra": 600.0,
+    "minimo_proxima_compra": 400.0,
+    "parcelas_max": 6,
+}
+
+
+def _ler_config_atacado():
+    """Lê parâmetros de atacado de bot_settings com fallback para defaults."""
+    try:
+        cfg = supabase.table("bot_settings").select(
+            "atacado_desconto_avista, atacado_desconto_aprazo, atacado_minimo_primeira, atacado_minimo_proxima, atacado_parcelas_max"
+        ).eq("id", 1).single().execute()
+        d = cfg.data or {}
+    except Exception:
+        d = {}
+    return {
+        "desconto_avista": float(d.get("atacado_desconto_avista") or _ATACADO_DEFAULT["desconto_avista"]),
+        "desconto_aprazo": float(d.get("atacado_desconto_aprazo") or _ATACADO_DEFAULT["desconto_aprazo"]),
+        "minimo_primeira_compra": float(d.get("atacado_minimo_primeira") or _ATACADO_DEFAULT["minimo_primeira_compra"]),
+        "minimo_proxima_compra": float(d.get("atacado_minimo_proxima") or _ATACADO_DEFAULT["minimo_proxima_compra"]),
+        "parcelas_max": int(d.get("atacado_parcelas_max") or _ATACADO_DEFAULT["parcelas_max"]),
+    }
+
+
+def calcular_total(itens_json: str, modo: str = "varejo", primeira_compra: bool = False):
+    """
+    Calcula o total de um carrinho, com desconto correto por modo e validação de mínimo.
+
+    Use esta ferramenta SEMPRE antes de citar valor agregado, total, desconto
+    ou parcelado para o cliente. Não calcule de cabeça — chame aqui.
+
+    Args:
+        itens_json: JSON string de uma lista de itens, no formato
+                    '[{"id_produto": 123, "qtd": 2}, {"id_produto": 456, "qtd": 1}]'.
+                    Use os id_produto retornados por consultar_estoque_supabase.
+        modo: "varejo" | "atacado_avista" | "atacado_aprazo".
+              "varejo" = preço cheio. "atacado_avista" = preço de atacado em pix/dinheiro.
+              "atacado_aprazo" = preço de atacado parcelado.
+        primeira_compra: True se é a primeira compra do cliente no atacado
+                         (mínimo R$ 600). False se já comprou antes (mínimo R$ 400).
+                         Ignorado em modo varejo.
+
+    Returns:
+        {status, subtotal_varejo, total, desconto, minimo_exigido, minimo_atingido,
+         falta_para_minimo, parcelado_6x, itens_detalhados: [...]}
+    """
+    try:
+        itens = json.loads(itens_json) if isinstance(itens_json, str) else itens_json
+        if not isinstance(itens, list) or not itens:
+            return {"status": "erro", "msg": "itens_json deve ser uma lista não vazia."}
+    except json.JSONDecodeError as e:
+        return {"status": "erro", "msg": f"itens_json inválido: {e}"}
+
+    ids = []
+    qtd_por_id = {}
+    for item in itens:
+        try:
+            pid = int(item["id_produto"])
+            qtd = max(1, int(item.get("qtd", 1)))
+            ids.append(pid)
+            qtd_por_id[pid] = qtd_por_id.get(pid, 0) + qtd
+        except (KeyError, TypeError, ValueError):
+            return {"status": "erro", "msg": f"item inválido: {item}. Esperado {{id_produto, qtd}}."}
+
+    if modo not in ("varejo", "atacado_avista", "atacado_aprazo"):
+        return {"status": "erro", "msg": f"modo inválido: {modo}"}
+
+    try:
+        resp = (
+            supabase.table("produtos_estoque")
+            .select("id_produto, nome, preco_varejo, preco_atacado")
+            .in_("id_produto", [str(i) for i in ids])
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as e:
+        print(f"❌ Erro calcular_total: {e}")
+        return {"status": "erro", "msg": "Erro ao consultar produtos."}
+
+    precos = {}
+    for r in rows:
+        pid = int(r["id_produto"])
+        if pid not in precos:
+            precos[pid] = {
+                "nome": r.get("nome"),
+                "preco_varejo": float(r.get("preco_varejo") or 0),
+                "preco_atacado": float(r.get("preco_atacado") or 0),
+            }
+
+    cfg = _ler_config_atacado()
+    subtotal_varejo = 0.0
+    subtotal_atacado_avista = 0.0
+    subtotal_atacado_aprazo = 0.0
+    detalhes = []
+    nao_encontrados = []
+
+    for pid, qtd in qtd_por_id.items():
+        info = precos.get(pid)
+        if not info:
+            nao_encontrados.append(pid)
+            continue
+        pv = info["preco_varejo"]
+        pa = info["preco_atacado"] or pv * (1 - cfg["desconto_avista"])
+        # à prazo derivado de varejo com desconto separado:
+        pap = pv * (1 - cfg["desconto_aprazo"])
+
+        subtotal_varejo += pv * qtd
+        subtotal_atacado_avista += pa * qtd
+        subtotal_atacado_aprazo += pap * qtd
+        detalhes.append({
+            "id_produto": pid,
+            "nome": info["nome"],
+            "qtd": qtd,
+            "preco_varejo_unit": round(pv, 2),
+            "preco_atacado_avista_unit": round(pa, 2),
+            "preco_atacado_aprazo_unit": round(pap, 2),
+        })
+
+    if nao_encontrados:
+        return {"status": "erro", "msg": f"id_produto não encontrado(s): {nao_encontrados}"}
+
+    if modo == "varejo":
+        total = subtotal_varejo
+        minimo = 0.0
+    elif modo == "atacado_avista":
+        total = subtotal_atacado_avista
+        minimo = cfg["minimo_primeira_compra"] if primeira_compra else cfg["minimo_proxima_compra"]
+    else:  # atacado_aprazo
+        total = subtotal_atacado_aprazo
+        minimo = cfg["minimo_primeira_compra"] if primeira_compra else cfg["minimo_proxima_compra"]
+
+    desconto = subtotal_varejo - total if modo != "varejo" else 0.0
+    minimo_atingido = total >= minimo if minimo > 0 else True
+    falta = max(0.0, minimo - total) if minimo > 0 else 0.0
+    parcela = total / cfg["parcelas_max"] if cfg["parcelas_max"] > 0 else total
+
+    return {
+        "status": "sucesso",
+        "modo": modo,
+        "primeira_compra": primeira_compra,
+        "subtotal_varejo": round(subtotal_varejo, 2),
+        "total": round(total, 2),
+        "desconto": round(desconto, 2),
+        "minimo_exigido": round(minimo, 2),
+        "minimo_atingido": minimo_atingido,
+        "falta_para_minimo": round(falta, 2),
+        "parcelado": {"parcelas": cfg["parcelas_max"], "valor_parcela": round(parcela, 2)} if modo == "atacado_aprazo" else None,
+        "itens_detalhados": detalhes,
+    }
+
+
+def verificar_promocao_hoje():
+    """
+    Verifica se há promoção ativa hoje (Dia S e similares).
+
+    Use esta ferramenta SEMPRE antes de mencionar Dia S, desconto promocional
+    ou qualquer oferta atrelada a dia da semana. Nunca afirme que existe
+    promoção sem chamar essa tool primeiro.
+
+    Returns:
+        {status, hoje_dia_semana, promocoes: [{nome, categoria, percentual, formas_pagamento, troca_permitida, observacao}]}
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+        # America/Sao_Paulo = UTC-3
+        agora = datetime.now(timezone(timedelta(hours=-3)))
+        # Postgres extract(dow): 0=domingo. Python weekday(): 0=segunda.
+        # Vamos usar o padrão Postgres: 0=dom, 1=seg, ..., 6=sab.
+        dow = (agora.weekday() + 1) % 7
+
+        resp = (
+            supabase.table("promocoes_ativas")
+            .select("nome, categoria, percentual, formas_pagamento, troca_permitida, observacao")
+            .eq("dia_semana", dow)
+            .eq("ativa", True)
+            .execute()
+        )
+        promos = resp.data or []
+    except Exception as e:
+        print(f"❌ Erro verificar_promocao_hoje: {e}")
+        return {"status": "erro", "msg": "Erro ao consultar promoções."}
+
+    return {
+        "status": "sucesso",
+        "hoje_dia_semana": dow,
+        "promocoes": promos,
+    }
+
 
 # ================= FERRAMENTA: CALCULAR FRETE ESTIMADO =================
 
@@ -243,22 +499,47 @@ def _fallback_frete():
     }
 
 
-def calcular_frete_estimado(cep_destino: str, nome_produto: str, quantidade: int = 1):
+def calcular_frete_estimado(cep_destino: str, id_produto: int = None, quantidade: int = 1, nome_produto: str = None):
     """
     Estima o custo de frete da Sangali até o CEP do cliente.
 
     Use esta ferramenta quando o cliente perguntar sobre frete, entrega, prazo ou custo de envio.
     IMPORTANTE: Chame esta ferramenta SOMENTE após o cliente informar o CEP.
-    Se o CEP ainda não foi fornecido na conversa, pergunte ao cliente antes de usar esta ferramenta.
+
+    Forneça preferencialmente o `id_produto` (mais preciso). `nome_produto`
+    só deve ser usado se você não souber o id ainda.
 
     Args:
         cep_destino:  CEP do cliente (ex: "29900-161" ou "29900161").
-        nome_produto: Produto principal de interesse (ex: "cueca boxer", "conjunto", "legging").
-        quantidade:   Quantidade de itens estimados no pedido (padrão 1).
+        id_produto:   id numérico do produto principal (do consultar_estoque_supabase).
+                      Determinístico — peso/dimensão lidos do banco.
+        quantidade:   Quantidade de itens estimados (padrão 1, máximo 50).
+        nome_produto: Fallback textual quando id_produto desconhecido.
+                      Usado para classificar peso por keyword.
     """
     cep_limpo = _validar_cep(cep_destino)
     if not cep_limpo:
         return {"status": "erro_cep", "msg": "CEP inválido. Informe o CEP com 8 dígitos, ex: 87013-000."}
+
+    try:
+        quantidade = max(1, min(50, int(quantidade)))
+    except (TypeError, ValueError):
+        quantidade = 1
+
+    nome_para_peso = None
+    if id_produto:
+        try:
+            r = supabase.table("produtos_estoque").select("nome, nome_grupo").eq("id_produto", str(id_produto)).limit(1).execute()
+            if r.data:
+                nome_para_peso = (r.data[0].get("nome") or "") + " " + (r.data[0].get("nome_grupo") or "")
+        except Exception as e:
+            print(f"⚠️ Frete: lookup id_produto={id_produto} falhou: {e}")
+
+    if not nome_para_peso:
+        nome_para_peso = nome_produto or ""
+
+    if not nome_para_peso:
+        return {"status": "erro", "msg": "Informe id_produto ou nome_produto para estimar o pacote."}
 
     try:
         cfg = supabase.table("bot_settings").select("cep_origem").eq("id", 1).single().execute()
@@ -270,8 +551,8 @@ def calcular_frete_estimado(cep_destino: str, nome_produto: str, quantidade: int
     if not cep_origem:
         return {"status": "erro_config", "msg": "Configuração da loja ausente. Transfira para atendente."}
 
-    peso_g, alt, larg, comp = _estimar_pacote(nome_produto, quantidade)
-    print(f"📦 Frete: cep_destino={cep_limpo} | produto='{nome_produto}' qtd={quantidade} | pacote={peso_g}g {alt}x{larg}x{comp}cm")
+    peso_g, alt, larg, comp = _estimar_pacote(nome_para_peso, quantidade)
+    print(f"📦 Frete: cep_destino={cep_limpo} | id={id_produto} nome='{nome_para_peso[:40]}' qtd={quantidade} | pacote={peso_g}g {alt}x{larg}x{comp}cm")
 
     payload = {
         "from": {"postal_code": cep_origem},
@@ -412,8 +693,217 @@ def criar_tool_transferir(user_id):
 
 # ================= CONFIGURAÇÃO DA IA (MODELO) =================
 
-# O modelo será inicializado dinamicamente dentro da função process_and_respond
-# model = genai.GenerativeModel(...)
+# Schema da resposta final do LLM. resposta_texto NÃO deve conter URLs;
+# o código monta as cards de produto a partir de produtos_recomendados,
+# usando dados canônicos retornados pelas tools no mesmo turno.
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "resposta_texto": {"type": "string"},
+        "produtos_recomendados": {
+            "type": "array",
+            "items": {"type": "integer"},
+        },
+    },
+    "required": ["resposta_texto"],
+}
+
+GENERATION_CONFIG = {
+    "response_mime_type": "application/json",
+    "response_schema": RESPONSE_SCHEMA,
+}
+
+
+def _coerce_to_dict(obj):
+    """Converte struct/proto/dict-like em dict puro."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    try:
+        from google.protobuf.json_format import MessageToDict
+        if hasattr(obj, '_pb'):
+            return MessageToDict(obj._pb, preserving_proto_field_name=True)
+        return MessageToDict(obj, preserving_proto_field_name=True)
+    except Exception:
+        try:
+            return dict(obj)
+        except Exception:
+            return None
+
+
+def extrair_produtos_de_tool_results(chat_history):
+    """
+    Indexa por id_produto o ÚLTIMO retorno de consultar_estoque_supabase
+    e consultar_produto_por_id na history. Resultado: cache canônico
+    pra renderização determinística da mensagem final.
+    """
+    cache = {}
+    for content in chat_history or []:
+        parts = getattr(content, 'parts', None) or []
+        for part in parts:
+            fr = getattr(part, 'function_response', None)
+            if not fr:
+                continue
+            tool_name = getattr(fr, 'name', None)
+            if tool_name not in ('consultar_estoque_supabase', 'consultar_produto_por_id'):
+                continue
+            response_dict = _coerce_to_dict(getattr(fr, 'response', None))
+            if not response_dict:
+                continue
+            payload = response_dict.get('result') or response_dict
+            if tool_name == 'consultar_estoque_supabase':
+                for prod in payload.get('produtos', []) or []:
+                    pid = prod.get('id_produto')
+                    try:
+                        key = int(pid)
+                    except (TypeError, ValueError):
+                        continue
+                    cache[key] = {
+                        "nome": prod.get('nome'),
+                        "preco": prod.get('preco') or prod.get('preco_varejo'),
+                        "preco_varejo": prod.get('preco_varejo'),
+                        "preco_atacado": prod.get('preco_atacado'),
+                        "imagem": prod.get('imagem'),
+                        "tamanho": prod.get('tamanho'),
+                        "id_unico": prod.get('id_unico'),
+                    }
+            elif tool_name == 'consultar_produto_por_id':
+                produto = payload.get('produto') or {}
+                pid = produto.get('id_produto')
+                try:
+                    key = int(pid)
+                except (TypeError, ValueError):
+                    continue
+                variacoes = produto.get('variacoes') or []
+                primeira = variacoes[0] if variacoes else {}
+                cache[key] = {
+                    "nome": produto.get('nome'),
+                    "preco": primeira.get('preco_varejo'),
+                    "preco_varejo": primeira.get('preco_varejo'),
+                    "preco_atacado": primeira.get('preco_atacado'),
+                    "imagem": None,
+                    "tamanho": primeira.get('tamanho'),
+                    "id_unico": primeira.get('id_unico'),
+                }
+    return cache
+
+
+def serializar_tool_calls(chat_history):
+    """Lista cronológica de tool calls com args + result (truncado) para logging."""
+    chamadas = []
+    for content in chat_history or []:
+        parts = getattr(content, 'parts', None) or []
+        for part in parts:
+            fc = getattr(part, 'function_call', None)
+            if fc and getattr(fc, 'name', None):
+                chamadas.append({
+                    "kind": "call",
+                    "name": fc.name,
+                    "args": _coerce_to_dict(getattr(fc, 'args', None)) or {},
+                })
+            fr = getattr(part, 'function_response', None)
+            if fr and getattr(fr, 'name', None):
+                resp = _coerce_to_dict(getattr(fr, 'response', None)) or {}
+                resp_str = json.dumps(resp, ensure_ascii=False, default=str)
+                if len(resp_str) > 2000:
+                    resp_str = resp_str[:2000] + "...(truncated)"
+                chamadas.append({
+                    "kind": "response",
+                    "name": fr.name,
+                    "result_digest": resp_str,
+                })
+    return chamadas
+
+
+def _formatar_preco(valor):
+    if valor is None:
+        return "—"
+    try:
+        return f"R$ {float(valor):.2f}".replace(".", ",")
+    except (TypeError, ValueError):
+        return f"R$ {valor}"
+
+
+def parsear_resposta_json(texto_bruto):
+    """
+    Tenta parsear como JSON do schema esperado.
+    Retorna (resposta_texto, produtos_recomendados, json_ok).
+    Em caso de falha, retorna (texto_bruto, [], False) e o caller cai no fallback regex.
+    """
+    if not texto_bruto:
+        return "", [], False
+    texto = texto_bruto.strip()
+    # Gemini pode envolver em ```json ... ``` se o response_schema for ignorado.
+    if texto.startswith("```"):
+        texto = re.sub(r"^```(?:json)?\s*|\s*```$", "", texto, flags=re.MULTILINE).strip()
+    try:
+        obj = json.loads(texto)
+    except json.JSONDecodeError:
+        return texto_bruto, [], False
+    if not isinstance(obj, dict):
+        return texto_bruto, [], False
+    resposta = obj.get("resposta_texto", "")
+    ids = obj.get("produtos_recomendados") or []
+    if not isinstance(ids, list):
+        ids = []
+    ids_int = []
+    for i in ids:
+        try:
+            ids_int.append(int(i))
+        except (TypeError, ValueError):
+            pass
+    return str(resposta), ids_int, True
+
+
+def renderizar_mensagem_estruturada(user_id, resposta_texto, ids_recomendados, cache):
+    """
+    Caminho determinístico: envia resposta_texto seguido de cards
+    `*Nome* - R$ Valor` + imagem por id, usando dados canônicos do cache.
+    Ids fora do cache do turno atual são ignorados (e logados).
+    """
+    if resposta_texto and resposta_texto.strip():
+        enviar_mensagem_whatsapp(user_id, resposta_texto.strip())
+
+    enviados = 0
+    ignorados = []
+    for pid in ids_recomendados[:5]:  # hard cap
+        info = cache.get(int(pid))
+        if not info:
+            ignorados.append(pid)
+            continue
+        nome = info.get("nome") or f"Produto {pid}"
+        preco_str = _formatar_preco(info.get("preco"))
+        legenda = f"*{nome}* - {preco_str}"
+        url = info.get("imagem")
+        if url:
+            time.sleep(1.0)
+            enviar_midia_whatsapp(user_id, url, legenda)
+        else:
+            time.sleep(0.5)
+            enviar_mensagem_whatsapp(user_id, legenda)
+        enviados += 1
+    if ignorados:
+        print(f"⚠️ ids fora do cache do turn: {ignorados}")
+    return enviados, ignorados
+
+
+def renderizar_mensagem_regex_fallback(user_id, texto):
+    """Fallback: parsing antigo por regex em [IMAGEM:url]."""
+    parts = re.split(r"\[IMAGEM:(.*?)\]", texto, flags=re.DOTALL)
+    if len(parts) > 1:
+        for i in range(0, len(parts) - 1, 2):
+            texto_legenda = parts[i].strip()
+            url_imagem = parts[i+1].strip()
+            if url_imagem:
+                enviar_midia_whatsapp(user_id, url_imagem, texto_legenda)
+                time.sleep(1.5)
+        ultimo_texto = parts[-1].strip()
+        if ultimo_texto:
+            enviar_mensagem_whatsapp(user_id, ultimo_texto)
+    else:
+        enviar_mensagem_whatsapp(user_id, texto)
+
 
 # ================= LÓGICA DA CONVERSA & WEBHOOK =================
 
@@ -455,59 +945,86 @@ def process_and_respond(user_id):
         
         # Instancia o modelo com a instrução ATUALIZADA
         transferir_para_atendente = criar_tool_transferir(user_id)
-        model = genai.GenerativeModel(
+
+        # Tenta com response_schema; se a versão do SDK / modelo recusar
+        # generation_config + tools, recria sem schema (cai no fallback regex).
+        modelo_args = dict(
             model_name='gemini-3-flash-preview',
-            tools=[consultar_estoque_supabase, transferir_para_atendente, calcular_frete_estimado],
-            system_instruction=system_instruction_dinamica
+            tools=[
+                consultar_estoque_supabase,
+                consultar_produto_por_id,
+                calcular_total,
+                verificar_promocao_hoje,
+                transferir_para_atendente,
+                calcular_frete_estimado,
+            ],
+            system_instruction=system_instruction_dinamica,
         )
+        try:
+            model = genai.GenerativeModel(generation_config=GENERATION_CONFIG, **modelo_args)
+            json_mode_enabled = True
+        except Exception as e_schema:
+            print(f"⚠️ response_schema rejeitado pelo SDK ({e_schema}); modo livre.")
+            model = genai.GenerativeModel(**modelo_args)
+            json_mode_enabled = False
 
         history = get_history(user_id)
         chat = model.start_chat(history=history, enable_automatic_function_calling=True)
+        t_inicio = time.perf_counter()
         response = chat.send_message(texto_completo)
+        latencia_ms = int((time.perf_counter() - t_inicio) * 1000)
         resposta_texto = response.text
-        print(f"DEBUG OUTPUT: '{resposta_texto}'")
-
-        # DEBUG: Salva resposta crua em arquivo para análise
-        try:
-            with open("bot_response_debug.txt", "w", encoding="utf-8") as f:
-                f.write(resposta_texto)
-        except:
-            pass
+        print(f"DEBUG OUTPUT ({latencia_ms}ms): '{resposta_texto[:200]}'")
 
         save_message(user_id, "model", resposta_texto)
-        
-        # NOVA LÓGICA: Split para separar textos e imagens de forma linear e robusta.
-        # O padrão captura a URL no grupo (parenteses), fazendo com que o split retorne:
-        # [Texto1, URL1, Texto2, URL2, Texto3...]
-        parts = re.split(r"\[IMAGEM:(.*?)\]", resposta_texto, flags=re.DOTALL)
-        
-        print(f"DEBUG SPLIT: Encontradas {len(parts)} partes na resposta.")
 
-        if len(parts) > 1:
-            # Iteramos de 2 em 2: (Texto anterior, URL da imagem)
-            # O último elemento sobra (texto após a última imagem)
-            for i in range(0, len(parts) - 1, 2):
-                texto_legenda = parts[i].strip()
-                url_imagem = parts[i+1].strip()
-                
-                if url_imagem:
-                    print(f"📸 Enviando Imagem {i//2 + 1}: Legenda='{texto_legenda[:30]}...' | Url='{url_imagem}'")
-                    enviar_midia_whatsapp(user_id, url_imagem, texto_legenda)
-                    time.sleep(1.5) # Delay essencial para garantir a ordem no WhatsApp
-            
-            # Verifica se sobrou texto após a última imagem
-            ultimo_texto = parts[-1].strip()
-            if ultimo_texto:
-                print(f"💬 Enviando texto final: '{ultimo_texto[:30]}...'")
-                enviar_mensagem_whatsapp(user_id, ultimo_texto)
+        # Cache canônico de produtos retornados pelas tools no turno
+        chat_history_obj = getattr(chat, 'history', None)
+        cache_produtos = extrair_produtos_de_tool_results(chat_history_obj)
+        tool_calls_serializados = serializar_tool_calls(chat_history_obj)
+
+        # Caminho preferencial: JSON estruturado
+        resposta_limpa, ids_recomendados, json_ok = parsear_resposta_json(resposta_texto)
+
+        fallback_usado = False
+        if json_ok:
+            print(f"✅ JSON parse ok | ids={ids_recomendados} | cache_size={len(cache_produtos)}")
+            renderizar_mensagem_estruturada(user_id, resposta_limpa, ids_recomendados, cache_produtos)
         else:
-            # Caso sem imagens, envia texto normal
-            print("DEBUG: Nenhuma tag de imagem encontrada. Enviando texto único.")
-            enviar_mensagem_whatsapp(user_id, resposta_texto)
+            fallback_usado = True
+            print(f"⚠️ JSON parse falhou (json_mode={json_mode_enabled}); fallback regex.")
+            renderizar_mensagem_regex_fallback(user_id, resposta_texto)
+
+        log_turn(
+            user_id=user_id,
+            user_input=texto_completo,
+            tool_calls=tool_calls_serializados,
+            final_output=resposta_texto,
+            latency_ms=latencia_ms,
+            model_name='gemini-3-flash-preview',
+            output_format=("json" if json_ok else "text"),
+            fallback_used=fallback_usado,
+        )
 
     except Exception as e:
-        print(f"Erro IA: {e}")
-    
+        import traceback
+        err_str = f"{e}\n{traceback.format_exc()}"
+        print(f"Erro IA: {err_str}")
+        try:
+            log_turn(
+                user_id=user_id,
+                user_input=texto_completo,
+                tool_calls=[],
+                final_output="",
+                latency_ms=0,
+                model_name='gemini-3-flash-preview',
+                output_format="error",
+                fallback_used=False,
+                error=str(e),
+            )
+        except Exception:
+            pass
+
     del message_buffers[user_id]
 
 def enviar_midia_whatsapp(numero, url_midia, legenda):
@@ -576,10 +1093,10 @@ def webhook(evento=None, tipo=None):
 if __name__ == '__main__':
     # Inicia os schedulers de sincronização
     scheduler = BackgroundScheduler()
-    scheduler.add_job(sync_otimizado, 'interval', minutes=5, misfire_grace_time=120)
+    scheduler.add_job(sync_otimizado, 'interval', minutes=30, misfire_grace_time=300)
     scheduler.add_job(sync_images, 'cron', hour=9, minute=0, misfire_grace_time=3600)
     scheduler.start()
-    print("⏰ Schedulers iniciados: ERP (5 min) | Imagens (diário 6h BRT)")
+    print("⏰ Schedulers iniciados: ERP (30 min) | Imagens (diário 6h BRT)")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host='0.0.0.0', port=port)
