@@ -547,27 +547,26 @@ def verificar_promocao_hoje():
     ou qualquer oferta atrelada a dia da semana. Nunca afirme que existe
     promoção sem chamar essa tool primeiro.
 
+    Lê da view `vw_promocao_ativa_hoje` que prioriza agendamentos específicos
+    em `dia_s_calendario` sobre regras semanais em `promocoes_ativas`. A view
+    já calcula o dia da semana em America/Sao_Paulo.
+
     Returns:
-        {status, hoje_dia_semana, promocoes: [{nome, categoria, percentual, formas_pagamento, troca_permitida, observacao}]}
+        {status, hoje_dia_semana, promocoes: [{fonte, categoria, percentual, formas_pagamento, observacao, dia_semana}]}
     """
     try:
         from datetime import datetime, timezone, timedelta
-        # America/Sao_Paulo = UTC-3
         agora = datetime.now(timezone(timedelta(hours=-3)))
-        # Postgres extract(dow): 0=domingo. Python weekday(): 0=segunda.
-        # Vamos usar o padrão Postgres: 0=dom, 1=seg, ..., 6=sab.
-        dow = (agora.weekday() + 1) % 7
+        dow = (agora.weekday() + 1) % 7  # apenas para o retorno; filtro feito pela view
 
         resp = (
-            supabase.table("promocoes_ativas")
-            .select("nome, categoria, percentual, formas_pagamento, troca_permitida, observacao")
-            .eq("dia_semana", dow)
-            .eq("ativa", True)
+            supabase.from_("vw_promocao_ativa_hoje")
+            .select("fonte, categoria, percentual, formas_pagamento, observacao, dia_semana")
             .execute()
         )
         promos = resp.data or []
     except Exception as e:
-        print(f"❌ Erro verificar_promocao_hoje: {e}")
+        print(f"Erro verificar_promocao_hoje: {e}")
         return {"status": "erro", "msg": "Erro ao consultar promoções."}
 
     return {
