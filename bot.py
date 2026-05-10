@@ -92,8 +92,15 @@ def log_turn(user_id, user_input, tool_calls, final_output, latency_ms, model_na
 
 def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
     """
-    Realiza busca semântica no Supabase usando Embeddings.
-    Filtra por tamanho e realiza curadoria de preços.
+    Realiza busca semântica no estoque por similaridade vetorial + filtro de tamanho.
+
+    Args:
+        termo_cliente: o que o cliente busca (ex: "fantasia", "camisola algodão", "cueca boxer").
+        tamanho: tamanho EXATO que o cliente pediu. Copie literal: se cliente disse "G",
+                 passe "G" (NÃO "GG"). Se disse "M", passe "M". Se disse "42", passe "42".
+                 Nunca expanda uma letra (G≠GG, M≠MM, P≠PP). Apenas colapse digitação
+                 repetida em ≥4 (GGGG → GG). Use None só se o cliente realmente não falou
+                 tamanho (ex: produtos sexshop, cosméticos).
     """
     print(f"\n[SEMÂNTICO] Buscando: '{termo_cliente}' | Tamanho: {tamanho}")
     
