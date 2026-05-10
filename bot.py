@@ -30,6 +30,75 @@ genai.configure(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 message_buffers = {}
+_message_buffers_global_lock = threading.Lock()  # protege escrita no dict global
+_user_locks = {}  # threading.Lock() por user_id (criado on-demand)
+
+# Última mensagem do user por user_id, usada para validar tamanho contra LLM drift.
+# Quando LLM passa um tamanho diferente do que o user disse, forçamos o do user.
+_user_last_msg = {}
+
+# user_id "ativo" do turn atual — usado pelas tools para acessar contexto da request
+# sem precisar receber user_id como argumento. Setado em process_and_respond.
+_consultar_estoque_active_user_id = None
+
+# Rate limit: histórico de timestamps por user_id. {user_id: [ts1, ts2, ...]}
+RATE_LIMIT_WINDOW_SEC = 60
+RATE_LIMIT_MAX_MSGS = 10
+_rate_limit_history = {}
+
+
+def _get_user_lock(user_id):
+    """Retorna o Lock dedicado a este user_id (cria se não existir)."""
+    with _message_buffers_global_lock:
+        lock = _user_locks.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            _user_locks[user_id] = lock
+        return lock
+
+
+def _check_rate_limit(user_id):
+    """Retorna True se OK, False se cliente excedeu RATE_LIMIT_MAX_MSGS na janela."""
+    now = time.time()
+    with _message_buffers_global_lock:
+        hist = _rate_limit_history.get(user_id, [])
+        # remove timestamps fora da janela
+        hist = [t for t in hist if now - t < RATE_LIMIT_WINDOW_SEC]
+        hist.append(now)
+        _rate_limit_history[user_id] = hist
+        return len(hist) <= RATE_LIMIT_MAX_MSGS
+
+
+def _tamanhos_validos_na_msg(texto):
+    """Extrai tokens de tamanho que aparecem em uma mensagem do usuário.
+
+    Retorna lista de tokens canônicos. Se cliente diz só 'G', volta ['G'].
+    Se diz 'tamanho 42', volta ['42']. Vazio se nada parecido.
+    """
+    if not texto:
+        return []
+    upper = texto.upper()
+    # Colapso de repetições óbvias: GGGG -> GG, PPPP -> PP, GGG -> GG (digitação)
+    upper = re.sub(r"([PMG])\1{2,}", lambda m: m.group(1) * 2, upper)
+
+    encontrados = []
+    # Números 30-69 — tamanho numérico
+    for m in re.finditer(r"\b(3[0-9]|4[0-9]|5[0-9]|6[0-9])\b", upper):
+        encontrados.append(m.group(1))
+    # Letras de tamanho — match de palavra inteira (boundary manual)
+    # Ordem de mais longo para mais curto evita pegar "G" dentro de "GG".
+    cobertos = set()  # posições já cobertas por token mais longo
+    for token in ("XGG", "XGG", "XG", "GG", "PP", "G3", "G2", "G1", "G", "M", "P"):
+        for m in re.finditer(r"(?:^|[^A-Z0-9])(" + re.escape(token) + r")(?:$|[^A-Z0-9])", upper):
+            if any(p in cobertos for p in range(m.start(1), m.end(1))):
+                continue
+            for p in range(m.start(1), m.end(1)):
+                cobertos.add(p)
+            encontrados.append(token)
+    # ÚNICO / ÚNICA
+    if "ÚNIC" in upper or "UNIC" in upper:
+        encontrados.append("UNICO")
+    return encontrados
 
 # ================= AUXILIARES DE INTELIGÊNCIA =================
 
@@ -70,23 +139,50 @@ def get_history(user_id, limit=30):
     return history
 
 
-def log_turn(user_id, user_input, tool_calls, final_output, latency_ms, model_name, output_format, fallback_used, error=None):
-    """Insere registro estruturado em bot_turns. Falha silenciosa — não bloqueia resposta."""
+def _job_purge_bot_turns():
+    """Roda 1x/dia: chama purge_old_bot_turns() do Postgres para apagar
+    registros com mais de 30 dias. Substitui necessidade de pg_cron."""
     try:
-        supabase.table("bot_turns").insert({
-            "user_id": user_id,
-            "user_input": user_input,
-            "tool_calls": tool_calls,
-            "final_output": final_output,
-            "latency_ms": latency_ms,
-            "model": model_name,
-            "output_format": output_format,
-            "fallback_used": fallback_used,
-            "error": error,
-        }).execute()
+        r = supabase.rpc('purge_old_bot_turns', {}).execute()
+        rows = r.data if isinstance(r.data, int) else (r.data or 0)
+        print(f"[PURGE] bot_turns purgado: {rows} rows removidas")
     except Exception as e:
-        # Tabela pode não existir ainda (migration 0003 não aplicada). Não bloqueia o bot.
-        print(f"⚠️ log_turn falhou (bot_turns existe?): {e}")
+        print(f"[PURGE] falhou: {e}")
+
+
+def log_turn(user_id, user_input, tool_calls, final_output, latency_ms, model_name, output_format, fallback_used, error=None, tokens_in=None, tokens_out=None):
+    """Insere registro estruturado em bot_turns. Falha silenciosa — não bloqueia resposta."""
+    payload = {
+        "user_id": user_id,
+        "user_input": user_input,
+        "tool_calls": tool_calls,
+        "final_output": final_output,
+        "latency_ms": latency_ms,
+        "model": model_name,
+        "output_format": output_format,
+        "fallback_used": fallback_used,
+        "error": error,
+    }
+    if tokens_in is not None:
+        payload["tokens_in"] = tokens_in
+    if tokens_out is not None:
+        payload["tokens_out"] = tokens_out
+    if tokens_in is not None and tokens_out is not None:
+        payload["tokens_total"] = tokens_in + tokens_out
+    try:
+        supabase.table("bot_turns").insert(payload).execute()
+    except Exception as e:
+        # Migration 0008 (tokens_*) pode ainda não estar aplicada — fallback sem tokens
+        if "tokens_" in str(e):
+            try:
+                for k in ("tokens_in", "tokens_out", "tokens_total"):
+                    payload.pop(k, None)
+                supabase.table("bot_turns").insert(payload).execute()
+                return
+            except Exception as e2:
+                print(f"log_turn falhou (sem tokens): {e2}")
+                return
+        print(f"log_turn falhou: {e}")
 
 # ================= NOVA FERRAMENTA DE BUSCA (SUPABASE) =================
 
@@ -102,10 +198,23 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
                  repetida em ≥4 (GGGG → GG). Use None só se o cliente realmente não falou
                  tamanho (ex: produtos sexshop, cosméticos).
     """
-    print(f"\n[SEMÂNTICO] Buscando: '{termo_cliente}' | Tamanho: {tamanho}")
-    
-    # 0. Normalização do Tamanho (Agora feita no início para enviar ao banco)
+    print(f"\n[SEMÂNTICO] Buscando: '{termo_cliente}' | Tamanho recebido: {tamanho}")
+
+    # 0. Normalização do Tamanho
     tamanho_alvo = tamanho.upper().strip() if tamanho else None
+
+    # 0.1. DEFESA contra LLM drift (Risco B4): se cliente disse uma letra única
+    # (ex: "G") e LLM passou outra (ex: "GG"), preferimos o que o cliente disse.
+    # Heurística: comparar tamanho_alvo com tokens extraídos da última msg do user.
+    if tamanho_alvo:
+        ultimo_user = _user_last_msg.get(_consultar_estoque_active_user_id)
+        tokens_user = _tamanhos_validos_na_msg(ultimo_user) if ultimo_user else []
+        if tokens_user and tamanho_alvo not in tokens_user:
+            # LLM passou tamanho que não bate com o que user disse na última msg.
+            # Substitui pelo primeiro tamanho que o user mencionou.
+            corrigido = tokens_user[0]
+            print(f"[GUARD] LLM passou '{tamanho_alvo}' mas user disse {tokens_user}. Forçando '{corrigido}'.")
+            tamanho_alvo = corrigido
 
     # 1. Gera o vetor da pergunta do cliente
     vetor_busca = get_embedding(termo_cliente)
@@ -511,60 +620,105 @@ def _fallback_frete():
     }
 
 
-def calcular_frete_estimado(cep_destino: str, id_produto: int = None, quantidade: int = 1, nome_produto: str = None):
+def calcular_frete_estimado(
+    cep_destino: str,
+    id_produto: int = None,
+    quantidade: int = 1,
+    nome_produto: str = None,
+    itens_json: str = None,
+):
     """
     Estima o custo de frete da Sangali até o CEP do cliente.
 
     Use esta ferramenta quando o cliente perguntar sobre frete, entrega, prazo ou custo de envio.
     IMPORTANTE: Chame esta ferramenta SOMENTE após o cliente informar o CEP.
 
-    Forneça preferencialmente o `id_produto` (mais preciso). `nome_produto`
-    só deve ser usado se você não souber o id ainda.
+    Para carrinho com múltiplos produtos, use `itens_json`. Para um único produto,
+    use `id_produto`. `nome_produto` é fallback textual.
 
     Args:
         cep_destino:  CEP do cliente (ex: "29900-161" ou "29900161").
-        id_produto:   id numérico do produto principal (do consultar_estoque_supabase).
-                      Determinístico — peso/dimensão lidos do banco.
-        quantidade:   Quantidade de itens estimados (padrão 1, máximo 50).
+        id_produto:   id numérico do produto principal (preferido para 1 item).
+        quantidade:   Quantidade quando usa id_produto (padrão 1, máx 50).
         nome_produto: Fallback textual quando id_produto desconhecido.
-                      Usado para classificar peso por keyword.
+        itens_json:   JSON string com lista de itens para carrinho:
+                      '[{"id_produto":123,"qtd":2},{"id_produto":456,"qtd":1}]'.
+                      Quando preenchido, soma os pesos dos itens.
     """
     cep_limpo = _validar_cep(cep_destino)
     if not cep_limpo:
         return {"status": "erro_cep", "msg": "CEP inválido. Informe o CEP com 8 dígitos, ex: 87013-000."}
 
-    try:
-        quantidade = max(1, min(50, int(quantidade)))
-    except (TypeError, ValueError):
-        quantidade = 1
+    # Modo carrinho: itens_json tem prioridade se preenchido
+    pacote = None
+    nome_para_peso = ""
+    qtd_total = 0
 
-    nome_para_peso = None
-    if id_produto:
+    if itens_json:
         try:
-            r = supabase.table("produtos_estoque").select("nome, nome_grupo").eq("id_produto", str(id_produto)).limit(1).execute()
-            if r.data:
-                nome_para_peso = (r.data[0].get("nome") or "") + " " + (r.data[0].get("nome_grupo") or "")
-        except Exception as e:
-            print(f"⚠️ Frete: lookup id_produto={id_produto} falhou: {e}")
+            itens = json.loads(itens_json) if isinstance(itens_json, str) else itens_json
+            if not isinstance(itens, list) or not itens:
+                return {"status": "erro", "msg": "itens_json deve ser lista não vazia."}
+            ids = [str(it["id_produto"]) for it in itens]
+            r = supabase.table("produtos_estoque").select("id_produto, nome, nome_grupo").in_("id_produto", ids).execute()
+            mapa_nome = {row["id_produto"]: (row.get("nome") or "") + " " + (row.get("nome_grupo") or "")
+                         for row in (r.data or [])}
+            peso_total = 0
+            altura_total = 0
+            largura_max = 0
+            comp_max = 0
+            for it in itens:
+                pid = str(it["id_produto"])
+                qtd = max(1, min(50, int(it.get("qtd", 1))))
+                qtd_total += qtd
+                nome_item = mapa_nome.get(pid, "")
+                nome_para_peso += " " + nome_item
+                p, a, l, c = _estimar_pacote(nome_item, qtd)
+                peso_total += p
+                altura_total += a  # empilha
+                largura_max = max(largura_max, l)
+                comp_max = max(comp_max, c)
+            pacote = (peso_total, max(altura_total, 2), max(largura_max, 16), max(comp_max, 11))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            return {"status": "erro", "msg": f"itens_json inválido: {e}"}
 
-    if not nome_para_peso:
-        nome_para_peso = nome_produto or ""
+    if pacote is None:
+        # Modo single (legado / um produto)
+        try:
+            quantidade = max(1, min(50, int(quantidade)))
+        except (TypeError, ValueError):
+            quantidade = 1
+        qtd_total = quantidade
 
-    if not nome_para_peso:
-        return {"status": "erro", "msg": "Informe id_produto ou nome_produto para estimar o pacote."}
+        if id_produto:
+            try:
+                r = supabase.table("produtos_estoque").select("nome, nome_grupo").eq("id_produto", str(id_produto)).limit(1).execute()
+                if r.data:
+                    nome_para_peso = (r.data[0].get("nome") or "") + " " + (r.data[0].get("nome_grupo") or "")
+            except Exception as e:
+                print(f"Frete: lookup id_produto={id_produto} falhou: {e}")
+
+        if not nome_para_peso:
+            nome_para_peso = nome_produto or ""
+
+        if not nome_para_peso:
+            return {"status": "erro", "msg": "Informe id_produto, itens_json ou nome_produto."}
+
+        pacote = _estimar_pacote(nome_para_peso, quantidade)
+
+    peso_g, alt, larg, comp = pacote
 
     try:
         cfg = supabase.table("bot_settings").select("cep_origem").eq("id", 1).single().execute()
         cep_origem = _validar_cep((cfg.data or {}).get("cep_origem", ""))
     except Exception as e:
-        print(f"⚠️ Frete: erro ao buscar cep_origem: {e}")
+        print(f"Frete: erro ao buscar cep_origem: {e}")
         cep_origem = None
 
     if not cep_origem:
         return {"status": "erro_config", "msg": "Configuração da loja ausente. Transfira para atendente."}
 
-    peso_g, alt, larg, comp = _estimar_pacote(nome_para_peso, quantidade)
-    print(f"📦 Frete: cep_destino={cep_limpo} | id={id_produto} nome='{nome_para_peso[:40]}' qtd={quantidade} | pacote={peso_g}g {alt}x{larg}x{comp}cm")
+    print(f"Frete: cep={cep_limpo} | itens={qtd_total} | nome='{nome_para_peso[:40]}' | pacote={peso_g}g {alt}x{larg}x{comp}cm")
 
     payload = {
         "from": {"postal_code": cep_origem},
@@ -727,21 +881,47 @@ GENERATION_CONFIG = {
 
 
 def _coerce_to_dict(obj):
-    """Converte struct/proto/dict-like em dict puro."""
+    """Converte struct/proto/dict-like em estrutura JSON-serializável (recursivo).
+
+    Lida com:
+    - dicts (recursão nos valores)
+    - listas/tuples (recursão nos itens)
+    - proto messages (via _pb e MessageToDict)
+    - proto MapComposite e MapField (iteráveis dict-like)
+    - tipos primitivos
+    """
     if obj is None:
         return None
-    if isinstance(obj, dict):
+    if isinstance(obj, (str, int, float, bool)):
         return obj
+    if isinstance(obj, dict):
+        return {k: _coerce_to_dict(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_coerce_to_dict(v) for v in obj]
+    # Proto MapComposite, MapField — iterável dict-like
     try:
         from google.protobuf.json_format import MessageToDict
         if hasattr(obj, '_pb'):
-            return MessageToDict(obj._pb, preserving_proto_field_name=True)
-        return MessageToDict(obj, preserving_proto_field_name=True)
+            return _coerce_to_dict(MessageToDict(obj._pb, preserving_proto_field_name=True))
     except Exception:
-        try:
-            return dict(obj)
-        except Exception:
-            return None
+        pass
+    # Tenta tratar como dict (proto MapComposite suporta .items())
+    try:
+        if hasattr(obj, 'items'):
+            return {k: _coerce_to_dict(v) for k, v in obj.items()}
+    except Exception:
+        pass
+    # Tenta tratar como iterável (proto RepeatedComposite / lista)
+    try:
+        if hasattr(obj, '__iter__') and not isinstance(obj, (bytes, bytearray)):
+            return [_coerce_to_dict(v) for v in obj]
+    except Exception:
+        pass
+    # Último recurso: string repr
+    try:
+        return str(obj)
+    except Exception:
+        return None
 
 
 def extrair_produtos_de_tool_results(chat_history):
@@ -920,11 +1100,16 @@ def renderizar_mensagem_regex_fallback(user_id, texto):
 # ================= LÓGICA DA CONVERSA & WEBHOOK =================
 
 def process_and_respond(user_id):
+    global _consultar_estoque_active_user_id
     buffer = message_buffers.get(user_id)
     if not buffer: return
     texto_completo = buffer['text']
     print(f"DEBUG INPUT: '{texto_completo}'")
-    
+
+    # Define contexto do turno usado por tools (defesa B4 em consultar_estoque)
+    _user_last_msg[user_id] = texto_completo
+    _consultar_estoque_active_user_id = user_id
+
     save_message(user_id, "user", texto_completo)
 
     try:
@@ -995,6 +1180,17 @@ def process_and_respond(user_id):
         cache_produtos = extrair_produtos_de_tool_results(chat_history_obj)
         tool_calls_serializados = serializar_tool_calls(chat_history_obj)
 
+        # Captura tokens Gemini (usage_metadata) para tracking de custo
+        tokens_in_count = None
+        tokens_out_count = None
+        try:
+            usage = getattr(response, 'usage_metadata', None)
+            if usage:
+                tokens_in_count = getattr(usage, 'prompt_token_count', None)
+                tokens_out_count = getattr(usage, 'candidates_token_count', None)
+        except Exception:
+            pass
+
         # Caminho preferencial: JSON estruturado
         resposta_limpa, ids_recomendados, json_ok = parsear_resposta_json(resposta_texto)
 
@@ -1016,6 +1212,8 @@ def process_and_respond(user_id):
             model_name='gemini-3-flash-preview',
             output_format=("json" if json_ok else "text"),
             fallback_used=fallback_usado,
+            tokens_in=tokens_in_count,
+            tokens_out=tokens_out_count,
         )
 
     except Exception as e:
@@ -1037,7 +1235,10 @@ def process_and_respond(user_id):
         except Exception:
             pass
 
-    del message_buffers[user_id]
+    # Cleanup protegido pelo lock (evita race com novo webhook chegando no fim do turn)
+    user_lock = _get_user_lock(user_id)
+    with user_lock:
+        message_buffers.pop(user_id, None)
 
 def enviar_midia_whatsapp(numero, url_midia, legenda):
     """Envia mídia (imagem/pdf) via UazAPI."""
@@ -1088,13 +1289,26 @@ def webhook(evento=None, tipo=None):
     chat_id = msg_data.get('chatid')
     raw_text = msg_data.get('content')
 
-    if chat_id and isinstance(raw_text, str):
-        user_id = chat_id.split('@')[0]
+    if not chat_id or not isinstance(raw_text, str):
+        return jsonify({"status": "buffering"}), 200
+
+    user_id = chat_id.split('@')[0]
+
+    # Rate limit por user_id (ANTES de qualquer trabalho pesado)
+    if not _check_rate_limit(user_id):
+        print(f"[RATE_LIMIT] user={user_id} excedeu {RATE_LIMIT_MAX_MSGS} msgs/{RATE_LIMIT_WINDOW_SEC}s — descartando")
+        return jsonify({"status": "rate_limited"}), 200
+
+    # Lock por user_id evita race em escrita concorrente do buffer
+    user_lock = _get_user_lock(user_id)
+    with user_lock:
         if user_id not in message_buffers:
             message_buffers[user_id] = {"text": raw_text, "timer": None}
         else:
             message_buffers[user_id]["text"] += f" {raw_text}"
-            if message_buffers[user_id]["timer"]: message_buffers[user_id]["timer"].cancel()
+            existing_timer = message_buffers[user_id].get("timer")
+            if existing_timer:
+                existing_timer.cancel()
 
         t = threading.Timer(10.0, process_and_respond, args=[user_id])
         message_buffers[user_id]["timer"] = t
@@ -1107,8 +1321,9 @@ if __name__ == '__main__':
     scheduler = BackgroundScheduler()
     scheduler.add_job(sync_otimizado, 'interval', minutes=30, misfire_grace_time=300)
     scheduler.add_job(sync_images, 'cron', hour=9, minute=0, misfire_grace_time=3600)
+    scheduler.add_job(_job_purge_bot_turns, 'cron', hour=7, minute=0, misfire_grace_time=3600)
     scheduler.start()
-    print("⏰ Schedulers iniciados: ERP (30 min) | Imagens (diário 6h BRT)")
+    print("Schedulers iniciados: ERP 30min | Imagens diario 6h BRT | Purge bot_turns diario 4h BRT")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host='0.0.0.0', port=port)

@@ -1,2 +1,3 @@
 run_log*.txt
+stress_log.txt
 __pycache__/

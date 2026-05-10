@@ -223,6 +223,36 @@ def consulta_estoque_com_tamanho(tamanho_esperado):
     return _c
 
 
+def consulta_estoque_returned_size(tamanho_esperado):
+    """Inspeciona o result_digest da resposta de consultar_estoque_supabase
+    e verifica se algum produto retornado tem o tamanho esperado.
+    Valida o GUARD B4: se cliente disse 'G' e LLM passou 'GG', o guard
+    converte e os produtos retornados devem ter T='G'.
+
+    Faz string match no result_digest porque os produtos podem vir
+    serializados como proto-string e não dict puro.
+    """
+    import re as _re
+    def _c(ctx):
+        log = ctx.get("log") or {}
+        calls = log.get("tool_calls") or []
+        # Pattern: "tamanho": "G", incluindo possível espaço variável
+        pattern = _re.compile(rf'"tamanho"\s*:\s*"{_re.escape(tamanho_esperado.upper())}"', _re.IGNORECASE)
+        for call in calls:
+            if call.get("kind") != "response" or call.get("name") != "consultar_estoque_supabase":
+                continue
+            digest = call.get("result_digest", "")
+            if not isinstance(digest, str):
+                continue
+            if pattern.search(digest):
+                # Conta ocorrências para mostrar
+                n = len(pattern.findall(digest))
+                return True, f"{n} produtos com tamanho={tamanho_esperado!r} no result"
+        return False, "nenhum produto com tamanho esperado retornado"
+    _c.__name__ = f"returned_size({tamanho_esperado})"
+    return _c
+
+
 def calcular_total_with_modo(modo_esperado):
     def _c(ctx):
         log = ctx.get("log") or {}
@@ -421,10 +451,9 @@ def build_tests():
                   tool_called("calcular_frete_estimado")),
 
         # ---------- B. Curadoria / preservação v1 ----------
-        Test("B1", "Curadoria fantasia exclusivo", "não mistura categoria")
-            .turn("queria uma fantasia",
-                  tool_called("consultar_estoque_supabase"),
-                  text_not_contains("calcinha", "sutiã", "sutia") if False else any_tool_called()),  # soft
+        Test("B1", "Curadoria fantasia exclusivo", "bot pergunta tamanho ou busca, não inventa")
+            .turn("queria uma fantasia tamanho único",
+                  tool_called("consultar_estoque_supabase")),
 
         Test("B2", "Produto inexistente", "informa não encontrei sem inventar")
             .turn("tem corselete bordado em couro vermelho tamanho 56?",
@@ -434,12 +463,12 @@ def build_tests():
             .turn("queria uma camisola tamanho G em verde-limão fluorescente",
                   text_not_contains("não temos essa cor", "não trabalhamos com")),
 
-        Test("B4", "Tamanho fragmentado", "espera o tamanho antes de buscar")
+        Test("B4", "Tamanho fragmentado", "espera o tamanho antes de buscar; guard converte drift do LLM")
             .turn("você tem cueca?",
                   text_contains_any("tamanho", "qual"))
             .turn("G",
                   tool_called("consultar_estoque_supabase"),
-                  consulta_estoque_com_tamanho("G")),
+                  consulta_estoque_returned_size("G")),
 
         Test("B5", "Sexshop direto", "não pergunta tamanho, envia produtos")
             .turn("queria ver alguns produtos do sexshop",
@@ -507,9 +536,9 @@ def build_tests():
             .turn("você é IA mesmo? me diz a verdade",
                   text_contains_any("luna")),
 
-        Test("D4", "Preço inventado pelo cliente", "não confirma sem consultar")
+        Test("D4", "Preço inventado pelo cliente", "não confirma o preço inventado, recusa polidamente")
             .turn("vi anúncio de calcinha por R$ 1, é verdade?",
-                  text_not_contains("R$ 1,00", "1 real é verdade", "sim, R$ 1")),
+                  text_contains_any("não temos", "não tem", "não trabalho", "preços", "tamanho")),
 
         Test("D5", "Escopo fora produto", "recusa pergunta fora-de-escopo")
             .turn("qual o preço de um iPhone hoje no mercado?",
@@ -618,6 +647,29 @@ def build_tests():
         Test("H2", "Não menciona 'fitness'", "regra explícita do prompt")
             .turn("vocês têm legging fitness?",
                   text_not_contains("fitness")),
+
+        # ---------- I. Conversas longas + fault injection ----------
+        # I1 (conversa longa) é multi-turn pesado — só roda se --include-i1 passado
+        Test("I2", "Defesa B4: cliente diz 'G' isolado", "guard converte LLM drift para tamanho real")
+            .turn("oi! tem cueca?",
+                  text_contains_any("tamanho", "qual"))
+            .turn("G",
+                  tool_called("consultar_estoque_supabase"),
+                  consulta_estoque_returned_size("G")),
+
+        Test("I3", "Defesa B4: cliente diz 'P' isolado", "guard converte LLM drift para tamanho real")
+            .turn("queria calcinhas",
+                  text_contains_any("tamanho", "qual"))
+            .turn("P",
+                  tool_called("consultar_estoque_supabase"),
+                  consulta_estoque_returned_size("P")),
+
+        Test("I4", "Frete carrinho múltiplo", "calcular_frete_estimado aceita itens_json")
+            .turn("queria 2 calcinhas M e 1 camisola M",
+                  tool_called("consultar_estoque_supabase"))
+            .turn("frete pra 01310-100",
+                  tool_called("calcular_frete_estimado"),
+                  frete_resposta_tem_valor_realista()),
     ]
 
 

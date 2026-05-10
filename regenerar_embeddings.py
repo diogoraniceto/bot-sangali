@@ -40,14 +40,19 @@ def gerar_embedding(texto):
         return None
 
 def main():
-    print("🔄 Buscando todos os produtos do banco...")
-    
-    # Busca todos os produtos com paginação (Supabase limita a 1000 por query)
+    import sys as _sys
+    only_missing = "--only-missing" in _sys.argv
+    print(f"[i] modo: {'somente sem embedding' if only_missing else 'todos os produtos'}")
+
+    # Busca todos com paginação. Se only_missing, filtra embedding IS NULL.
     produtos = []
     page_size = 1000
     offset = 0
     while True:
-        response = supabase.table("produtos_estoque").select("id_produto, nome, tamanho, preco").range(offset, offset + page_size - 1).execute()
+        q = supabase.table("produtos_estoque").select("id_produto, nome, tamanho, preco")
+        if only_missing:
+            q = q.is_("embedding", "null")
+        response = q.range(offset, offset + page_size - 1).execute()
         batch = response.data
         if not batch:
             break
@@ -55,8 +60,18 @@ def main():
         if len(batch) < page_size:
             break
         offset += page_size
-    
-    print(f"📦 Total de produtos encontrados: {len(produtos)}")
+
+    # Deduplica por id_produto (cada variação tem mesmo id_produto, embedding é por produto base)
+    vistos = set()
+    unicos = []
+    for p in produtos:
+        if p.get("id_produto") in vistos:
+            continue
+        vistos.add(p.get("id_produto"))
+        unicos.append(p)
+    produtos = unicos
+
+    print(f"[i] Produtos únicos para gerar embedding: {len(produtos)}")
     print("=" * 60)
     
     atualizados = 0

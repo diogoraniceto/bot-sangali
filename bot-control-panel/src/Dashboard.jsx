@@ -5,10 +5,12 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip,
 import {
     Bell, Search, LayoutDashboard, MessageSquare, Box, Puzzle, RotateCcw, PanelLeft, Bot, Zap, Plus, Settings, Play, Link, Download, Move, LogOut, FileText, Sun, Moon, LayoutGrid, List, ImagePlus, Filter, UploadCloud, Activity, RefreshCw, AlertCircle, TrendingUp, ShoppingCart, Users, Check, X, Camera, Image as ImageIcon,
     GripVertical, Sparkles, ChevronDown, ChevronRight, Trash2, Save, MessageCircle, UserCircle2, Package, ArrowUpDown, ArrowUp, ArrowDown,
-    Command, Plug
+    Command, Plug, Tag, FileSearch
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import Promocoes from './Promocoes'
+import Conversas from './Conversas'
 // ==================== HELPERS ====================
 
 function parsePromptToBlocks(text) {
@@ -687,8 +689,8 @@ export default function Dashboard() {
 
                     <SidebarItem id="comandos" icon={Command} label="Comandos" active={activeSidebarItem === 'comandos'} onClick={() => setActiveSidebarItem('comandos')} />
                     <SidebarItem id="estoque" icon={Package} label="Estoque" active={activeSidebarItem === 'estoque'} onClick={() => setActiveSidebarItem('estoque')} />
-                    {/* <SidebarItem id="integracoes" icon={Plug} label="Integrações" active={activeSidebarItem === 'integracoes'} onClick={() => setActiveSidebarItem('integracoes')} /> */}
-                    {/* <SidebarItem id="sincronizacao" icon={RefreshCw} label="Sinc. Dados" active={activeSidebarItem === 'sincronizacao'} onClick={() => setActiveSidebarItem('sincronizacao')} /> */}
+                    <SidebarItem id="promocoes" icon={Tag} label="Promoções" active={activeSidebarItem === 'promocoes'} onClick={() => setActiveSidebarItem('promocoes')} />
+                    <SidebarItem id="conversas" icon={FileSearch} label="Conversas" active={activeSidebarItem === 'conversas'} onClick={() => setActiveSidebarItem('conversas')} />
                 </nav>
             </aside>
 
@@ -700,7 +702,10 @@ export default function Dashboard() {
                         <h1 className="text-[15px] font-medium text-slate-800 dark:text-slate-200 capitalize tracking-wide transition-colors">
                             {activeSidebarItem === 'integracoes' ? 'Integrações' :
                                 activeSidebarItem === 'sincronizacao' ? 'Sincronização' :
-                                    activeSidebarItem === 'estoque' ? 'Controle de Estoque' : activeSidebarItem}
+                                    activeSidebarItem === 'estoque' ? 'Controle de Estoque' :
+                                    activeSidebarItem === 'promocoes' ? 'Promoções' :
+                                    activeSidebarItem === 'conversas' ? 'Conversas (logs)' :
+                                    activeSidebarItem}
                         </h1>
                     </div>
                     <div className="flex items-center gap-4">
@@ -1242,6 +1247,9 @@ export default function Dashboard() {
                             )}
                         </div>
                     )}
+
+                    {activeSidebarItem === 'promocoes' && <Promocoes />}
+                    {activeSidebarItem === 'conversas' && <Conversas />}
 
                     {/* PLACEHOLDER PAGES */}
                     {(activeSidebarItem === 'integracoes' || activeSidebarItem === 'sincronizacao') && (
