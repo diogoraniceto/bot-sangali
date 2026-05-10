@@ -223,6 +223,91 @@ def consulta_estoque_com_tamanho(tamanho_esperado):
     return _c
 
 
+def calcular_total_with_modo(modo_esperado):
+    def _c(ctx):
+        log = ctx.get("log") or {}
+        calls = log.get("tool_calls") or []
+        for call in calls:
+            if call.get("kind") != "call" or call.get("name") != "calcular_total":
+                continue
+            args = call.get("args") or {}
+            if args.get("modo") == modo_esperado:
+                return True, f"matched modo={modo_esperado}"
+        return False, f"calcular_total args: {[c.get('args') for c in calls if c.get('name')=='calcular_total' and c.get('kind')=='call']}"
+    _c.__name__ = f"calcular_total_modo({modo_esperado})"
+    return _c
+
+
+def calcular_total_result_contains(key, predicate):
+    """Inspeciona o result_digest da chamada calcular_total e aplica predicate(value)."""
+    def _c(ctx):
+        log = ctx.get("log") or {}
+        calls = log.get("tool_calls") or []
+        for call in calls:
+            if call.get("kind") != "response" or call.get("name") != "calcular_total":
+                continue
+            digest = call.get("result_digest", "")
+            try:
+                obj = json.loads(digest) if digest.startswith("{") else None
+            except Exception:
+                obj = None
+            if obj is None:
+                continue
+            val = obj.get(key)
+            try:
+                if predicate(val):
+                    return True, f"{key}={val} OK"
+            except Exception:
+                continue
+        return False, f"no calcular_total response found, or {key} did not match predicate"
+    _c.__name__ = f"calcular_total_result({key})"
+    return _c
+
+
+def frete_chamado_com_id():
+    def _c(ctx):
+        log = ctx.get("log") or {}
+        calls = log.get("tool_calls") or []
+        for call in calls:
+            if call.get("kind") != "call" or call.get("name") != "calcular_frete_estimado":
+                continue
+            args = call.get("args") or {}
+            if args.get("id_produto"):
+                return True, f"id_produto={args.get('id_produto')}, qtd={args.get('quantidade')}"
+        # Aceita também sem id_produto (modo legado), só com nome
+        for call in calls:
+            if call.get("kind") != "call" or call.get("name") != "calcular_frete_estimado":
+                continue
+            args = call.get("args") or {}
+            if args.get("nome_produto") or args.get("cep_destino"):
+                return True, f"chamado mas SEM id_produto (legado): {args}"
+        return False, "calcular_frete_estimado não foi chamada"
+    _c.__name__ = "frete_chamado"
+    return _c
+
+
+def frete_resposta_tem_valor_realista():
+    """Verifica se a resposta tem 'R$' seguido de número plausivel (R$ 1 a R$ 999)."""
+    import re as _re
+    def _c(ctx):
+        all_text = " ".join(m["text"] for m in ctx["messages_sent"])
+        all_text += " " + " ".join(m.get("caption", "") for m in ctx["media_sent"])
+        matches = _re.findall(r"R\$\s*([\d]+[.,]?\d*)", all_text)
+        if not matches:
+            return False, "nenhum valor R$ encontrado"
+        valores = []
+        for m in matches:
+            try:
+                v = float(m.replace(",", "."))
+                valores.append(v)
+            except ValueError:
+                pass
+        plausiveis = [v for v in valores if 1 <= v <= 999]
+        return len(plausiveis) > 0, f"valores R$ encontrados: {valores}, plausíveis: {plausiveis}"
+    _c.__name__ = "frete_valor_realista"
+    return _c
+
+
 # ============================================================
 # Test class
 # ============================================================
@@ -457,6 +542,82 @@ def build_tests():
             .turn("oi",
                   output_is_json(),
                   fallback_NOT_used()),
+
+        # ---------- F. Carrinho, mínimo, frete, varejo vs atacado ----------
+        Test("F1", "Carrinho consolidado + handoff", "monta carrinho, fecha, transfere com calcular_total")
+            .turn("oi! quero fechar atacado primeira compra. mostra 3 camisolas tamanho M",
+                  tool_called("consultar_estoque_supabase"))
+            .turn("perfeito, levo 3 da primeira, 3 da segunda e 3 da terceira",
+                  any_tool_called())
+            .turn("fecha aí à vista",
+                  tool_called("calcular_total"),
+                  calcular_total_with_modo("atacado_avista")),
+
+        Test("F2", "Mínimo NÃO atingido (atacado primeira)", "bot avisa quanto falta para o mínimo")
+            .turn("queria atacado primeira compra. mostra calcinhas tamanho M",
+                  tool_called("consultar_estoque_supabase"))
+            .turn("levo só 2 unidades dessa primeira aí, à vista. quanto fica?",
+                  tool_called("calcular_total"),
+                  text_contains_any("falta", "mínimo", "minimo", "abaixo", "completar", "R$ 600", "600,00")),
+
+        Test("F3", "Frete CEP distante (SP)", "calcular_frete chamado, valor plausível")
+            .turn("queria pijama tamanho M",
+                  tool_called("consultar_estoque_supabase"))
+            .turn("quero o primeiro. quanto fica o frete pra 01310-100?",
+                  frete_chamado_com_id(),
+                  frete_resposta_tem_valor_realista()),
+
+        Test("F4", "Frete CEP perto (ES Linhares)", "frete deve ser muito barato")
+            .turn("queria 1 calcinha M",
+                  tool_called("consultar_estoque_supabase"))
+            .turn("escolho a primeira. frete pra 29900-161?",
+                  frete_chamado_com_id(),
+                  frete_resposta_tem_valor_realista()),
+
+        Test("F5", "CEP inválido", "bot pede CEP completo")
+            .turn("queria pijama tamanho G",
+                  tool_called("consultar_estoque_supabase"))
+            .turn("quero o primeiro. frete pra 12345?",
+                  text_contains_any("8 dígitos", "8 digitos", "completo", "incompleto", "cep válido", "29900-161", "exemplo")),
+
+        Test("F6", "Diferença varejo vs atacado", "menciona valores distintos")
+            .turn("qual a diferença de preço entre varejo e atacado?",
+                  text_contains_any("30%", "30 por cento", "à vista", "desconto", "atacado")),
+
+        Test("F7", "Atacado à vista vs a prazo", "diferencia as 2 modalidades")
+            .turn("no atacado, qual a diferença entre pagar à vista ou a prazo?",
+                  text_contains_any("6x", "6 vezes", "parcel", "à vista", "30%", "25%")),
+
+        Test("F8", "Mínimo atingido - carrinho cheio", "calcular_total retorna minimo_atingido=true")
+            .turn("atacado primeira compra. mostra camisolas M",
+                  tool_called("consultar_estoque_supabase"))
+            .turn("perfeito, levo 30 unidades da primeira, à vista. quanto fica?",
+                  tool_called("calcular_total"),
+                  calcular_total_result_contains("minimo_atingido", lambda v: v is True)),
+
+        # ---------- G. Estratégias persuasivas do prompt v1 ----------
+        Test("G1", "Cliente pergunta consignado", "bot apresenta atacado como alternativa")
+            .turn("vocês trabalham com consignado?",
+                  text_contains_any("atacado", "30%", "desconto", "à vista", "primeira compra", "investimento")),
+
+        Test("G2", "Medo de encalhe", "menciona troca/30 dias/teste")
+            .turn("tô com medo de comprar atacado e ficar com produto encalhado, não vender",
+                  text_contains_any("troca", "30 dias", "testar", "teste", "tranquila", "garantia")),
+
+        Test("G3", "Persuasão quando cliente acha caro", "bot reage com técnica de venda")
+            .turn("queria atacado primeira compra. preciso de R$ 600?",
+                  text_contains_any("600", "atacado", "primeira"))
+            .turn("achei caro",
+                  text_contains_any("6x", "parcel", "por mês", "investimento", "retorno", "vale a pena", "desconto", "rápido")),
+
+        # ---------- H. Edge cases adicionais ----------
+        Test("H1", "Troca varejo (calcinha)", "informa que NÃO troca calcinha")
+            .turn("comprei uma calcinha ontem, posso trocar?",
+                  text_contains_any("não troca", "nao troca", "não trocamos", "não realizamos troca", "não tem troca", "higiene", "íntimas", "intimas")),
+
+        Test("H2", "Não menciona 'fitness'", "regra explícita do prompt")
+            .turn("vocês têm legging fitness?",
+                  text_not_contains("fitness")),
     ]
 
 
