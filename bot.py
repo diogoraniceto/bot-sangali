@@ -4,6 +4,7 @@ import json
 import requests
 import time
 import threading
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -99,6 +100,44 @@ def _tamanhos_validos_na_msg(texto):
     if "ÚNIC" in upper or "UNIC" in upper:
         encontrados.append("UNICO")
     return encontrados
+
+
+HANDOFF_SILENCIO_MIN = 30
+
+
+def _ultimo_handoff_em(user_id):
+    """Retorna timedelta desde o último handoff do user, ou None se nunca houve."""
+    try:
+        r = (
+            supabase.table("conversation_handoffs")
+            .select("created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        print(f"[handoff] falha ao consultar conversation_handoffs: {e}")
+        return None
+    if not r.data:
+        return None
+    try:
+        ts = datetime.fromisoformat(r.data[0]["created_at"].replace("Z", "+00:00"))
+    except Exception as e:
+        print(f"[handoff] created_at inválido: {e}")
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - ts
+
+
+def _em_silencio_pos_handoff(user_id):
+    """True se houve handoff para este user nos últimos HANDOFF_SILENCIO_MIN minutos."""
+    delta = _ultimo_handoff_em(user_id)
+    if delta is None:
+        return False
+    return delta < timedelta(minutes=HANDOFF_SILENCIO_MIN)
+
 
 # ================= AUXILIARES DE INTELIGÊNCIA =================
 
@@ -825,6 +864,13 @@ def criar_tool_transferir(user_id):
             produtos_interesse: nomes/códigos dos produtos mencionados, separados
                                 por vírgula. Vazio se não aplicável.
         """
+        # Idempotência: se já houve handoff nos últimos HANDOFF_SILENCIO_MIN minutos
+        # para este user, não duplica WhatsApp nem row em conversation_handoffs.
+        delta = _ultimo_handoff_em(user_id)
+        if delta is not None and delta < timedelta(minutes=HANDOFF_SILENCIO_MIN):
+            print(f"🔁 Handoff já ativo há {delta} para {user_id} — disparo suprimido.")
+            return {"status": "ja_transferido", "msg": "Conversa já está com atendente."}
+
         try:
             config = supabase.table("bot_settings").select("operator_number").eq("id", 1).single().execute()
             operator_number = (config.data or {}).get("operator_number") if config else None
@@ -1132,6 +1178,12 @@ def process_and_respond(user_id):
         if not settings.get('is_active'):
              print(f"⏹️ Bot desligado no painel para usuário. Ignorando mensagem.")
              return
+
+        # Pós-handoff: humano assumiu, bot fica em silêncio por HANDOFF_SILENCIO_MIN.
+        # Mensagem do cliente já foi salva em chat_history (acima) — atendente vê.
+        if _em_silencio_pos_handoff(user_id):
+            print(f"⏸️ Handoff ativo para {user_id} — bot em silêncio, ignorando msg.")
+            return
 
         system_instruction_dinamica = settings.get('system_prompt', '')
         

@@ -124,6 +124,15 @@ def any_tool_called():
     return _c
 
 
+def nothing_sent():
+    def _c(ctx):
+        n_msg = len(ctx.get("messages_sent") or [])
+        n_media = len(ctx.get("media_sent") or [])
+        return (n_msg == 0 and n_media == 0), f"msgs={n_msg} media={n_media}"
+    _c.__name__ = "nothing_sent"
+    return _c
+
+
 def text_contains_any(*words):
     def _c(ctx):
         all_text = " ".join(m["text"] for m in ctx["messages_sent"])
@@ -670,6 +679,16 @@ def build_tests():
             .turn("frete pra 01310-100",
                   tool_called("calcular_frete_estimado"),
                   frete_resposta_tem_valor_realista()),
+
+        # ---------- J. Pós-handoff (silêncio) ----------
+        # Após transferir_para_atendente, bot deve silenciar por 30 min:
+        # nada é enviado nem ao cliente nem ao operador. Cobre o bug em produção
+        # de duplicação de notif e bot interferindo após humano assumir.
+        Test("J1", "Silêncio pós-handoff", "após transferir, próxima msg do cliente é ignorada (sem nova notif, sem nova resposta)")
+            .turn("oi, queria falar com uma vendedora real, por favor",
+                  tool_called("transferir_para_atendente"))
+            .turn("obrigado! qual a promoção dessa semana?",
+                  nothing_sent()),
     ]
 
 
