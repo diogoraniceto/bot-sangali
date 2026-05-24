@@ -1436,6 +1436,15 @@ def _extract_quoted_content(msg_data):
         msg_data.get('quoted'),
         (msg_data.get('contextInfo') or {}).get('quotedMessage') if isinstance(msg_data.get('contextInfo'), dict) else None,
     ]
+
+    # UAZAPI variante: content eh dict com text + contextInfo.quotedMessage
+    content_dict = msg_data.get('content')
+    if isinstance(content_dict, dict):
+        quoted_paths.append(content_dict.get('quotedMessage'))
+        ctx_c = content_dict.get('contextInfo')
+        if isinstance(ctx_c, dict):
+            quoted_paths.append(ctx_c.get('quotedMessage'))
+
     ext = msg_data.get('extendedTextMessage')
     if isinstance(ext, dict):
         ctx = ext.get('contextInfo')
