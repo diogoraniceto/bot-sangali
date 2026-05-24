@@ -5,7 +5,7 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip,
 import {
     Bell, Search, LayoutDashboard, MessageSquare, Box, Puzzle, RotateCcw, PanelLeft, Bot, Zap, Plus, Settings, Play, Link, Download, Move, LogOut, FileText, Sun, Moon, LayoutGrid, List, ImagePlus, Filter, UploadCloud, Activity, RefreshCw, AlertCircle, TrendingUp, ShoppingCart, Users, Check, X, Camera, Image as ImageIcon,
     GripVertical, Sparkles, ChevronDown, ChevronRight, Trash2, Save, MessageCircle, UserCircle2, Package, ArrowUpDown, ArrowUp, ArrowDown,
-    Command, Plug, Tag, FileSearch
+    Command, Plug, Tag, FileSearch, Store, Copy, ListTree
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -72,17 +72,18 @@ function SidebarItem({ icon: Icon, label, active, onClick }) {
     )
 }
 
-function PromptBlock({ block, index, onUpdate, onDelete, onDragStart, onDragOver, onDrop, isDragTarget }) {
+function PromptBlock({ block, index, domId, onUpdate, onDelete, onDragStart, onDragOver, onDrop, isDragTarget }) {
     const [editing, setEditing] = useState(false)
     const [collapsed, setCollapsed] = useState(block.collapsed)
 
     return (
         <div
+            id={domId}
             draggable
             onDragStart={(e) => onDragStart(e, index)}
             onDragOver={(e) => onDragOver(e, index)}
             onDrop={(e) => onDrop(e, index)}
-            className={`group bg-white dark:bg-[#111111] border rounded-xl overflow-hidden transition-all duration-200 ${isDragTarget
+            className={`group bg-white dark:bg-[#111111] border rounded-xl overflow-hidden transition-all duration-200 scroll-mt-6 ${isDragTarget
                 ? 'border-purple-500 scale-[1.01] shadow-lg shadow-purple-500/10'
                 : 'border-slate-200 dark:border-[#1E1E1E] hover:border-slate-300 dark:hover:border-[#333] shadow-sm'
                 }`}
@@ -189,6 +190,9 @@ export default function Dashboard() {
     const [savingOperator, setSavingOperator] = useState(false)
     const [operatorSaved, setOperatorSaved] = useState(false)
 
+    // Lojas com id_loja (para referencia no Construtor de Comandos)
+    const [lojasComId, setLojasComId] = useState([])
+
     useEffect(() => {
         fetchConfig()
         fetchLogs()
@@ -238,6 +242,31 @@ export default function Dashboard() {
         if (activeSidebarItem !== 'estoque') return
         loadEstoqueMetadados()
     }, [activeSidebarItem])
+
+    // Carregar lojas (id <> nome) ao entrar no Construtor de Comandos
+    useEffect(() => {
+        if (activeSidebarItem !== 'comandos' || lojasComId.length > 0) return
+        let cancelled = false
+        ;(async () => {
+            const { data } = await supabase
+                .from('produtos_estoque')
+                .select('id_loja, loja')
+                .not('id_loja', 'is', null)
+                .not('loja', 'is', null)
+                .range(0, 9999)
+            if (cancelled || !data) return
+            const map = new Map()
+            for (const r of data) {
+                const k = String(r.id_loja)
+                if (!map.has(k)) map.set(k, r.loja)
+            }
+            const lista = [...map.entries()]
+                .map(([id_loja, loja]) => ({ id_loja, loja }))
+                .sort((a, b) => a.loja.localeCompare(b.loja))
+            setLojasComId(lista)
+        })()
+        return () => { cancelled = true }
+    }, [activeSidebarItem, lojasComId.length])
 
     // (Re)carregar página atual quando filtros, sort, página ou metadados mudam
     useEffect(() => {
@@ -907,7 +936,7 @@ export default function Dashboard() {
 
                     {/* COMANDOS PAGE (Prompt Builder) */}
                     {activeSidebarItem === 'comandos' && (
-                        <div className="px-8 py-8 max-w-4xl mx-auto w-full pb-24 animate-fade-in transition-colors">
+                        <div className="px-8 py-8 max-w-7xl mx-auto w-full pb-24 animate-fade-in transition-colors">
                             {/* Header de Ações (Apenas p/ Comandos) */}
                             <div className="flex justify-between items-center mb-6">
                                 <div>
@@ -935,35 +964,106 @@ export default function Dashboard() {
                                 </div>
                             </div>
 
-                            <div className="bg-white dark:bg-[#0F0F0F] rounded-2xl border border-slate-200 dark:border-[#1E1E1E] p-6 shadow-sm transition-colors">
-                                {/* Blocks */}
-                                <div
-                                    className="space-y-4"
-                                    onDragEnd={() => { setDragIndex(null); setDragOverIndex(null) }}
-                                >
-                                    {blocks.map((block, index) => (
-                                        <PromptBlock
-                                            key={block.id}
-                                            block={block}
-                                            index={index}
-                                            onUpdate={updateBlock}
-                                            onDelete={deleteBlock}
-                                            onDragStart={handleDragStart}
-                                            onDragOver={handleDragOver}
-                                            onDrop={handleDrop}
-                                            isDragTarget={dragOverIndex === index && dragIndex !== index}
-                                        />
-                                    ))}
+                            <div className="flex gap-6">
+                                {/* Editor de blocos */}
+                                <div className="flex-1 min-w-0 max-w-4xl">
+                                    <div className="bg-white dark:bg-[#0F0F0F] rounded-2xl border border-slate-200 dark:border-[#1E1E1E] p-6 shadow-sm transition-colors">
+                                        {/* Blocks */}
+                                        <div
+                                            className="space-y-4"
+                                            onDragEnd={() => { setDragIndex(null); setDragOverIndex(null) }}
+                                        >
+                                            {blocks.map((block, index) => (
+                                                <PromptBlock
+                                                    key={block.id}
+                                                    block={block}
+                                                    index={index}
+                                                    domId={`prompt-block-${block.id}`}
+                                                    onUpdate={updateBlock}
+                                                    onDelete={deleteBlock}
+                                                    onDragStart={handleDragStart}
+                                                    onDragOver={handleDragOver}
+                                                    onDrop={handleDrop}
+                                                    isDragTarget={dragOverIndex === index && dragIndex !== index}
+                                                />
+                                            ))}
+                                        </div>
+
+                                        {/* Add Block Button */}
+                                        <button
+                                            onClick={addBlock}
+                                            className="w-full mt-6 py-4 border border-dashed border-slate-300 dark:border-[#333] hover:border-purple-500/50 dark:hover:border-purple-500/50 bg-slate-50 dark:bg-transparent hover:bg-slate-100 dark:hover:bg-[#111111] rounded-xl text-slate-500 dark:text-[#71717A] hover:text-purple-600 dark:hover:text-purple-400 transition-all duration-200 flex items-center justify-center gap-2 text-xs font-bold uppercase tracking-wider group cursor-pointer"
+                                        >
+                                            <Plus size={14} className="group-hover:text-purple-600 dark:group-hover:text-purple-400 transition-colors" />
+                                            Adicionar Nova Sessão
+                                        </button>
+                                    </div>
                                 </div>
 
-                                {/* Add Block Button */}
-                                <button
-                                    onClick={addBlock}
-                                    className="w-full mt-6 py-4 border border-dashed border-slate-300 dark:border-[#333] hover:border-purple-500/50 dark:hover:border-purple-500/50 bg-slate-50 dark:bg-transparent hover:bg-slate-100 dark:hover:bg-[#111111] rounded-xl text-slate-500 dark:text-[#71717A] hover:text-purple-600 dark:hover:text-purple-400 transition-all duration-200 flex items-center justify-center gap-2 text-xs font-bold uppercase tracking-wider group cursor-pointer"
-                                >
-                                    <Plus size={14} className="group-hover:text-purple-600 dark:group-hover:text-purple-400 transition-colors" />
-                                    Adicionar Nova Sessão
-                                </button>
+                                {/* Sidebar lateral: TOC + Lojas */}
+                                <aside className="hidden lg:flex flex-col w-64 shrink-0 sticky top-4 self-start max-h-[calc(100vh-6rem)] gap-4">
+                                    {/* TOC — sumario clicavel */}
+                                    <div className="bg-white dark:bg-[#0F0F0F] rounded-xl border border-slate-200 dark:border-[#1E1E1E] shadow-sm overflow-hidden">
+                                        <div className="px-4 py-3 border-b border-slate-200 dark:border-[#1E1E1E] flex items-center gap-2">
+                                            <ListTree size={14} className="text-purple-500" />
+                                            <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">Sumário</h3>
+                                        </div>
+                                        <nav className="py-2 max-h-[55vh] overflow-y-auto custom-scrollbar">
+                                            {blocks.length === 0 && (
+                                                <p className="px-4 py-3 text-[12px] text-slate-400 dark:text-[#71717A]">Nenhum bloco ainda.</p>
+                                            )}
+                                            {blocks.map((b) => (
+                                                <button
+                                                    key={b.id}
+                                                    onClick={() => {
+                                                        const el = document.getElementById(`prompt-block-${b.id}`)
+                                                        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                                                    }}
+                                                    className="w-full text-left px-4 py-1.5 text-[12px] text-slate-600 dark:text-slate-300 hover:text-purple-600 dark:hover:text-purple-400 hover:bg-slate-50 dark:hover:bg-[#1A1A1A] transition-colors truncate cursor-pointer"
+                                                    title={b.title}
+                                                >
+                                                    {b.isIntro ? 'Introdução' : b.title}
+                                                </button>
+                                            ))}
+                                        </nav>
+                                    </div>
+
+                                    {/* Lojas — referencia id <> nome */}
+                                    <div className="bg-white dark:bg-[#0F0F0F] rounded-xl border border-slate-200 dark:border-[#1E1E1E] shadow-sm overflow-hidden">
+                                        <div className="px-4 py-3 border-b border-slate-200 dark:border-[#1E1E1E] flex items-center gap-2">
+                                            <Store size={14} className="text-purple-500" />
+                                            <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">Lojas (id)</h3>
+                                        </div>
+                                        <div className="p-2">
+                                            <p className="px-2 pt-1 pb-2 text-[11px] text-slate-500 dark:text-[#71717A] leading-snug">
+                                                Use o id_loja no prompt para filtrar o estoque por filial. Clique para copiar.
+                                            </p>
+                                            {lojasComId.length === 0 && (
+                                                <p className="px-2 py-2 text-[12px] text-slate-400 dark:text-[#71717A]">Carregando...</p>
+                                            )}
+                                            <ul className="space-y-0.5">
+                                                {lojasComId.map(({ id_loja, loja }) => (
+                                                    <li key={id_loja}>
+                                                        <button
+                                                            onClick={() => {
+                                                                navigator.clipboard?.writeText(id_loja)
+                                                                toast.success(`id_loja "${id_loja}" copiado`, { duration: 1500 })
+                                                            }}
+                                                            className="w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded-md hover:bg-slate-50 dark:hover:bg-[#1A1A1A] transition-colors group cursor-pointer"
+                                                            title={`Copiar id_loja ${id_loja}`}
+                                                        >
+                                                            <span className="text-[12px] text-slate-700 dark:text-slate-200 truncate">{loja}</span>
+                                                            <span className="flex items-center gap-1 text-[11px] font-mono text-slate-500 dark:text-[#A1A1AA] shrink-0">
+                                                                {id_loja}
+                                                                <Copy size={11} className="opacity-0 group-hover:opacity-100 transition-opacity" />
+                                                            </span>
+                                                        </button>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                        </div>
+                                    </div>
+                                </aside>
                             </div>
                         </div>
                     )}
