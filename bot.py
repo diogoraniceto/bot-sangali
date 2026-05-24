@@ -429,11 +429,18 @@ def consultar_produto_por_id(id_produto: int):
     Returns:
         {status, produto: {id_produto, nome, nome_grupo, variacoes: [{id_unico, tamanho, preco_varejo, preco_atacado, estoque, loja}]}}
     """
+    # Gemini eventualmente passa id_produto como float (54557957.0). Cast para int
+    # antes de virar string para evitar mismatch com '54557957' no banco.
+    try:
+        id_produto_normalizado = str(int(float(id_produto)))
+    except (TypeError, ValueError):
+        return {"status": "erro", "msg": f"id_produto invalido: {id_produto!r}"}
+
     try:
         resp = (
             supabase.table("produtos_estoque")
             .select("id_unico, id_produto, id_loja, loja, nome, tamanho, preco_varejo, preco_atacado, estoque, grupo_id, nome_grupo")
-            .eq("id_produto", str(id_produto))
+            .eq("id_produto", id_produto_normalizado)
             .gt("estoque", 0)
             .execute()
         )
@@ -1414,6 +1421,81 @@ def _extract_message_text(msg_data):
     return None
 
 
+def _extract_quoted_content(msg_data):
+    """Extrai o conteudo da mensagem citada (botao Responder do WhatsApp).
+
+    Tenta varios paths conhecidos da UAZAPI/Baileys. Retorna string com o conteudo
+    citado (texto, legenda de imagem, ou nome do arquivo) ou None se nao houver.
+    """
+    if not isinstance(msg_data, dict):
+        return None
+
+    # Caminhos onde a quotedMessage pode estar aninhada
+    quoted_paths = [
+        msg_data.get('quotedMessage'),
+        msg_data.get('quoted'),
+        (msg_data.get('contextInfo') or {}).get('quotedMessage') if isinstance(msg_data.get('contextInfo'), dict) else None,
+    ]
+    ext = msg_data.get('extendedTextMessage')
+    if isinstance(ext, dict):
+        ctx = ext.get('contextInfo')
+        if isinstance(ctx, dict):
+            quoted_paths.append(ctx.get('quotedMessage'))
+    msg_inner = msg_data.get('message')
+    if isinstance(msg_inner, dict):
+        ext_inner = msg_inner.get('extendedTextMessage')
+        if isinstance(ext_inner, dict):
+            ctx_inner = ext_inner.get('contextInfo')
+            if isinstance(ctx_inner, dict):
+                quoted_paths.append(ctx_inner.get('quotedMessage'))
+
+    # Tambem aceita campos flat que algumas integracoes mandam
+    flat_candidates = [
+        msg_data.get('quotedText'),
+        msg_data.get('quotedContent'),
+        msg_data.get('quotedBody'),
+        msg_data.get('replyTo'),
+    ]
+
+    for q in quoted_paths:
+        if not isinstance(q, dict):
+            continue
+        # Texto plano citado
+        for key in ('conversation', 'text', 'body'):
+            v = q.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # Texto dentro de extendedTextMessage citado
+        ext_q = q.get('extendedTextMessage')
+        if isinstance(ext_q, dict):
+            v = ext_q.get('text')
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # Legenda de imagem citada (e o caso dos cards de produto)
+        img = q.get('imageMessage')
+        if isinstance(img, dict):
+            cap = img.get('caption')
+            if isinstance(cap, str) and cap.strip():
+                return cap.strip()
+        # Documento/audio/video citado: usar caption ou fileName
+        for media_key in ('videoMessage', 'documentMessage', 'audioMessage'):
+            m = q.get(media_key)
+            if isinstance(m, dict):
+                cap = m.get('caption') or m.get('fileName') or m.get('title')
+                if isinstance(cap, str) and cap.strip():
+                    return cap.strip()
+
+    for c in flat_candidates:
+        if isinstance(c, str) and c.strip():
+            return c.strip()
+        if isinstance(c, dict):
+            for key in ('text', 'caption', 'conversation', 'body'):
+                v = c.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return None
+
+
 @app.route('/webhook', methods=['POST'])
 @app.route('/webhook/<evento>/<tipo>', methods=['POST'])
 def webhook(evento=None, tipo=None):
@@ -1423,10 +1505,26 @@ def webhook(evento=None, tipo=None):
 
     chat_id = msg_data.get('chatid')
     raw_text = _extract_message_text(msg_data)
+    quoted = _extract_quoted_content(msg_data)
+
+    # Log temporario do payload quando vier mensagem citada (botao Responder).
+    # Remover apos confirmar o campo correto da UAZAPI.
+    msg_type = msg_data.get('messageType') or msg_data.get('type') or ''
+    is_reply = quoted is not None or 'extend' in str(msg_type).lower() or 'quot' in str(msg_type).lower() or msg_data.get('quotedMessage') is not None
+    if is_reply:
+        try:
+            payload_str = json.dumps(msg_data, ensure_ascii=False, default=str)[:2000]
+            print(f"[WEBHOOK_REPLY] type={msg_type} | quoted_extraido={quoted!r} | payload={payload_str}")
+        except Exception as e:
+            print(f"[WEBHOOK_REPLY] falha ao serializar payload: {e} | keys={list(msg_data.keys())}")
+
+    # Se houver quoted, anexa ao texto para a LLM ter contexto do que o cliente citou.
+    if isinstance(raw_text, str) and quoted:
+        raw_text = f"[respondendo a mensagem citada: \"{quoted}\"] {raw_text}"
 
     if not chat_id or not isinstance(raw_text, str):
         if chat_id:
-            print(f"[WEBHOOK] texto nao extraido | chat={chat_id} | type={msg_data.get('messageType') or msg_data.get('type')} | keys={list(msg_data.keys())}")
+            print(f"[WEBHOOK] texto nao extraido | chat={chat_id} | type={msg_type} | keys={list(msg_data.keys())}")
         return jsonify({"status": "buffering"}), 200
 
     user_id = chat_id.split('@')[0]
