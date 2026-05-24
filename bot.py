@@ -102,7 +102,21 @@ def _tamanhos_validos_na_msg(texto):
     return encontrados
 
 
-HANDOFF_SILENCIO_MIN = 30
+HANDOFF_SILENCIO_MIN = 120  # silencia o bot por 2h apos handoff
+CONVERSA_GAP_HORAS = 24     # gap entre msgs que reseta o historico do contexto
+
+
+def _parse_iso_ts(ts_str):
+    """Converte ISO timestamp para datetime UTC. Retorna None se invalido."""
+    if not ts_str:
+        return None
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
 
 
 def _ultimo_handoff_em(user_id):
@@ -165,17 +179,48 @@ def save_message(user_id, role, content):
     }).execute()
 
 def get_history(user_id, limit=30):
+    """Carrega historico recente do user, descartando 'conversa antiga'.
+
+    Conversa antiga = mensagens antes de um gap >= CONVERSA_GAP_HORAS, OU
+    mensagens antes do ultimo handoff (atendente humana ja resolveu).
+    O banco mantem tudo para auditoria — quem filtra eh so o contexto do Gemini.
+    """
     response = supabase.table("chat_history") \
-        .select("role, content") \
+        .select("role, content, created_at") \
         .eq("user_id", user_id) \
         .order("created_at", desc=True) \
         .limit(limit) \
         .execute()
 
-    history = []
-    for msg in reversed(response.data):
-        history.append({"role": msg["role"], "parts": [msg["content"]]})
-    return history
+    rows = response.data or []
+    if not rows:
+        return []
+
+    # 1. Gap entre msgs consecutivas. rows esta em ordem DESC, entao descemos
+    # no tempo procurando o primeiro gap grande — tudo a partir dali pra tras
+    # eh outra conversa.
+    gap_limit = timedelta(hours=CONVERSA_GAP_HORAS)
+    cutoff_idx = len(rows)
+    for i in range(len(rows) - 1):
+        ts_atual = _parse_iso_ts(rows[i].get("created_at"))
+        ts_anterior = _parse_iso_ts(rows[i + 1].get("created_at"))
+        if ts_atual and ts_anterior and (ts_atual - ts_anterior) >= gap_limit:
+            cutoff_idx = i + 1
+            break
+    rows = rows[:cutoff_idx]
+
+    # 2. Descarta mensagens anteriores ao ultimo handoff (se houver).
+    delta_handoff = _ultimo_handoff_em(user_id)
+    if delta_handoff is not None:
+        ts_handoff = datetime.now(timezone.utc) - delta_handoff
+        rows = [
+            r for r in rows
+            if (ts := _parse_iso_ts(r.get("created_at"))) and ts > ts_handoff
+        ]
+
+    # 3. Reverte para ordem cronologica (oldest -> newest) para o Gemini.
+    rows.reverse()
+    return [{"role": r["role"], "parts": [r["content"]]} for r in rows]
 
 
 def _job_purge_bot_turns():
