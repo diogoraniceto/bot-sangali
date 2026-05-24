@@ -8,6 +8,7 @@ Aplicar **em ordem** via Supabase Dashboard → SQL Editor (uma de cada vez).
 2. `0002_update_rpc_buscar_produtos_semantico.sql` — RPC passa a casar tamanho via tokens. **Pré-requisito:** 0001 aplicada.
 3. `0003_bot_turns.sql` — tabela de logging estruturado por turno. Resolve Dimensão 7.
 4. `0004_promocoes_ativas.sql` — tabela de Dia S e similares. Resolve Risco 3.
+5. `0009_rpc_buscar_produtos_semantico_id_loja.sql` — adiciona `filtro_id_loja` na RPC. **Pré-requisito:** 0002 aplicada.
 
 ## Verificação rápida pós-aplicação
 

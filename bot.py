@@ -225,9 +225,9 @@ def log_turn(user_id, user_input, tool_calls, final_output, latency_ms, model_na
 
 # ================= NOVA FERRAMENTA DE BUSCA (SUPABASE) =================
 
-def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
+def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja: str = None):
     """
-    Realiza busca semântica no estoque por similaridade vetorial + filtro de tamanho.
+    Realiza busca semântica no estoque por similaridade vetorial + filtro de tamanho + filtro de loja.
 
     Args:
         termo_cliente: o que o cliente busca (ex: "fantasia", "camisola algodão", "cueca boxer").
@@ -236,8 +236,11 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
                  Nunca expanda uma letra (G≠GG, M≠MM, P≠PP). Apenas colapse digitação
                  repetida em ≥4 (GGGG → GG). Use None só se o cliente realmente não falou
                  tamanho (ex: produtos sexshop, cosméticos).
+        id_loja: id da loja a filtrar (string). Use o id_loja informado nas instruções
+                 do prompt para restringir a busca a uma filial específica.
+                 Use None para buscar em todas as lojas.
     """
-    print(f"\n[SEMÂNTICO] Buscando: '{termo_cliente}' | Tamanho recebido: {tamanho}")
+    print(f"\n[SEMÂNTICO] Buscando: '{termo_cliente}' | Tamanho recebido: {tamanho} | Loja: {id_loja}")
 
     # 0. Normalização do Tamanho
     tamanho_alvo = tamanho.upper().strip() if tamanho else None
@@ -262,11 +265,13 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None):
 
     # 2. Chama a RPC 'buscar_produtos_semantico' no Supabase
     try:
+        id_loja_alvo = str(id_loja).strip() if id_loja not in (None, "") else None
         rpc_params = {
             'query_embedding': vetor_busca,
             'match_threshold': 0.5,
             'match_count': 10,
-            'filtro_tamanho': tamanho_alvo
+            'filtro_tamanho': tamanho_alvo,
+            'filtro_id_loja': id_loja_alvo
         }
         response = supabase.rpc('buscar_produtos_semantico', rpc_params).execute()
         produtos_candidatos = response.data
@@ -1330,6 +1335,40 @@ def enviar_mensagem_whatsapp(numero, texto):
     except Exception as e:
         print(f"Erro de conexão Uazapi: {e}")
 
+def _extract_message_text(msg_data):
+    """Extrai texto do payload do webhook, com fallback para mensagens citadas (botão Responder).
+
+    Quando o cliente usa "Responder" no WhatsApp, o messageType muda para
+    extendedTextMessage e o texto pode chegar em campos diferentes ou aninhado
+    dentro de um dict. Cobre as variantes mais comuns da UAZAPI / Baileys.
+    """
+    candidatos = []
+    candidatos.append(msg_data.get('content'))
+    candidatos.append(msg_data.get('text'))
+    candidatos.append(msg_data.get('conversation'))
+    candidatos.append(msg_data.get('body'))
+
+    ext = msg_data.get('extendedTextMessage')
+    if isinstance(ext, dict):
+        candidatos.append(ext.get('text'))
+
+    msg_inner = msg_data.get('message')
+    if isinstance(msg_inner, dict):
+        candidatos.append(msg_inner.get('conversation'))
+        ext_inner = msg_inner.get('extendedTextMessage')
+        if isinstance(ext_inner, dict):
+            candidatos.append(ext_inner.get('text'))
+
+    for c in candidatos:
+        if isinstance(c, str) and c.strip():
+            return c
+        if isinstance(c, dict):
+            nested = c.get('text') or c.get('conversation') or c.get('body')
+            if isinstance(nested, str) and nested.strip():
+                return nested
+    return None
+
+
 @app.route('/webhook', methods=['POST'])
 @app.route('/webhook/<evento>/<tipo>', methods=['POST'])
 def webhook(evento=None, tipo=None):
@@ -1338,9 +1377,11 @@ def webhook(evento=None, tipo=None):
     if msg_data.get('fromMe'): return jsonify({"status": "ignored"}), 200
 
     chat_id = msg_data.get('chatid')
-    raw_text = msg_data.get('content')
+    raw_text = _extract_message_text(msg_data)
 
     if not chat_id or not isinstance(raw_text, str):
+        if chat_id:
+            print(f"[WEBHOOK] texto nao extraido | chat={chat_id} | type={msg_data.get('messageType') or msg_data.get('type')} | keys={list(msg_data.keys())}")
         return jsonify({"status": "buffering"}), 200
 
     user_id = chat_id.split('@')[0]
