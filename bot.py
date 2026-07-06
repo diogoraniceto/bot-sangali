@@ -12,6 +12,7 @@ from google.api_core.exceptions import GoogleAPICallError
 from supabase import create_client, Client
 from apscheduler.schedulers.background import BackgroundScheduler
 from sync_erp import sync_otimizado
+import sync_erp
 from sync_images import sync_images
 
 # ================= CONFIGURAÇÕES =================
@@ -1565,6 +1566,98 @@ def webhook(evento=None, tipo=None):
 
     return jsonify({"status": "buffering"}), 200
 
+# ============================================================
+# Health-check + watchdog do sync (alerta se o sync travar)
+# ============================================================
+PROCESS_START_AT = datetime.now(timezone.utc)
+SYNC_STALE_ALERT_MIN = int(os.getenv("SYNC_STALE_ALERT_MIN", "30"))
+ALERT_WHATSAPP = os.getenv("ALERT_WHATSAPP", "")   # numero sem '+', ex: 5514997767200
+ALERT_EMAIL = os.getenv("ALERT_EMAIL", "")
+_alert_state = {"alerting": False, "last_alert_at": None}
+
+
+def _sync_age_min():
+    """Retorna (idade_min, last_run_dt|None, tolerancia_min) usando o heartbeat do sync_erp."""
+    now = datetime.now(timezone.utc)
+    last = sync_erp.LAST_RUN_AT
+    if last is None:
+        # Ainda nao rodou desde o boot: tolera boot + 1 ciclo antes de considerar parado.
+        return (now - PROCESS_START_AT).total_seconds() / 60.0, None, SYNC_STALE_ALERT_MIN + 15
+    return (now - last).total_seconds() / 60.0, last, SYNC_STALE_ALERT_MIN
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    age, last, tol = _sync_age_min()
+    healthy = age <= tol
+    body = {
+        "status": "ok" if healthy else "stale",
+        "sync_last_run_utc": last.isoformat() if last else None,
+        "sync_age_min": round(age, 1),
+        "sync_last_ok": sync_erp.LAST_RUN_OK,
+        "sync_last_info": sync_erp.LAST_RUN_INFO,
+        "threshold_min": tol,
+    }
+    return jsonify(body), (200 if healthy else 503)
+
+
+def _enviar_email_alerta(assunto, corpo):
+    host = os.getenv("SMTP_HOST"); user = os.getenv("SMTP_USER"); pwd = os.getenv("SMTP_PASS")
+    if not (host and user and pwd and ALERT_EMAIL):
+        return False  # e-mail nao configurado (defina SMTP_HOST/USER/PASS p/ ativar)
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        m = MIMEText(corpo, "plain", "utf-8")
+        m["Subject"] = assunto; m["From"] = user; m["To"] = ALERT_EMAIL
+        with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587")), timeout=20) as s:
+            s.starttls(); s.login(user, pwd); s.send_message(m)
+        print(f"[ALERTA] email enviado para {ALERT_EMAIL}")
+        return True
+    except Exception as e:
+        print(f"[ALERTA] email falhou: {e}")
+        return False
+
+
+def _disparar_alerta(assunto, corpo):
+    if ALERT_WHATSAPP:
+        try:
+            enviar_mensagem_whatsapp(ALERT_WHATSAPP, f"*{assunto}*\n\n{corpo}")
+            print(f"[ALERTA] whatsapp enviado para {ALERT_WHATSAPP}")
+        except Exception as e:
+            print(f"[ALERTA] whatsapp falhou: {e}")
+    _enviar_email_alerta(assunto, corpo)
+
+
+def _verificar_sync_e_alertar():
+    """Roda periodicamente: se o sync nao roda ha mais que o limite, alerta (com cooldown)."""
+    try:
+        now = datetime.now(timezone.utc)
+        age, last, tol = _sync_age_min()
+        if age > tol:
+            la = _alert_state["last_alert_at"]
+            reenvio = la is None or (now - la).total_seconds() > 3 * 3600
+            if not _alert_state["alerting"] or reenvio:
+                corpo = (
+                    "O sync de estoque do bot Sangali parece parado.\n"
+                    f"Ultima execucao: {last.isoformat() if last else 'nenhuma desde o boot'}\n"
+                    f"Ha ~{int(age)} min (limite {int(tol)} min).\n"
+                    "Verifique o servico no Railway."
+                )
+                _disparar_alerta("Sync de estoque parado", corpo)
+                _alert_state["alerting"] = True
+                _alert_state["last_alert_at"] = now
+                print(f"[WATCHDOG] alerta de sync parado enviado (age={int(age)}min)")
+        else:
+            if _alert_state["alerting"]:
+                _disparar_alerta("Sync de estoque normalizado",
+                                 f"O sync voltou a rodar (ultima execucao ha ~{int(age)} min).")
+                print("[WATCHDOG] sync normalizado")
+            _alert_state["alerting"] = False
+    except Exception as e:
+        print(f"[WATCHDOG] erro: {e}")
+
+
 if __name__ == '__main__':
     # Inicia os schedulers de sincronização
     scheduler = BackgroundScheduler()
@@ -1579,6 +1672,8 @@ if __name__ == '__main__':
         print(f"Scheduler ERP in-process ativo: cada {_sync_min}min")
     scheduler.add_job(sync_images, 'cron', hour=9, minute=0, misfire_grace_time=3600)
     scheduler.add_job(_job_purge_bot_turns, 'cron', hour=7, minute=0, misfire_grace_time=3600)
+    scheduler.add_job(_verificar_sync_e_alertar, 'interval', minutes=15,
+                      misfire_grace_time=300, coalesce=True, max_instances=1)
     scheduler.start()
     print("Schedulers iniciados: Imagens diario 6h BRT | Purge bot_turns diario 4h BRT")
 

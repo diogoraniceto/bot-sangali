@@ -3,6 +3,7 @@ import requests
 import logging
 from supabase import create_client
 import time
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import google.generativeai as genai
 
@@ -42,6 +43,13 @@ REQUEST_TIMEOUT = int(os.getenv("SYNC_HTTP_TIMEOUT", "30"))
 # Cache de embeddings em memória (por execução)
 embedding_cache = {}
 
+# Heartbeat do sync: atualizado a cada execucao concluida (mesmo com 0 mudancas).
+# E o sinal real de "o sync rodou" — diferente de last_sync na tabela, que so muda
+# quando um produto muda. Lido pelo /health e pelo watchdog de alerta (bot.py).
+LAST_RUN_AT = None    # datetime UTC da ultima execucao
+LAST_RUN_OK = None    # bool: ultima execucao terminou sem abortar
+LAST_RUN_INFO = ""    # resumo curto (contadores)
+
 
 def get_embedding(text):
     if text in embedding_cache:
@@ -51,7 +59,8 @@ def get_embedding(text):
             model="models/gemini-embedding-001",
             content=text,
             task_type="retrieval_document",
-            output_dimensionality=768
+            output_dimensionality=768,
+            request_options={"timeout": 30}
         )
         embedding = result['embedding']
         embedding_cache[text] = embedding
@@ -180,6 +189,7 @@ def carregar_estado_atual_do_banco():
 
 
 def sync_otimizado():
+    global LAST_RUN_AT, LAST_RUN_OK, LAST_RUN_INFO
     t_inicio = time.perf_counter()
 
     total_processados = 0
@@ -192,6 +202,7 @@ def sync_otimizado():
     lojas = get_lojas()
     if not lojas:
         log.error("Nenhuma loja encontrada. Abortando sync.")
+        LAST_RUN_AT = datetime.now(timezone.utc); LAST_RUN_OK = False; LAST_RUN_INFO = "abortou: sem lojas do ERP"
         return
 
     # 2) Carrega estado do banco
@@ -383,6 +394,8 @@ def sync_otimizado():
 
     # 5) Log final com tempos
     t_total = time.perf_counter() - t_inicio
+    LAST_RUN_AT = datetime.now(timezone.utc); LAST_RUN_OK = True
+    LAST_RUN_INFO = f"upserts:{total_upserts} skipped:{total_skipped} zerados:{total_zerados}"
     log.info(
         f"SYNC OK | {t_total:.1f}s total | "
         f"lojas:{len(lojas)} banco:{t_banco:.1f}s api:{t_api_total:.1f}s embed:{t_embed_total:.1f}s upsert:{t_upsert_total:.1f}s | "
