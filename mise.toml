@@ -1,0 +1,9 @@
+# Railway usa o builder Railpack -> mise para instalar o Python.
+# O mise passou a exigir GitHub artifact attestations e o download do
+# cpython 3.11.9 nao as possui, quebrando o build ("No GitHub artifact
+# attestations found for python@3.11.9"). Desligamos a verificacao aqui.
+[tools]
+python = "3.11.9"
+
+[settings]
+python.github_attestations = false
