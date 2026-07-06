@@ -409,6 +409,11 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
             vistos.add(chave)
             selecao.append(p)
 
+    # Sinal explícito de foto p/ o modelo: evita prometer imagem que o sistema
+    # não vai enviar (card sem imagem sai só como texto — renderizar_mensagem_estruturada).
+    for p in selecao:
+        p['tem_foto'] = bool(p.get('imagem'))
+
     print(f"[SEMÂNTICO] Retornando {len(selecao)} itens.")
     return {"status": "sucesso", "produtos": selecao}
 
