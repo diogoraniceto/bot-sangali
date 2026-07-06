@@ -35,6 +35,10 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 session = requests.Session()
 session.headers.update(HEADERS)
 
+# Timeout obrigatorio em toda chamada HTTP: sem isso, um request travado congela
+# a thread do scheduler e o sync para de rodar (foi a causa do estoque parar em 03/07).
+REQUEST_TIMEOUT = int(os.getenv("SYNC_HTTP_TIMEOUT", "30"))
+
 # Cache de embeddings em memória (por execução)
 embedding_cache = {}
 
@@ -60,7 +64,7 @@ def get_embedding(text):
 def get_lojas():
     """Busca todas as lojas disponíveis na API GestãoClick."""
     try:
-        response = session.get("https://api.gestaoclick.com/lojas")
+        response = session.get("https://api.gestaoclick.com/lojas", timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
             log.error(f"Erro ao buscar lojas: Status {response.status_code}")
             return []
@@ -219,7 +223,7 @@ def sync_otimizado():
 
             try:
                 t0 = time.perf_counter()
-                response = session.get(GESTAO_CLICK_URL, params=params)
+                response = session.get(GESTAO_CLICK_URL, params=params, timeout=REQUEST_TIMEOUT)
                 t_api_total += time.perf_counter() - t0
 
                 if response.status_code != 200:

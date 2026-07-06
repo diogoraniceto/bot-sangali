@@ -1568,11 +1568,19 @@ def webhook(evento=None, tipo=None):
 if __name__ == '__main__':
     # Inicia os schedulers de sincronização
     scheduler = BackgroundScheduler()
-    scheduler.add_job(sync_otimizado, 'interval', minutes=30, misfire_grace_time=300)
+    # Sync ERP in-process (fallback). Ideal em producao: rodar via cron dedicado
+    # do Railway (python sync_erp.py), desacoplado do web — nao trava o webhook e
+    # nao depende deste processo. Desligue este aqui com ENABLE_INPROCESS_SYNC=0
+    # quando o cron dedicado estiver ativo (evita sync duplicado).
+    if os.getenv("ENABLE_INPROCESS_SYNC", "1") == "1":
+        _sync_min = int(os.getenv("SYNC_INTERVAL_MIN", "10"))
+        scheduler.add_job(sync_otimizado, 'interval', minutes=_sync_min,
+                          misfire_grace_time=600, coalesce=True, max_instances=1)
+        print(f"Scheduler ERP in-process ativo: cada {_sync_min}min")
     scheduler.add_job(sync_images, 'cron', hour=9, minute=0, misfire_grace_time=3600)
     scheduler.add_job(_job_purge_bot_turns, 'cron', hour=7, minute=0, misfire_grace_time=3600)
     scheduler.start()
-    print("Schedulers iniciados: ERP 30min | Imagens diario 6h BRT | Purge bot_turns diario 4h BRT")
+    print("Schedulers iniciados: Imagens diario 6h BRT | Purge bot_turns diario 4h BRT")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host='0.0.0.0', port=port)
