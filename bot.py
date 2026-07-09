@@ -8,6 +8,21 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import google.generativeai as genai
+
+# Safety relaxado: dominio lingerie/sexshop gera falso-positivo no filtro padrao.
+# (block_reason=PROHIBITED_CONTENT e filtro central NAO configuravel aqui -> tratado
+# por degradacao graciosa no except de process_and_respond.)
+try:
+    from google.generativeai.types import HarmCategory as _HC, HarmBlockThreshold as _HB
+    SAFETY_SETTINGS = {
+        _HC.HARM_CATEGORY_HARASSMENT: _HB.BLOCK_NONE,
+        _HC.HARM_CATEGORY_HATE_SPEECH: _HB.BLOCK_NONE,
+        _HC.HARM_CATEGORY_SEXUALLY_EXPLICIT: _HB.BLOCK_NONE,
+        _HC.HARM_CATEGORY_DANGEROUS_CONTENT: _HB.BLOCK_NONE,
+    }
+except Exception as _e_safety:
+    print(f"[safety] settings nao configurados: {_e_safety}")
+    SAFETY_SETTINGS = None
 from google.api_core.exceptions import GoogleAPICallError
 from supabase import create_client, Client
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -163,7 +178,8 @@ def get_embedding(text):
             model="models/gemini-embedding-001",
             content=text,
             task_type="retrieval_query",
-            output_dimensionality=768
+            output_dimensionality=768,
+            request_options={"timeout": 30}
         )
         return result['embedding']
     except Exception as e:
@@ -1174,7 +1190,7 @@ def renderizar_mensagem_estruturada(user_id, resposta_texto, ids_recomendados, c
             continue
         nome = info.get("nome") or f"Produto {pid}"
         preco_str = _formatar_preco(info.get("preco"))
-        legenda = f"*{nome}* - {preco_str}"
+        legenda = f"*{nome}* - {preco_str}\n_cód: {int(pid)}_"
         url = info.get("imagem")
         if url:
             time.sleep(1.0)
@@ -1270,6 +1286,7 @@ def process_and_respond(user_id):
                 calcular_frete_estimado,
             ],
             system_instruction=system_instruction_dinamica,
+            safety_settings=SAFETY_SETTINGS,
         )
         try:
             model = genai.GenerativeModel(generation_config=GENERATION_CONFIG, **modelo_args)
@@ -1282,7 +1299,7 @@ def process_and_respond(user_id):
         history = get_history(user_id)
         chat = model.start_chat(history=history, enable_automatic_function_calling=True)
         t_inicio = time.perf_counter()
-        response = chat.send_message(texto_completo)
+        response = chat.send_message(texto_completo, request_options={"timeout": 60})
         latencia_ms = int((time.perf_counter() - t_inicio) * 1000)
         resposta_texto = response.text
         print(f"DEBUG OUTPUT ({latencia_ms}ms): '{resposta_texto[:200]}'")
@@ -1334,12 +1351,22 @@ def process_and_respond(user_id):
         import traceback
         err_str = f"{e}\n{traceback.format_exc()}"
         print(f"Erro IA: {err_str}")
+        # Degradacao graciosa: NUNCA deixar o cliente sem resposta (nem em bloqueio/timeout).
+        _low = str(e).lower()
+        if any(k in _low for k in ("block", "prohibited", "safety", "finish_reason", "blocked")):
+            _fallback = "Desculpa, nao consegui processar essa mensagem agora 😅 Pode reformular ou me dizer de outro jeito? Se preferir, ja chamo uma atendente pra te ajudar 💕"
+        else:
+            _fallback = "Ops, tive um probleminha tecnico aqui 😅 Pode reenviar sua ultima mensagem, por favor?"
+        try:
+            enviar_mensagem_whatsapp(user_id, _fallback)
+        except Exception:
+            pass
         try:
             log_turn(
                 user_id=user_id,
                 user_input=texto_completo,
                 tool_calls=[],
-                final_output="",
+                final_output=_fallback,
                 latency_ms=0,
                 model_name='gemini-3-flash-preview',
                 output_format="error",
@@ -1535,7 +1562,14 @@ def webhook(evento=None, tipo=None):
 
     # Se houver quoted, anexa ao texto para a LLM ter contexto do que o cliente citou.
     if isinstance(raw_text, str) and quoted:
-        raw_text = f"[respondendo a mensagem citada: \"{quoted}\"] {raw_text}"
+        _m_cod = re.search(r'c[óo]d:\s*(\d+)', quoted, re.IGNORECASE)
+        if _m_cod:
+            _pid = _m_cod.group(1)
+            raw_text = (f"[o cliente respondeu ao card do produto id_produto={_pid} "
+                        f"(citacao: \"{quoted}\"). Use EXATAMENTE id_produto={_pid} para este item em "
+                        f"calcular_total / produtos_recomendados / resumo; nao re-derive o id pelo nome.] {raw_text}")
+        else:
+            raw_text = f"[respondendo a mensagem citada: \"{quoted}\"] {raw_text}"
 
     if not chat_id or not isinstance(raw_text, str):
         if chat_id:
