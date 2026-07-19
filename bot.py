@@ -1,6 +1,9 @@
 import os
 import re
 import json
+import hmac
+import hashlib
+import collections
 import requests
 import time
 import threading
@@ -39,6 +42,22 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 UAZAPI_URL = os.getenv("UAZAPI_URL")
 UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN")
+
+# ---- Camada de transporte do WhatsApp (migracao UAZAPI -> Cloud API oficial) ----
+# WHATSAPP_PROVIDER controla qual backend envia/recebe. Default "uazapi" preserva
+# 100% do comportamento atual; "cloud" ativa a WhatsApp Business Cloud API da Meta.
+# Ver MIGRATION_CLOUD_API.md.
+WHATSAPP_PROVIDER = (os.getenv("WHATSAPP_PROVIDER", "uazapi") or "uazapi").lower()
+GRAPH_VERSION = os.getenv("GRAPH_VERSION", "v22.0")
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")            # System User token (permanente)
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")  # string p/ handshake do webhook
+WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET")  # do App, p/ validar X-Hub-Signature-256
+_GRAPH_MSG_URL = (
+    f"https://graph.facebook.com/{GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    if WHATSAPP_PHONE_NUMBER_ID else None
+)
+
 MELHOR_ENVIO_TOKEN = os.getenv("MELHOR_ENVIO_TOKEN")
 MELHOR_ENVIO_URL = "https://www.melhorenvio.com.br/api/v2/me/shipment/calculate"
 
@@ -48,6 +67,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 message_buffers = {}
 _message_buffers_global_lock = threading.Lock()  # protege escrita no dict global
+# user_ids ja identificados em contexto de ATACADO — usado p/ exibir o preco de
+# atacado no card (modo_preco) mesmo quando o modelo esquece de setar o campo.
+_atacado_users = set()
 _user_locks = {}  # threading.Lock() por user_id (criado on-demand)
 
 # Última mensagem do user por user_id, usada para validar tamanho contra LLM drift.
@@ -994,6 +1016,13 @@ RESPONSE_SCHEMA = {
             "type": "array",
             "items": {"type": "integer"},
         },
+        # Contexto de preco dos cards deste turno. "varejo" (default) = card mostra
+        # preco cheio; "atacado_avista"/"atacado_aprazo" = card mostra o preco de
+        # atacado com o varejo como referencia. O modelo seta conforme a conversa.
+        "modo_preco": {
+            "type": "string",
+            "enum": ["varejo", "atacado_avista", "atacado_aprazo"],
+        },
     },
     "required": ["resposta_texto"],
 }
@@ -1144,11 +1173,12 @@ def _formatar_preco(valor):
 def parsear_resposta_json(texto_bruto):
     """
     Tenta parsear como JSON do schema esperado.
-    Retorna (resposta_texto, produtos_recomendados, json_ok).
-    Em caso de falha, retorna (texto_bruto, [], False) e o caller cai no fallback regex.
+    Retorna (resposta_texto, produtos_recomendados, json_ok, modo_preco).
+    modo_preco in {"varejo","atacado_avista","atacado_aprazo"} (default "varejo").
+    Em caso de falha, retorna (texto_bruto, [], False, "varejo") e o caller cai no fallback regex.
     """
     if not texto_bruto:
-        return "", [], False
+        return "", [], False, "varejo"
     texto = texto_bruto.strip()
     # Gemini pode envolver em ```json ... ``` se o response_schema for ignorado.
     if texto.startswith("```"):
@@ -1156,9 +1186,9 @@ def parsear_resposta_json(texto_bruto):
     try:
         obj = json.loads(texto)
     except json.JSONDecodeError:
-        return texto_bruto, [], False
+        return texto_bruto, [], False, "varejo"
     if not isinstance(obj, dict):
-        return texto_bruto, [], False
+        return texto_bruto, [], False, "varejo"
     resposta = obj.get("resposta_texto", "")
     ids = obj.get("produtos_recomendados") or []
     if not isinstance(ids, list):
@@ -1169,18 +1199,68 @@ def parsear_resposta_json(texto_bruto):
             ids_int.append(int(i))
         except (TypeError, ValueError):
             pass
-    return str(resposta), ids_int, True
+    modo_preco = obj.get("modo_preco") or "varejo"
+    if modo_preco not in ("varejo", "atacado_avista", "atacado_aprazo"):
+        modo_preco = "varejo"
+    return str(resposta), ids_int, True, modo_preco
 
 
-def renderizar_mensagem_estruturada(user_id, resposta_texto, ids_recomendados, cache):
+_ATACADO_KEYWORDS = ("atacado", "revend", "por atacado", "no atacado", "pra revenda", "para revenda")
+
+
+def _detectar_atacado(texto):
+    """Sinal deterministico de contexto de atacado no texto do cliente. Conservador
+    (palavras que praticamente nao aparecem em conversa de varejo) p/ minimizar
+    falso-positivo. So decide EXIBICAO de card — nunca o total (que vem do calcular_total)."""
+    t = (texto or "").lower()
+    return any(k in t for k in _ATACADO_KEYWORDS)
+
+
+def _modo_preco_efetivo(user_id, modo_preco_modelo, texto_cliente):
+    """Combina o modo_preco do modelo com o contexto de atacado detectado/lembrado.
+    - Se o modelo marcou atacado, respeita (e memoriza o user como atacado).
+    - Se detectou atacado no texto do cliente, memoriza.
+    - Se o user esta em contexto de atacado mas o modelo deixou 'varejo', promove
+      p/ 'atacado_avista' (default seguro; o modelo pode especificar aprazo)."""
+    if modo_preco_modelo in ("atacado_avista", "atacado_aprazo"):
+        _atacado_users.add(user_id)
+        return modo_preco_modelo
+    if _detectar_atacado(texto_cliente):
+        _atacado_users.add(user_id)
+    if user_id in _atacado_users:
+        return "atacado_avista"
+    return "varejo"
+
+
+def _legenda_card(pid, info, modo_preco="varejo", cfg_atacado=None):
+    """Monta a legenda do card. Em modo atacado mostra o preco de atacado
+    (varejo * (1-desconto)) em destaque e o varejo como referencia; em varejo,
+    mantem o formato `*Nome* - R$ Valor`. O `_cód: id_` e sempre preservado."""
+    nome = info.get("nome") or f"Produto {pid}"
+    preco = info.get("preco")
+    if modo_preco in ("atacado_avista", "atacado_aprazo") and isinstance(preco, (int, float)):
+        cfg = cfg_atacado or _ler_config_atacado()
+        desc = cfg["desconto_avista"] if modo_preco == "atacado_avista" else cfg["desconto_aprazo"]
+        rotulo = "à vista" if modo_preco == "atacado_avista" else "parcelado"
+        atacado_unit = round(float(preco) * (1 - desc), 2)
+        return (f"*{nome}*\n💵 Atacado {rotulo}: {_formatar_preco(atacado_unit)}/un\n"
+                f"(de {_formatar_preco(preco)} no varejo)\n_cód: {int(pid)}_")
+    return f"*{nome}* - {_formatar_preco(preco)}\n_cód: {int(pid)}_"
+
+
+def renderizar_mensagem_estruturada(user_id, resposta_texto, ids_recomendados, cache, modo_preco="varejo"):
     """
     Caminho determinístico: envia resposta_texto seguido de cards
     `*Nome* - R$ Valor` + imagem por id, usando dados canônicos do cache.
+    Em modo atacado (modo_preco), o card mostra o preco de atacado + varejo de referencia.
     Ids fora do cache do turno atual são ignorados (e logados).
+    Em provider "cloud", captura o wamid de cada card e persiste wamid->id_produto
+    (card_envios) p/ o reply-to-card (a Cloud API so devolve context.id, nao a legenda).
     """
     if resposta_texto and resposta_texto.strip():
         enviar_mensagem_whatsapp(user_id, resposta_texto.strip())
 
+    cfg_atacado = _ler_config_atacado() if modo_preco in ("atacado_avista", "atacado_aprazo") else None
     enviados = 0
     ignorados = []
     for pid in ids_recomendados[:5]:  # hard cap
@@ -1188,16 +1268,16 @@ def renderizar_mensagem_estruturada(user_id, resposta_texto, ids_recomendados, c
         if not info:
             ignorados.append(pid)
             continue
-        nome = info.get("nome") or f"Produto {pid}"
-        preco_str = _formatar_preco(info.get("preco"))
-        legenda = f"*{nome}* - {preco_str}\n_cód: {int(pid)}_"
+        legenda = _legenda_card(pid, info, modo_preco, cfg_atacado)
         url = info.get("imagem")
         if url:
             time.sleep(1.0)
-            enviar_midia_whatsapp(user_id, url, legenda)
+            wamid = enviar_midia_whatsapp(user_id, url, legenda)
         else:
             time.sleep(0.5)
-            enviar_mensagem_whatsapp(user_id, legenda)
+            wamid = enviar_mensagem_whatsapp(user_id, legenda)
+        if WHATSAPP_PROVIDER == "cloud" and isinstance(wamid, str):
+            registrar_card_enviado(wamid, user_id, int(pid), legenda)
         enviados += 1
     if ignorados:
         print(f"⚠️ ids fora do cache do turn: {ignorados}")
@@ -1323,12 +1403,13 @@ def process_and_respond(user_id):
             pass
 
         # Caminho preferencial: JSON estruturado
-        resposta_limpa, ids_recomendados, json_ok = parsear_resposta_json(resposta_texto)
+        resposta_limpa, ids_recomendados, json_ok, modo_preco = parsear_resposta_json(resposta_texto)
 
         fallback_usado = False
         if json_ok:
-            print(f"✅ JSON parse ok | ids={ids_recomendados} | cache_size={len(cache_produtos)}")
-            renderizar_mensagem_estruturada(user_id, resposta_limpa, ids_recomendados, cache_produtos)
+            modo_efetivo = _modo_preco_efetivo(user_id, modo_preco, texto_completo)
+            print(f"✅ JSON parse ok | ids={ids_recomendados} | modo_preco={modo_preco}->{modo_efetivo} | cache_size={len(cache_produtos)}")
+            renderizar_mensagem_estruturada(user_id, resposta_limpa, ids_recomendados, cache_produtos, modo_efetivo)
         else:
             fallback_usado = True
             print(f"⚠️ JSON parse falhou (json_mode={json_mode_enabled}); fallback regex.")
@@ -1381,8 +1462,34 @@ def process_and_respond(user_id):
     with user_lock:
         message_buffers.pop(user_id, None)
 
+def _cloud_send(payload):
+    """POST na WhatsApp Cloud API (Graph). Retorna o wamid (str) ou None. Levanta em erro HTTP."""
+    if not _GRAPH_MSG_URL or not WHATSAPP_TOKEN:
+        print("[cloud] WHATSAPP_PHONE_NUMBER_ID/WHATSAPP_TOKEN ausentes; envio ignorado.")
+        return None
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    resp = requests.post(_GRAPH_MSG_URL, json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    try:
+        return (resp.json().get("messages") or [{}])[0].get("id")
+    except Exception:
+        return None
+
+
 def enviar_midia_whatsapp(numero, url_midia, legenda):
-    """Envia mídia (imagem/pdf) via UazAPI."""
+    """Envia imagem com legenda. Retorna wamid (cloud) ou None. Backend por WHATSAPP_PROVIDER."""
+    if WHATSAPP_PROVIDER == "cloud":
+        try:
+            print(f"📸 [cloud] Enviando mídia para {numero}: {url_midia}")
+            return _cloud_send({
+                "messaging_product": "whatsapp", "to": numero, "type": "image",
+                "image": {"link": url_midia, "caption": legenda},
+            })
+        except Exception as e:
+            print(f"Erro Cloud API (mídia): {e}")
+            return None
+
+    # --- UAZAPI (default) ---
     # Deriva a URL de mídia baseada na URL de texto configurada no ENV
     # Ex: .../send/text -> .../send/media
     if UAZAPI_URL and "send/text" in UAZAPI_URL:
@@ -1390,35 +1497,44 @@ def enviar_midia_whatsapp(numero, url_midia, legenda):
     else:
         # Fallback ou se a URL for diferente
         url = "https://vennx.uazapi.com/send/media"
-    
-    headers = {
-        "token": UAZAPI_TOKEN, 
-        "Content-Type": "application/json"
-    }
-    
+
+    headers = {"token": UAZAPI_TOKEN, "Content-Type": "application/json"}
     payload = {
         "number": numero,
-        "type": "image", # Assumindo imagem por enquanto
+        "type": "image",  # Assumindo imagem por enquanto
         "file": url_midia,
         "docName": "foto_produto.jpg",
-        "text": legenda # Legenda vai no campo text conforme documentação
+        "text": legenda,  # Legenda vai no campo text conforme documentação
     }
-    
     try:
         print(f"📸 Enviando Mídia para {numero}: {url_midia}")
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
         print(f"Status Mídia: {response.status_code} | {response.text}")
     except Exception as e:
         print(f"Erro de conexão Uazapi Media: {e}")
+    return None
+
 
 def enviar_mensagem_whatsapp(numero, texto):
-    # Se o texto contém tags de imagem, não deveria usar essa função, mas vamos manter como fallback
+    """Envia mensagem de texto. Retorna wamid (cloud) ou None. Backend por WHATSAPP_PROVIDER."""
+    if WHATSAPP_PROVIDER == "cloud":
+        try:
+            return _cloud_send({
+                "messaging_product": "whatsapp", "to": numero, "type": "text",
+                "text": {"body": texto, "preview_url": False},
+            })
+        except Exception as e:
+            print(f"Erro Cloud API (texto): {e}")
+            return None
+
+    # --- UAZAPI (default) ---
     headers = {"token": UAZAPI_TOKEN, "Content-Type": "application/json"}
     payload = {"number": numero, "text": texto}
     try:
-        requests.post(UAZAPI_URL, json=payload, headers=headers)
+        requests.post(UAZAPI_URL, json=payload, headers=headers, timeout=30)
     except Exception as e:
         print(f"Erro de conexão Uazapi: {e}")
+    return None
 
 def _extract_message_text(msg_data):
     """Extrai texto do payload do webhook, com fallback para mensagens citadas (botão Responder).
@@ -1538,9 +1654,154 @@ def _extract_quoted_content(msg_data):
     return None
 
 
+# ================= TRANSPORTE CLOUD API — HELPERS =================
+# Dedup de wamid recebido (Meta reentrega quando nao recebe 200 rapido). Best-effort
+# por-processo — em multiplas replicas, migrar p/ store compartilhado (MIGRATION_CLOUD_API.md).
+_cloud_seen_wamids = collections.deque()
+_cloud_seen_set = set()
+_CLOUD_DEDUP_MAX = 3000
+
+
+def _cloud_ja_processado(wamid):
+    if not wamid:
+        return False
+    if wamid in _cloud_seen_set:
+        return True
+    _cloud_seen_set.add(wamid)
+    _cloud_seen_wamids.append(wamid)
+    while len(_cloud_seen_wamids) > _CLOUD_DEDUP_MAX:
+        _cloud_seen_set.discard(_cloud_seen_wamids.popleft())
+    return False
+
+
+def _canonical_user_id(num):
+    """Chave estavel de conversa. Trata o 9o digito de celular BR: a Cloud API pode
+    entregar 55+DDD+8digitos (sem o 9); reinsere o 9 quando o local comeca com 6-9
+    (prefixos de celular), preservando compatibilidade com o historico gravado no
+    formato da UAZAPI. Landline (comeca com 2-5) fica intacto."""
+    d = re.sub(r"\D", "", str(num or ""))
+    if d.startswith("55") and len(d) == 12 and d[4] in "6789":
+        d = d[:4] + "9" + d[4:]
+    return d
+
+
+def registrar_card_enviado(wamid, user_id, id_produto, legenda=None):
+    """Persiste wamid->id_produto (tabela card_envios) p/ o reply-to-card no cloud.
+    Degrada em silencio se a tabela nao existir (DDL em MIGRATION_CLOUD_API.md)."""
+    try:
+        supabase.table("card_envios").insert({
+            "wamid": wamid,
+            "user_id": user_id,
+            "id_produto": int(id_produto),
+            "legenda": legenda,
+        }).execute()
+    except Exception as e:
+        print(f"[card_envios] falha ao registrar {wamid}: {e}")
+
+
+def _lookup_card(wamid):
+    """id_produto do card cujo wamid o cliente citou (context.id), ou None."""
+    if not wamid:
+        return None
+    try:
+        r = (supabase.table("card_envios").select("id_produto")
+             .eq("wamid", wamid).limit(1).execute())
+        rows = r.data or []
+        return int(rows[0]["id_produto"]) if rows else None
+    except Exception as e:
+        print(f"[card_envios] lookup {wamid}: {e}")
+        return None
+
+
+def _enqueue_user_message(user_id, raw_text):
+    """Rate-limit + buffer/debounce (10s) + agenda process_and_respond.
+    Compartilhado pelos dois providers (UAZAPI e Cloud). Retorna False se rate-limited."""
+    if not _check_rate_limit(user_id):
+        print(f"[RATE_LIMIT] user={user_id} excedeu {RATE_LIMIT_MAX_MSGS} msgs/{RATE_LIMIT_WINDOW_SEC}s — descartando")
+        return False
+    user_lock = _get_user_lock(user_id)
+    with user_lock:
+        if user_id not in message_buffers:
+            message_buffers[user_id] = {"text": raw_text, "timer": None}
+        else:
+            message_buffers[user_id]["text"] += f" {raw_text}"
+            existing_timer = message_buffers[user_id].get("timer")
+            if existing_timer:
+                existing_timer.cancel()
+        t = threading.Timer(10.0, process_and_respond, args=[user_id])
+        message_buffers[user_id]["timer"] = t
+        t.start()
+    return True
+
+
+def _ingest_cloud_message(msg, value):
+    """Parseia UMA mensagem do webhook da Cloud API e enfileira p/ processamento."""
+    wamid = msg.get("id")
+    if _cloud_ja_processado(wamid):
+        return
+    numero = _canonical_user_id(msg.get("from") or "")
+    if not numero:
+        return
+    tipo = msg.get("type")
+    if tipo == "text":
+        raw_text = (msg.get("text") or {}).get("body", "")
+    elif tipo == "interactive":
+        inter = msg.get("interactive") or {}
+        br = inter.get("button_reply") or inter.get("list_reply") or {}
+        raw_text = br.get("title") or br.get("id") or ""
+    elif tipo == "button":
+        raw_text = (msg.get("button") or {}).get("text", "")
+    else:
+        raw_text = ""  # midia/localizacao/etc — sem texto util por enquanto
+    if not raw_text:
+        print(f"[cloud] mensagem sem texto util | type={tipo} | from={numero}")
+        return
+
+    # reply-to-card: a Cloud API so devolve o wamid citado (context.id), nao a legenda.
+    ctx_id = (msg.get("context") or {}).get("id")
+    if ctx_id:
+        pid = _lookup_card(ctx_id)
+        if pid:
+            raw_text = (f"[o cliente respondeu ao card do produto id_produto={pid}. "
+                        f"Use EXATAMENTE id_produto={pid} para este item em calcular_total / "
+                        f"produtos_recomendados / resumo; nao re-derive o id pelo nome.] {raw_text}")
+
+    _enqueue_user_message(numero, raw_text)
+
+
+@app.route('/webhook', methods=['GET'])
+def webhook_verify():
+    """Handshake de verificacao do webhook da Cloud API (Meta faz um GET nesta URL)."""
+    if (WHATSAPP_VERIFY_TOKEN
+            and request.args.get("hub.mode") == "subscribe"
+            and request.args.get("hub.verify_token") == WHATSAPP_VERIFY_TOKEN):
+        return request.args.get("hub.challenge", ""), 200
+    return "forbidden", 403
+
+
 @app.route('/webhook', methods=['POST'])
 @app.route('/webhook/<evento>/<tipo>', methods=['POST'])
 def webhook(evento=None, tipo=None):
+    # --- WhatsApp Cloud API (oficial) ---
+    if WHATSAPP_PROVIDER == "cloud":
+        raw = request.get_data()
+        if WHATSAPP_APP_SECRET:
+            sig = request.headers.get("X-Hub-Signature-256", "")
+            expected = "sha256=" + hmac.new(WHATSAPP_APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(sig, expected):
+                print("[cloud] assinatura X-Hub-Signature-256 invalida — descartando")
+                return jsonify({"status": "bad_signature"}), 403
+        data = request.get_json(silent=True) or {}
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                if change.get("field") != "messages":
+                    continue  # ignora template/quality/account updates
+                value = change.get("value", {})
+                for m in value.get("messages", []):  # ignora value["statuses"] (recibos)
+                    _ingest_cloud_message(m, value)
+        return jsonify({"status": "ok"}), 200
+
+    # --- UAZAPI (default) ---
     data = request.json
     msg_data = data.get('message', {})
     if msg_data.get('fromMe'): return jsonify({"status": "ignored"}), 200
@@ -1578,26 +1839,8 @@ def webhook(evento=None, tipo=None):
 
     user_id = chat_id.split('@')[0]
 
-    # Rate limit por user_id (ANTES de qualquer trabalho pesado)
-    if not _check_rate_limit(user_id):
-        print(f"[RATE_LIMIT] user={user_id} excedeu {RATE_LIMIT_MAX_MSGS} msgs/{RATE_LIMIT_WINDOW_SEC}s — descartando")
+    if not _enqueue_user_message(user_id, raw_text):
         return jsonify({"status": "rate_limited"}), 200
-
-    # Lock por user_id evita race em escrita concorrente do buffer
-    user_lock = _get_user_lock(user_id)
-    with user_lock:
-        if user_id not in message_buffers:
-            message_buffers[user_id] = {"text": raw_text, "timer": None}
-        else:
-            message_buffers[user_id]["text"] += f" {raw_text}"
-            existing_timer = message_buffers[user_id].get("timer")
-            if existing_timer:
-                existing_timer.cancel()
-
-        t = threading.Timer(10.0, process_and_respond, args=[user_id])
-        message_buffers[user_id]["timer"] = t
-        t.start()
-
     return jsonify({"status": "buffering"}), 200
 
 # ============================================================
