@@ -1303,6 +1303,20 @@ def renderizar_mensagem_regex_fallback(user_id, texto):
 
 # ================= LÓGICA DA CONVERSA & WEBHOOK =================
 
+# Erros transitorios do Gemini (504/503/500/429) — valem retry; safety/blocked nao.
+_IA_ERR_TRANSITORIO = (
+    "deadline", "504", "503", "500", "unavailable", "resource exhausted",
+    "resourceexhausted", "429", "internal error", "temporarily", "try again",
+)
+
+
+def _erro_ia_transitorio(e):
+    """True se o erro do Gemini for transitorio (vale retry), False se for permanente
+    (safety/blocked/quota de projeto etc — retry so piora)."""
+    s = f"{type(e).__name__} {e}".lower()
+    return any(k in s for k in _IA_ERR_TRANSITORIO)
+
+
 def process_and_respond(user_id):
     global _consultar_estoque_active_user_id
     buffer = message_buffers.get(user_id)
@@ -1377,9 +1391,25 @@ def process_and_respond(user_id):
             json_mode_enabled = False
 
         history = get_history(user_id)
-        chat = model.start_chat(history=history, enable_automatic_function_calling=True)
         t_inicio = time.perf_counter()
-        response = chat.send_message(texto_completo, request_options={"timeout": 60})
+        # Gemini as vezes trava/estoura o deadline (504), sobretudo em turns com cadeia
+        # de tools (ex.: resposta-a-card -> consultar_estoque + calcular_total). Sem retry
+        # o cliente caia no fallback "reenvie" e a Luna parecia muda. Retry com o chat
+        # reconstruido a cada tentativa (history vem do banco e e estavel).
+        response = None
+        _MAX_TENTATIVAS_IA = 3
+        for _tentativa in range(1, _MAX_TENTATIVAS_IA + 1):
+            chat = model.start_chat(history=history, enable_automatic_function_calling=True)
+            try:
+                response = chat.send_message(texto_completo, request_options={"timeout": 45})
+                break
+            except Exception as e_ia:
+                if _tentativa < _MAX_TENTATIVAS_IA and _erro_ia_transitorio(e_ia):
+                    print(f"⚠️ IA transitorio (tentativa {_tentativa}/{_MAX_TENTATIVAS_IA}): "
+                          f"{type(e_ia).__name__}: {str(e_ia)[:120]} — retry")
+                    time.sleep(2 * _tentativa)
+                    continue
+                raise
         latencia_ms = int((time.perf_counter() - t_inicio) * 1000)
         resposta_texto = response.text
         print(f"DEBUG OUTPUT ({latencia_ms}ms): '{resposta_texto[:200]}'")
