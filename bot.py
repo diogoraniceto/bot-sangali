@@ -1476,6 +1476,92 @@ def _cloud_send(payload):
         return None
 
 
+# ---- Midia RECEBIDA do cliente (audio/imagem): download + Gemini (multimodal) ----
+_CLOUD_MEDIA_MAX_BYTES = 16 * 1024 * 1024   # teto de midia da Cloud API
+MODEL_MULTIMODAL = "gemini-3-flash-preview"  # mesmo modelo do pipeline de venda
+
+
+def _cloud_baixar_midia(media_id):
+    """media_id -> (bytes, mime) ou (None, None) em qualquer falha. DOIS GETs, ambos
+    com Authorization: Bearer WHATSAPP_TOKEN:
+      1) GET graph.facebook.com/{GRAPH_VERSION}/{media_id} -> {url, mime_type, file_size}
+      2) GET nessa url (lookaside.fbsbx.com, efemera ~5min) -> bytes."""
+    if not media_id or not WHATSAPP_TOKEN:
+        print("[cloud] baixar_midia: media_id/WHATSAPP_TOKEN ausentes")
+        return None, None
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    try:
+        meta_url = f"https://graph.facebook.com/{GRAPH_VERSION}/{media_id}"
+        r1 = requests.get(meta_url, headers=headers, timeout=15)
+        r1.raise_for_status()
+        meta = r1.json() or {}
+        media_url = meta.get("url")
+        mime = (meta.get("mime_type") or "").split(";")[0].strip()  # tira "; codecs=opus"
+        if not media_url:
+            print(f"[cloud] baixar_midia: sem url no lookup | id={media_id}")
+            return None, None
+        declared = int(meta.get("file_size") or 0)
+        if declared and declared > _CLOUD_MEDIA_MAX_BYTES:
+            print(f"[cloud] baixar_midia: file_size {declared} > max | id={media_id}")
+            return None, None
+        r2 = requests.get(media_url, headers={**headers, "User-Agent": "curl/8"},
+                          timeout=30, stream=True)
+        r2.raise_for_status()
+        buf = bytearray()
+        for chunk in r2.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) > _CLOUD_MEDIA_MAX_BYTES:
+                print(f"[cloud] baixar_midia: excedeu cap | id={media_id}")
+                return None, None
+        return (bytes(buf), (mime or None)) if buf else (None, None)
+    except Exception as e:
+        print(f"[cloud] baixar_midia falhou | id={media_id}: {e}")
+        return None, None
+
+
+def transcrever_audio(audio_bytes, mime):
+    """Transcreve audio recebido do cliente (inline, sem File API). str ou None."""
+    if not audio_bytes:
+        return None
+    try:
+        model = genai.GenerativeModel(MODEL_MULTIMODAL, safety_settings=SAFETY_SETTINGS)
+        prompt = ("Transcreva o audio a seguir em portugues do Brasil. Responda APENAS com "
+                  "a transcricao literal do que foi dito, sem comentarios, sem aspas, sem rotulos.")
+        resp = model.generate_content(
+            [prompt, {"mime_type": mime or "audio/ogg", "data": audio_bytes}],
+            request_options={"timeout": 45},
+        )
+        return ((getattr(resp, "text", "") or "").strip()) or None
+    except Exception as e:
+        print(f"[gemini] transcrever_audio falhou: {e}")
+        return None
+
+
+def descrever_imagem(img_bytes, mime, caption=None):
+    """Descreve imagem recebida do cliente (peca) p/ busca no catalogo. str ou None."""
+    if not img_bytes:
+        return None
+    try:
+        model = genai.GenerativeModel(MODEL_MULTIMODAL, safety_settings=SAFETY_SETTINGS)
+        prompt = ("Voce ajuda uma loja de lingerie. Descreva de forma objetiva e curta a peca na "
+                  "imagem para busca no catalogo: tipo (sutia/calcinha/conjunto/camisola etc), cor, "
+                  "estampa e detalhes (renda, boju, fio), e QUALQUER codigo/numero/texto visivel na "
+                  "foto ou etiqueta. Se nao for uma peca de lingerie, diga o que aparenta ser em 1 "
+                  "frase. Nao invente codigo.")
+        if caption:
+            prompt += f' Legenda enviada pelo cliente: "{caption}".'
+        resp = model.generate_content(
+            [prompt, {"mime_type": mime or "image/jpeg", "data": img_bytes}],
+            request_options={"timeout": 45},
+        )
+        return ((getattr(resp, "text", "") or "").strip()) or None
+    except Exception as e:
+        print(f"[gemini] descrever_imagem falhou: {e}")
+        return None
+
+
 def enviar_midia_whatsapp(numero, url_midia, legenda):
     """Envia imagem com legenda. Retorna wamid (cloud) ou None. Backend por WHATSAPP_PROVIDER."""
     if WHATSAPP_PROVIDER == "cloud":
@@ -1734,6 +1820,37 @@ def _enqueue_user_message(user_id, raw_text):
     return True
 
 
+def _processar_midia_async(numero, tipo, media_id, caption, ctx_id):
+    """Baixa a midia recebida, transcreve (audio) ou descreve (imagem) via Gemini e injeta
+    como texto no pipeline (mesmo molde do reply-to-card). Roda em THREAD para o webhook
+    responder 200 rapido (evita reentrega da Meta). Falha -> pede texto ao cliente."""
+    try:
+        b, mime = _cloud_baixar_midia(media_id)
+        if tipo == "audio":
+            txt = transcrever_audio(b, mime) if b else None
+            if not txt:
+                enviar_mensagem_whatsapp(numero, "Não consegui ouvir seu áudio 😅 me escreve o que você precisa?")
+                return
+            raw_text = f"[transcrição de áudio do cliente:] {txt}"
+        else:  # image
+            desc = descrever_imagem(b, mime, caption) if b else None
+            if not desc:
+                enviar_mensagem_whatsapp(numero, "Recebi sua foto mas não consegui abrir 😅 me manda o código da peça ou descreve pra mim?")
+                return
+            raw_text = f"[o cliente enviou uma foto que parece: {desc}]"
+            if caption:
+                raw_text += f' Legenda do cliente: "{caption}"'
+        if ctx_id:  # reply-to-card: cliente respondeu um card com audio/foto
+            pid = _lookup_card(ctx_id)
+            if pid:
+                raw_text = (f"[o cliente respondeu ao card do produto id_produto={pid}. "
+                            f"Use EXATAMENTE id_produto={pid} para este item em calcular_total / "
+                            f"produtos_recomendados / resumo; nao re-derive o id pelo nome.] {raw_text}")
+        _enqueue_user_message(numero, raw_text)
+    except Exception as e:
+        print(f"[cloud] _processar_midia_async falhou | type={tipo} from={numero}: {e}")
+
+
 def _ingest_cloud_message(msg, value):
     """Parseia UMA mensagem do webhook da Cloud API e enfileira p/ processamento."""
     wamid = msg.get("id")
@@ -1743,6 +1860,17 @@ def _ingest_cloud_message(msg, value):
     if not numero:
         return
     tipo = msg.get("type")
+    if tipo in ("audio", "image"):
+        # midia: baixa + Gemini + injeta em THREAD; webhook responde 200 na hora
+        media = msg.get(tipo) or {}
+        caption = (media.get("caption") or "").strip() if tipo == "image" else None
+        ctx_id = (msg.get("context") or {}).get("id")
+        threading.Thread(
+            target=_processar_midia_async,
+            args=(numero, tipo, media.get("id"), caption, ctx_id),
+            daemon=True,
+        ).start()
+        return
     if tipo == "text":
         raw_text = (msg.get("text") or {}).get("body", "")
     elif tipo == "interactive":
