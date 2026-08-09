@@ -502,6 +502,17 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         id_loja: id da loja a filtrar (string). Use o id_loja informado nas instruções
                  do prompt para restringir a busca a uma filial específica.
                  Use None para buscar em todas as lojas.
+
+    Returns:
+        dict com `status` ("sucesso" | "vazio" | "erro") e `filtro_aplicado`.
+        `filtro_aplicado` é a VERDADE sobre o que foi consultado — vale acima do que
+        você lembra de ter pedido. Se `filtro_aplicado.tamanho` for diferente do
+        tamanho que você passou, a busca foi feita no valor de `filtro_aplicado`.
+        Nunca afirme nada sobre um tamanho que não esteja em `filtro_aplicado`.
+        Em "sucesso" vem `produtos` (lista). Cada item traz seu próprio `tamanho`,
+        que pode ser COMPOSTO ('P/M', 'G/GG') ou acentuado ('ÚNICO') e ainda assim
+        atender ao tamanho pedido — leia o campo do item; não diga que a peça é do
+        tamanho X. Pode vir também `aviso`: instrução interna, nunca repita ao cliente.
     """
     print(f"\n[SEMÂNTICO] Buscando: '{termo_cliente}' | Tamanho recebido: {tamanho} | Loja: {id_loja}")
 
@@ -634,8 +645,37 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     if dropados:
         print(f"[TAMANHO] descartados por tamanho: {dropados}")
 
+    # 3.1. O retorno DECLARA o filtro aplicado. O modelo tratava a própria memória do
+    # que pediu como verdade; agora a verdade vem no payload. `aviso` só existe quando
+    # o guard corrigiu — nunca mandar chave None ao Gemini.
+    filtro_aplicado = {
+        "tamanho": tamanho_alvo,
+        "tamanho_tokens": sorted(tokens_alvo),
+        "id_loja": id_loja_alvo,
+        "observacao_tamanho": (
+            "Cada item traz seu proprio campo 'tamanho'. Ele pode ser COMPOSTO "
+            "('P/M','G/GG') ou acentuado ('UNICO'/'ÚNICO') e ainda assim atender o "
+            "tamanho pedido. Nunca afirme que um item e do tamanho X: leia o campo "
+            "'tamanho' do item."),
+    }
+    # O texto NAO manda re-chamar a tool com outro tamanho: o guard lê a mensagem do
+    # cliente, que não muda dentro do turno, então a re-chamada seria corrigida de novo
+    # e o modelo entraria em loop. E não afirma "todos são do tamanho X", que seria
+    # falso depois do overlap — justamente a mentira que este campo existe para matar.
+    aviso = (f"INSTRUCAO INTERNA (nao repita ao cliente): a ferramenta foi chamada com "
+             f"tamanho '{tamanho_llm}', mas nesta mensagem o cliente escreveu "
+             f"{tokens_user_log}. A busca foi executada LITERALMENTE em '{tamanho_alvo}'. "
+             f"Nao afirme nada sobre '{tamanho_llm}'. A ferramenta so aceita o tamanho que "
+             f"o cliente escreveu nesta mensagem — se precisar de outro tamanho, PERGUNTE "
+             f"ao cliente.")
+
     if not validados:
-        return {"status": "vazio", "msg": f"Não encontrei nada disponível no tamanho {tamanho_alvo}."}
+        return {"status": "vazio", "filtro_aplicado": filtro_aplicado,
+                **({"aviso": aviso} if guard_acionou else {}),
+                "msg": (f"Nenhum produto com estoque para o termo buscado no tamanho "
+                        f"{tamanho_alvo} na loja {id_loja_alvo}. O filtro foi aplicado "
+                        f"literalmente; nao conclua nada sobre outro tamanho sem chamar "
+                        f"a ferramenta de novo.")}
 
     # 4. Top-K final preservando ordem do boost (set destruía ordenação)
     vistos = set()
@@ -652,7 +692,9 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         p['tem_foto'] = bool(p.get('imagem'))
 
     print(f"[SEMÂNTICO] Retornando {len(selecao)} itens.")
-    return {"status": "sucesso", "produtos": selecao}
+    return {"status": "sucesso", "filtro_aplicado": filtro_aplicado,
+            **({"aviso": aviso} if guard_acionou else {}),
+            "produtos": selecao}
 
 # ================= FERRAMENTAS DE CONSULTA DETERMINÍSTICA =================
 
@@ -1349,8 +1391,12 @@ def serializar_tool_calls(chat_history):
             if fr and getattr(fr, 'name', None):
                 resp = _coerce_to_dict(getattr(fr, 'response', None)) or {}
                 resp_str = json.dumps(resp, ensure_ascii=False, default=str)
-                if len(resp_str) > 2000:
-                    resp_str = resp_str[:2000] + "...(truncated)"
+                # 4000, nao 2000: `filtro_aplicado` + `aviso` entram ANTES de `produtos`
+                # e comiam o orcamento do digest de que o harness depende para extrair
+                # id_produto (run_eval.py:_prod_ids_from_responses). E log em bot_turns,
+                # nao contexto do Gemini: o custo e armazenamento.
+                if len(resp_str) > 4000:
+                    resp_str = resp_str[:4000] + "...(truncated)"
                 chamadas.append({
                     "kind": "response",
                     "name": fr.name,

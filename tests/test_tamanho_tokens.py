@@ -156,6 +156,106 @@ ok(bot._tokens_tamanho("/") == [] and overlap("/", "G"),
    "C4 alvo que normaliza para 0 tokens nao filtra nada (espelha cardinality=0 da RPC)")
 
 
+print("\n### E. consultar_estoque_supabase de verdade (RPC stubbada, zero rede)")
+
+CANDIDATOS = [
+    {"id_produto": "1", "id_unico": "u1", "nome": "BOXER SEM COSTURA MEN", "tamanho": "P/M",
+     "preco": 12.0, "estoque": 5, "nome_grupo": "CUECA"},
+    {"id_produto": "2", "id_unico": "u2", "nome": "CALCINHA BX SEM COSTURA", "tamanho": "M",
+     "preco": 22.0, "estoque": 3, "nome_grupo": "CALCINHA"},
+    {"id_produto": "3", "id_unico": "u3", "nome": "ALGEMA RENDADA", "tamanho": UNICO_ACENTO,
+     "preco": 35.0, "estoque": 2, "nome_grupo": "SEXSHOP"},
+    {"id_produto": "4", "id_unico": "u4", "nome": "CAMISOLA URDA", "tamanho": "GG",
+     "preco": 49.9, "estoque": 9, "nome_grupo": "CAMISOLA"},
+]
+
+
+class _FakeQuery:
+    """produtos_imagens: devolve zero imagens (o teste nao depende de foto)."""
+    def select(self, *a, **k): return self
+    def in_(self, *a, **k): return self
+    def eq(self, *a, **k): return self
+    def limit(self, *a, **k): return self
+    def order(self, *a, **k): return self
+    def execute(self): return type("R", (), {"data": []})()
+
+
+class _FakeSupabase:
+    def __init__(self, rows): self.rows = rows; self.ultimos_params = None
+    def rpc(self, nome, params):
+        self.ultimos_params = params
+        rows = self.rows
+        return type("R", (), {"execute": lambda _s=None, _r=rows: type("X", (), {"data": [dict(r) for r in _r]})()})()
+    def table(self, *a, **k): return _FakeQuery()
+
+
+_emb_real, _sb_real = bot.get_embedding, bot.supabase
+bot.get_embedding = lambda t: [0.0] * 768
+try:
+    # E1 — sucesso: filtro_aplicado declarado, sem aviso, overlap liberando 'P/M'
+    bot.supabase = _FakeSupabase(CANDIDATOS)
+    bot._set_turn_ctx("u_test", "tem boxer sem costura no M?")
+    r = bot.consultar_estoque_supabase("boxer sem costura", "M", "220540")
+    fa = r.get("filtro_aplicado") or {}
+    ok(r.get("status") == "sucesso", "E1 status sucesso", r.get("status"))
+    ok(fa.get("tamanho") == "M" and fa.get("tamanho_tokens") == ["M"]
+       and fa.get("id_loja") == "220540", "E1 filtro_aplicado declara tamanho/tokens/loja", fa)
+    ok("observacao_tamanho" in fa and "COMPOSTO" in fa["observacao_tamanho"],
+       "E1 filtro_aplicado carrega a observacao sobre tamanho composto")
+    ok("aviso" not in r, "E1 sem aviso quando o guard nao corrigiu", list(r))
+    tams = sorted(p["tamanho"] for p in r["produtos"])
+    ok(tams == ["M", "P/M"], "E1 overlap liberou 'P/M' e nao vazou GG/UNICO", tams)
+    ok(bot._tokens_tamanho(r["produtos"][0]["tamanho"]), "E1 item mantem o campo tamanho")
+    ok(set(r["produtos"][0]) >= {"id_produto", "id_unico", "nome", "tamanho", "preco", "tem_foto"},
+       "E1 shape do item de produtos preservado", sorted(r["produtos"][0]))
+
+    # E2 — guard corrigiu: aviso presente, citando a fala do cliente
+    bot._set_turn_ctx("u_test", "tem no M?")
+    r2 = bot.consultar_estoque_supabase("boxer", "GG", "220540")
+    ok(r2["filtro_aplicado"]["tamanho"] == "M", "E2 busca executada em M (o que o cliente disse)",
+       r2["filtro_aplicado"])
+    ok("aviso" in r2 and "'GG'" in r2["aviso"] and "['M']" in r2["aviso"],
+       "E2 aviso cita o tamanho do LLM e a fala do cliente", r2.get("aviso"))
+    ok("PERGUNTE" in r2["aviso"] and "chame a ferramenta de novo" not in r2["aviso"],
+       "E2 aviso nao manda re-chamar a tool (evita loop)", r2.get("aviso"))
+    ok("todos os produtos" not in r2["aviso"].lower(),
+       "E2 aviso nao afirma que todos sao do tamanho X")
+
+    # E3 — o BUG: preco do card nao vira tamanho nem no caminho completo da tool
+    bot._set_turn_ctx("u_test", PREAMBULO + LEGENDA_VAREJO + "tem?")
+    r3 = bot.consultar_estoque_supabase("camisola de urda", "GG", "220540")
+    ok(r3["filtro_aplicado"]["tamanho"] == "GG",
+       "E3 busca em GG (nao em '49', a parte inteira do preco da legenda)",
+       r3["filtro_aplicado"])
+    ok("aviso" not in r3, "E3 sem aviso: o guard nao teve o que corrigir", list(r3))
+    ok([p["tamanho"] for p in r3["produtos"]] == ["GG"], "E3 devolve a grade certa",
+       [p["tamanho"] for p in r3["produtos"]])
+
+    # E4 — vazio simetrico
+    bot._set_turn_ctx("u_test", "tem no 42?")
+    r4 = bot.consultar_estoque_supabase("camisola", "42", "220540")
+    ok(r4["status"] == "vazio" and "filtro_aplicado" in r4,
+       "E4 caminho vazio tambem declara filtro_aplicado", list(r4))
+    ok("42" in r4["msg"] and "220540" in r4["msg"],
+       "E4 msg do vazio cita tamanho e loja aplicados", r4["msg"])
+
+    # E5 — sem tamanho: nada e filtrado e filtro_aplicado diz isso
+    bot._set_turn_ctx("u_test", "me mostra algemas")
+    r5 = bot.consultar_estoque_supabase("algema", None, None)
+    ok(r5["filtro_aplicado"]["tamanho"] is None
+       and r5["filtro_aplicado"]["tamanho_tokens"] == []
+       and len(r5["produtos"]) == 4, "E5 sem tamanho nada e filtrado", r5["filtro_aplicado"])
+
+    # E6 — erro de embedding continua curto (nao inventa filtro que nao foi aplicado)
+    bot.get_embedding = lambda t: None
+    r6 = bot.consultar_estoque_supabase("algema", "M", "220540")
+    ok(r6 == {"status": "erro", "msg": "Falha na geração do vetor de busca."},
+       "E6 erro de embedding preserva o contrato antigo", r6)
+finally:
+    bot.get_embedding, bot.supabase = _emb_real, _sb_real
+    bot._clear_turn_ctx()
+
+
 print("\n### D. Fixture x banco (opcional; so com .env)")
 if not os.getenv("SUPABASE_URL"):
     print("  [~] sem SUPABASE_URL — camada de banco pulada")
