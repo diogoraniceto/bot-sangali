@@ -161,10 +161,19 @@ def main():
             'minimo_grade': bot.RANKING_MINIMO_GRADE,
             'termo_tokens': [t.upper() for t in termo.split()], 'excluir_ids': None})
         elegiveis = [x for x in (resp.data or []) if x.get('tier') == 1]
+        ids_result = {p['id_produto'] for p in r.get('produtos', [])}
         if elegiveis:
-            check(f"A5 {termo}/{ln}: existe campeao elegivel -> foi promovido",
-                  tem_destaque,
-                  f"{len(elegiveis)} elegivel(is), ex.: {elegiveis[0]['nome'][:40]}")
+            # O invariante e PRESENCA, nao o rotulo. `destaque` marca so o tier 1;
+            # um campeao que ja esta entre os ANCORA_SEMANTICA primeiros por
+            # similaridade sai como tier 0 e `destaque=False` — ele nao precisou de
+            # promocao comercial porque a busca semantica ja o colocou no topo.
+            # Caso real: `cueca boxer` devolve CUECA BOXER SEM COSTURA (grade 40) na
+            # POSICAO 2 com tier=0. Exigir o rotulo ali reprovaria o comportamento
+            # correto (foi o que este assert fazia antes).
+            presentes = [x['nome'][:34] for x in elegiveis if x['id_produto'] in ids_result]
+            check(f"A5 {termo}/{ln}: campeao elegivel aparece no resultado",
+                  bool(presentes),
+                  f"{len(elegiveis)} elegivel(is); no resultado: {presentes or 'NENHUM'}")
         else:
             check(f"A5 {termo}/{ln}: sem campeao elegivel -> nao inventa destaque",
                   not tem_destaque,

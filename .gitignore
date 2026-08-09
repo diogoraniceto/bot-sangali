@@ -13,3 +13,4 @@ __pycache__/
 *.so
 venv/
 .venv/
+reembed_total.log
