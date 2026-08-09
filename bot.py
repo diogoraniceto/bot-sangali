@@ -75,13 +75,9 @@ _user_locks = {}  # threading.Lock() por user_id (criado on-demand)
 _user_turn_locks = {}  # threading.Lock() por user_id: serializa o TURNO INTEIRO
                        # (segurado por dezenas de segundos — nunca na thread do webhook)
 
-# Última mensagem do user por user_id, usada para validar tamanho contra LLM drift.
-# Quando LLM passa um tamanho diferente do que o user disse, forçamos o do user.
-_user_last_msg = {}
-
-# user_id "ativo" do turn atual — usado pelas tools para acessar contexto da request
-# sem precisar receber user_id como argumento. Setado em process_and_respond.
-_consultar_estoque_active_user_id = None
+# A última mensagem do cliente e o user_id do turno vivem em `_turn_ctx`
+# (threading.local, abaixo). Eram globais de módulo e vazavam o contexto de um
+# cliente para o turno de outro quando dois clientes falavam ao mesmo tempo.
 
 # Rate limit: histórico de timestamps por user_id. {user_id: [ts1, ts2, ...]}
 RATE_LIMIT_WINDOW_SEC = 60
@@ -187,6 +183,23 @@ def _tamanhos_validos_na_msg(texto):
     if "ÚNIC" in upper or "UNIC" in upper:
         encontrados.append("UNICO")
     return encontrados
+
+
+def _resolver_tamanho_alvo(tamanho_alvo):
+    """(tamanho_efetivo, corrigido: bool). Lê o contexto do TURNO, não global de módulo.
+
+    Defesa contra LLM drift (Risco B4): se o cliente disse uma letra ('G') e o
+    modelo passou outra ('GG'), vale o que o cliente escreveu nesta mensagem.
+    Fora de um turno (`_ctx_last_msg()` None) o guard não inventa correção.
+    """
+    if not tamanho_alvo:
+        return None, False
+    ultimo_user = _ctx_last_msg()
+    tokens_user = _tamanhos_validos_na_msg(ultimo_user) if ultimo_user else []
+    if tokens_user and tamanho_alvo not in tokens_user:
+        print(f"[GUARD] tamanho '{tamanho_alvo}' fora da msg do cliente {tokens_user} -> forcando '{tokens_user[0]}'")
+        return tokens_user[0], True
+    return tamanho_alvo, False
 
 
 HANDOFF_SILENCIO_MIN = 120  # silencia o bot por 2h apos handoff
@@ -380,16 +393,8 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
 
     # 0.1. DEFESA contra LLM drift (Risco B4): se cliente disse uma letra única
     # (ex: "G") e LLM passou outra (ex: "GG"), preferimos o que o cliente disse.
-    # Heurística: comparar tamanho_alvo com tokens extraídos da última msg do user.
-    if tamanho_alvo:
-        ultimo_user = _user_last_msg.get(_consultar_estoque_active_user_id)
-        tokens_user = _tamanhos_validos_na_msg(ultimo_user) if ultimo_user else []
-        if tokens_user and tamanho_alvo not in tokens_user:
-            # LLM passou tamanho que não bate com o que user disse na última msg.
-            # Substitui pelo primeiro tamanho que o user mencionou.
-            corrigido = tokens_user[0]
-            print(f"[GUARD] LLM passou '{tamanho_alvo}' mas user disse {tokens_user}. Forçando '{corrigido}'.")
-            tamanho_alvo = corrigido
+    # O bool de retorno (guard acionou) fica disponível para a F2.
+    tamanho_alvo, _ = _resolver_tamanho_alvo(tamanho_alvo)
 
     # 1. Gera o vetor da pergunta do cliente
     vetor_busca = get_embedding(termo_cliente)
@@ -1374,7 +1379,6 @@ def process_and_respond(user_id):
     ainda cheio, então a msg3 que chegar entra no MESMO buffer e B a drena junto.
     Drenar antes de bloquear geraria duas respostas separadas.
     """
-    global _consultar_estoque_active_user_id
     turn_lock = _get_turn_lock(user_id)
     buf_lock = _get_user_lock(user_id)      # resolve AMBOS antes de adquirir qualquer um
     t0 = time.perf_counter()
@@ -1397,11 +1401,9 @@ def process_and_respond(user_id):
             return
         print(f"[TURNO] {user_id}: espera_lock={espera_ms}ms | chars={len(texto_completo)}")
         print(f"DEBUG INPUT: '{texto_completo}'")
+        # Contexto do turno usado pelas tools (defesa B4 em consultar_estoque).
+        # É por THREAD: dois clientes simultâneos não enxergam o texto um do outro.
         _set_turn_ctx(user_id, texto_completo)
-        # Contexto do turno usado por tools (defesa B4 em consultar_estoque).
-        # C1.1 MANTEM os globais para o guard continuar idêntico; C1.2 os remove.
-        _user_last_msg[user_id] = texto_completo
-        _consultar_estoque_active_user_id = user_id
         fotos_pendentes = []                # F3 usa; aqui fica vazio e inerte
         turno_ok = False
         try:
