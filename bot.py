@@ -178,6 +178,28 @@ def _ctx_last_msg():
     return getattr(_turn_ctx, "last_msg", None)
 
 
+def _snapshot_turn_ctx():
+    """Copia o contexto do turno para reinstalar em outra thread (ver `_ia_send_com_teto`).
+
+    `excluir_ids` vai pela MESMA referência de lista de propósito: o que a tool
+    acumular na thread de trabalho tem de ser visível para quem espera (F5).
+    """
+    return {
+        "user_id": getattr(_turn_ctx, "user_id", None),
+        "last_msg": getattr(_turn_ctx, "last_msg", None),
+        "msg_cliente": getattr(_turn_ctx, "msg_cliente", None),
+        "excluir_ids": getattr(_turn_ctx, "excluir_ids", None),
+    }
+
+
+def _restore_turn_ctx(snap):
+    """Reinstala nesta thread o contexto capturado por `_snapshot_turn_ctx`."""
+    _turn_ctx.user_id = snap.get("user_id")
+    _turn_ctx.last_msg = snap.get("last_msg")
+    _turn_ctx.msg_cliente = snap.get("msg_cliente")
+    _turn_ctx.excluir_ids = snap.get("excluir_ids") if snap.get("excluir_ids") is not None else []
+
+
 def _ctx_msg_cliente():
     """Só a fala do cliente neste turno (sem preâmbulo/legenda/preço). "" fora de um turno.
 
@@ -1602,6 +1624,60 @@ def _erro_ia_transitorio(e):
     return any(k in s for k in _IA_ERR_TRANSITORIO)
 
 
+# Teto de tempo TOTAL do turno (todas as tentativas somadas).
+# Por que existe: `request_options={"timeout": 45}` e um pedido ao SDK, nao uma
+# garantia — ja aconteceu de uma chamada ficar ~11 h pendurada sem devolver erro.
+# Depois da F1 isso e pior: o turno pendurado segura o `turn_lock` daquele cliente,
+# e todas as mensagens seguintes dele ficam presas na fila para sempre.
+# Por que 120 s: o pior caso legitimo do retry e 45 + 2 + 45 + 4 = 96 s (tres
+# tentativas com os sleeps de 2·tentativa). 120 da folga de ~25% para a terceira
+# tentativa comecar e ainda deixa o cliente esperando no maximo ~2 min antes do
+# fallback gracioso — contra as horas de hoje. Ajustavel por TURNO_ORCAMENTO_S.
+TURNO_ORCAMENTO_S = float(os.getenv("TURNO_ORCAMENTO_S", "120"))
+IA_TIMEOUT_S = float(os.getenv("IA_TIMEOUT_S", "45"))
+_IA_TENTATIVA_MIN_S = 5.0     # abaixo disto nao vale abrir mais uma tentativa
+
+
+class TurnoOrcamentoEsgotado(Exception):
+    """O turno estourou o teto de tempo TOTAL. Cai no fallback gracioso."""
+
+
+def _ia_send_com_teto(chat, texto, teto_s):
+    """`chat.send_message` com teto de tempo de PAREDE, custe o que custar.
+
+    Roda numa thread daemon e desiste de esperar em `teto_s`. Se a chamada nao
+    voltou, a thread e ABANDONADA (nao ha como cancelar um socket do SDK) e o
+    turno segue para o fallback — o importante e liberar o `turn_lock`.
+    O contexto do turno e reinstalado na thread de trabalho: as tools rodam la
+    dentro (automatic function calling) e sem isto o guard de tamanho e o
+    `user_id` de `tool_filtro_eventos` ficariam cegos.
+    A thread abandonada nao envia nada ao cliente — o render acontece aqui fora.
+    """
+    caixa = {}
+    snap = _snapshot_turn_ctx()
+    timeout_sdk = max(1.0, min(IA_TIMEOUT_S, teto_s))
+
+    def _worker():
+        _restore_turn_ctx(snap)
+        try:
+            caixa["r"] = chat.send_message(texto, request_options={"timeout": timeout_sdk})
+        except BaseException as e:      # noqa: BLE001 — re-levantada na thread chamadora
+            caixa["e"] = e
+        finally:
+            _clear_turn_ctx()
+
+    th = threading.Thread(target=_worker, daemon=True, name="ia-send")
+    th.start()
+    th.join(timeout=teto_s)
+    if th.is_alive():
+        raise TurnoOrcamentoEsgotado(
+            f"orcamento do turno esgotado: chat.send_message nao retornou em "
+            f"{teto_s:.0f}s — thread abandonada, turn_lock liberado")
+    if "e" in caixa:
+        raise caixa["e"]
+    return caixa.get("r")
+
+
 def process_and_respond(user_id):
     """Serializa o turno deste cliente e drena o buffer ANTES de executá-lo.
 
@@ -1743,18 +1819,33 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
         # de tools (ex.: resposta-a-card -> consultar_estoque + calcular_total). Sem retry
         # o cliente caia no fallback "reenvie" e a Luna parecia muda. Retry com o chat
         # reconstruido a cada tentativa (history vem do banco e e estavel).
+        # O retry tem ORCAMENTO GLOBAL: cada tentativa so recebe o que sobrou do teto
+        # do turno. Sem isso um unico send_message pendurado prende o turn_lock deste
+        # cliente indefinidamente (medido: ~11 h na 3a tentativa).
         response = None
         _MAX_TENTATIVAS_IA = 3
+        chat = None
         for _tentativa in range(1, _MAX_TENTATIVAS_IA + 1):
+            _restante = TURNO_ORCAMENTO_S - (time.perf_counter() - t_inicio)
+            if _restante < _IA_TENTATIVA_MIN_S:
+                raise TurnoOrcamentoEsgotado(
+                    f"orcamento do turno ({TURNO_ORCAMENTO_S:.0f}s) esgotado antes da "
+                    f"tentativa {_tentativa}")
             chat = model.start_chat(history=history, enable_automatic_function_calling=True)
             try:
-                response = chat.send_message(texto_completo, request_options={"timeout": 45})
+                response = _ia_send_com_teto(chat, texto_completo, _restante)
                 break
+            except TurnoOrcamentoEsgotado:
+                raise                    # teto e global: nao ha o que retentar
             except Exception as e_ia:
-                if _tentativa < _MAX_TENTATIVAS_IA and _erro_ia_transitorio(e_ia):
+                _restante = TURNO_ORCAMENTO_S - (time.perf_counter() - t_inicio)
+                _espera = 2 * _tentativa
+                if (_tentativa < _MAX_TENTATIVAS_IA and _erro_ia_transitorio(e_ia)
+                        and _restante > _espera + _IA_TENTATIVA_MIN_S):
                     print(f"⚠️ IA transitorio (tentativa {_tentativa}/{_MAX_TENTATIVAS_IA}): "
-                          f"{type(e_ia).__name__}: {str(e_ia)[:120]} — retry")
-                    time.sleep(2 * _tentativa)
+                          f"{type(e_ia).__name__}: {str(e_ia)[:120]} — retry "
+                          f"(restam {_restante:.0f}s do orcamento)")
+                    time.sleep(_espera)
                     continue
                 raise
         latencia_ms = int((time.perf_counter() - t_inicio) * 1000)
