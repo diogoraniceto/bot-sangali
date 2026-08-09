@@ -506,12 +506,22 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     print(f"\n[SEMÂNTICO] Buscando: '{termo_cliente}' | Tamanho recebido: {tamanho} | Loja: {id_loja}")
 
     # 0. Normalização do Tamanho
-    tamanho_alvo = tamanho.upper().strip() if tamanho else None
+    tamanho_llm = tamanho.upper().strip() if tamanho else None
+    tamanho_alvo = tamanho_llm
 
     # 0.1. DEFESA contra LLM drift (Risco B4): se cliente disse uma letra única
     # (ex: "G") e LLM passou outra (ex: "GG"), preferimos o que o cliente disse.
-    # O bool de retorno (guard acionou) fica disponível para a F2.
-    tamanho_alvo, _ = _resolver_tamanho_alvo(tamanho_alvo)
+    tamanho_alvo, guard_acionou = _resolver_tamanho_alvo(tamanho_alvo)
+
+    # 0.2. Estado do filtro — calculado SEMPRE (mesmo sem tamanho), porque o modo de
+    # falha mais provável é o LLM OMITIR o tamanho que o cliente deu; sem isto ele
+    # ficaria invisível. `tokens_alvo` é o mesmo overlap que a RPC faz (0009:55).
+    tokens_user_log = _tokens_tamanho_do_cliente()
+    llm_omitiu_tamanho = bool(tokens_user_log) and not tamanho_alvo
+    tokens_alvo = set(_tokens_tamanho(tamanho_alvo)) if tamanho_alvo else set()
+    # hoistado: id_loja_alvo entra no retorno/log dos 4 caminhos, inclusive o
+    # early-return de embedding abaixo.
+    id_loja_alvo = str(id_loja).strip() if id_loja not in (None, "") else None
 
     # 1. Gera o vetor da pergunta do cliente
     vetor_busca = get_embedding(termo_cliente)
@@ -520,7 +530,6 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
 
     # 2. Chama a RPC 'buscar_produtos_semantico' no Supabase
     try:
-        id_loja_alvo = str(id_loja).strip() if id_loja not in (None, "") else None
         rpc_params = {
             'query_embedding': vetor_busca,
             'match_threshold': 0.5,
@@ -594,18 +603,36 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         print(f"❌ Erro RPC: {e}")
         return {"status": "erro", "msg": "Erro ao consultar banco de dados."}
 
-    # 3. Filtragem por Tamanho (REDUNDÂNCIA / SEGURANÇA)
-    # Mesmo com o banco filtrando, mantemos isso para garantir ou caso a RPC falhe silenciosamente no filtro
+    # 3. Re-filtro por OVERLAP DE TOKENS — mesma regra da RPC (0009:55,
+    # `tamanho_tokens && tokens_alvo`). A igualdade exata que existia aqui derrubava
+    # o que o banco havia aprovado: 'ÚNICO'.upper() != 'UNICO' matava 623 das 674
+    # linhas (92,4%), e todo tamanho COMPOSTO ('P/M' 20 linhas, 'G/GG' 18) era
+    # invisível. Era essa a origem do falso "não tenho nesse tamanho".
+    # `not tokens_alvo` espelha o branch cardinality(...)=0 da RPC.
+    # G ≠ GG continua valendo (conjuntos disjuntos): a expansão que o prompt proíbe
+    # não volta.
     validados = []
+    dropados = []                      # tamanhos crus descartados pelo overlap
+    n_dropados_igualdade_legado = 0    # sobreviveram ao overlap, morreriam na igualdade
 
     for p in produtos_candidatos:
-        # Se o cliente pediu tamanho, validamos se o produto bate
         if tamanho_alvo:
-            if p['tamanho'].upper() == tamanho_alvo:
+            tokens_p = set(_tokens_tamanho(p.get('tamanho')))
+            if (not tokens_alvo) or (tokens_alvo & tokens_p):
                 validados.append(p)
+                if (p.get('tamanho') or '').upper() != tamanho_alvo:
+                    n_dropados_igualdade_legado += 1
+            else:
+                dropados.append(p.get('tamanho'))
         else:
             # Para cosméticos/acessórios, aceitamos o que vier com maior similaridade
             validados.append(p)
+
+    if n_dropados_igualdade_legado:
+        print(f"[TAMANHO] overlap salvou {n_dropados_igualdade_legado} linha(s) que a "
+              f"igualdade exata derrubaria (alvo={tamanho_alvo})")
+    if dropados:
+        print(f"[TAMANHO] descartados por tamanho: {dropados}")
 
     if not validados:
         return {"status": "vazio", "msg": f"Não encontrei nada disponível no tamanho {tamanho_alvo}."}
