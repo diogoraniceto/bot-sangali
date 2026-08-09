@@ -526,6 +526,14 @@ def _log_filtro_evento(**campos):
 
 # ================= NOVA FERRAMENTA DE BUSCA (SUPABASE) =================
 
+# Valores que o modelo escreve quando quer dizer "sem tamanho". Nenhum deles existe
+# como tamanho real (o catalogo tem 35 valores distintos e nenhum e destes), então
+# tratá-los como ausência não esconde produto nenhum.
+_TAMANHO_SENTINELA = frozenset({
+    "NONE", "NULL", "NIL", "N/A", "NENHUM", "NAO", "NÃO", "UNDEFINED", "NAN",
+    "SEM TAMANHO", "NAO INFORMADO", "NÃO INFORMADO", "-", "?", "NAO SE APLICA",
+})
+
 def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja: str = None):
     """
     Realiza busca semântica no estoque por similaridade vetorial + filtro de tamanho + filtro de loja.
@@ -535,8 +543,10 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         tamanho: tamanho EXATO que o cliente pediu. Copie literal: se cliente disse "G",
                  passe "G" (NÃO "GG"). Se disse "M", passe "M". Se disse "42", passe "42".
                  Nunca expanda uma letra (G≠GG, M≠MM, P≠PP). Apenas colapse digitação
-                 repetida em ≥4 (GGGG → GG). Use None só se o cliente realmente não falou
-                 tamanho (ex: produtos sexshop, cosméticos).
+                 repetida em ≥4 (GGGG → GG). Se o cliente realmente não falou tamanho
+                 (ex: produtos sexshop, cosméticos), OMITA este parâmetro — não envie
+                 o campo. Nunca escreva a palavra "None"/"null" como valor: ela seria
+                 usada como se fosse um tamanho e a busca voltaria vazia.
         id_loja: id da loja a filtrar (string). Use o id_loja informado nas instruções
                  do prompt para restringir a busca a uma filial específica.
                  Use None para buscar em todas as lojas.
@@ -557,6 +567,14 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     # 0. Normalização do Tamanho
     tamanho_llm = tamanho.upper().strip() if tamanho else None
     tamanho_alvo = tamanho_llm
+    # `tamanho` é declarado como string, então o modelo às vezes escreve a PALAVRA
+    # "None" em vez de omitir o campo — e aí a RPC filtrava por tokens ['NONE'],
+    # zero linhas, e a Luna dizia "não tenho" para produtos que existiam. Medido em
+    # tool_filtro_eventos no primeiro dia: 3 buscas com tamanho_llm='NONE'.
+    # `tamanho_llm` guarda o valor cru (é o que a métrica precisa ver).
+    if tamanho_alvo in _TAMANHO_SENTINELA:
+        print(f"[TAMANHO] LLM mandou a palavra '{tamanho}' como tamanho — tratando como SEM tamanho")
+        tamanho_alvo = None
 
     # 0.1. DEFESA contra LLM drift (Risco B4): se cliente disse uma letra única
     # (ex: "G") e LLM passou outra (ex: "GG"), preferimos o que o cliente disse.

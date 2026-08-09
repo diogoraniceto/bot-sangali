@@ -294,6 +294,29 @@ try:
     bot.consultar_estoque_supabase("algema", None, None)
     ok(EVENTOS[0]["llm_omitiu_tamanho"] is False,
        "F8 cliente sem tamanho nao acusa omissao do LLM", EVENTOS[0])
+
+    print("\n### G. a palavra 'None' como tamanho nao pode dar falso vazio")
+    # Achado do proprio tool_filtro_eventos no primeiro dia de vida: 3 buscas reais
+    # com tamanho_llm='NONE'. `tamanho` e declarado como string, entao o modelo
+    # escreve a palavra em vez de omitir o campo. Antes: a RPC filtrava por tokens
+    # ['NONE'] -> 0 linhas -> "nao tenho" para produtos que existiam.
+    for palavra in ("None", "none", "null", "N/A", "nenhum", "-", "sem tamanho"):
+        bot._set_turn_ctx("u_test", "me mostra algemas")
+        rg = bot.consultar_estoque_supabase("algema", palavra, "244033")
+        ok(rg["status"] == "sucesso" and rg["filtro_aplicado"]["tamanho"] is None
+           and len(rg["produtos"]) == 4,
+           f"G1 tamanho={palavra!r} tratado como SEM tamanho",
+           (rg["status"], rg.get("filtro_aplicado", {}).get("tamanho")))
+    EVENTOS.clear()
+    bot._set_turn_ctx("u_test", "me mostra algemas")
+    bot.consultar_estoque_supabase("algema", "None", "244033")
+    ok(EVENTOS[0]["tamanho_llm"] == "NONE" and EVENTOS[0]["tamanho_aplicado"] is None,
+       "G2 o log preserva o valor CRU do LLM (a metrica precisa ver a palavra)", EVENTOS[0])
+    bot._set_turn_ctx("u_test", "tem no M?")
+    rg = bot.consultar_estoque_supabase("boxer", "M", "220540")
+    ok(sorted(p["tamanho"] for p in rg["produtos"]) == ["M", "P/M"],
+       "G3 tamanho real continua filtrando (sentinela nao virou passe livre)",
+       [p["tamanho"] for p in rg["produtos"]])
 finally:
     bot.get_embedding, bot.supabase = _emb_real, _sb_real
     bot._clear_turn_ctx()
