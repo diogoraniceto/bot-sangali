@@ -1729,10 +1729,13 @@ def _enviar_fotos_extras_pendentes(user_id, pendentes):
             print(f"[fotos] pid={pid}: nada novo para enviar (n_fotos={len(fotos)})")
             continue
         escolhidas = novas[:min(FOTOS_MAX_POR_PEDIDO, orcamento)]
-        for i, url in enumerate(escolhidas):
-            legenda = (_legenda_fotos_extra(pid, len(escolhidas), len(fotos)) if i == 0
-                       else f"_cód: {int(pid)}_")   # nunca legenda vazia: o payload
-                                                    # cloud sempre manda `caption`
+        anunciou = False        # a legenda de anúncio vai na 1ª foto que SAIU de fato:
+                                # se a primeira for recusada, o anúncio iria junto com
+                                # ela e o cliente receberia só imagens com `_cód:`.
+        for url in escolhidas:
+            legenda = (f"_cód: {int(pid)}_" if anunciou     # nunca legenda vazia: o
+                       else _legenda_fotos_extra(pid, len(escolhidas), len(fotos)))
+                                                    # payload cloud sempre manda `caption`
             try:
                 wamid = enviar_midia_whatsapp(user_id, url, legenda)
             except Exception as e:
@@ -1749,6 +1752,7 @@ def _enviar_fotos_extras_pendentes(user_id, pendentes):
             if WHATSAPP_PROVIDER == "cloud" and isinstance(wamid, str):
                 registrar_card_enviado(wamid, user_id, int(pid), legenda)
             _marcar_fotos_vistas(user_id, pid, [url])
+            anunciou = True
             enviadas += 1
             orcamento -= 1
             if FOTOS_SLEEP_SEG:
