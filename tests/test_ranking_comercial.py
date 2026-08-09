@@ -127,18 +127,49 @@ def main():
         check(f"A4 {termo}/{ln}", top_sim in primeiros,
               f"top_sim={top_sim} primeiros={primeiros}")
 
-    print("\n=== A5: pares com ao menos 1 produto destaque=True ===")
-    com_destaque = [f"{t}/{ln}" for (t, ln), r in resultados.items()
-                    if any(p.get('destaque') for p in r.get('produtos', []))]
-    # LIMIAR: 10 de 14. O plano previa >=12, medido com vetores de CONSULTA do
-    # Gemini; este teste roda com o proxy de centroide (ver _vetores_ranking.py) e
-    # da 11/14. Os 3 pares sem destaque foram auditados um a um e sao DADO, nao
-    # ranking: fantasia (a base tem 5-6 fantasias, nenhuma campea de venda) e
-    # sutia/FILIAL01 (os unicos campeoes no pool sao CONJUNTO e CALCINHA, que o
-    # escopo de categoria barra CERTO). O limiar fica em 10 para nao virar um
-    # teste do vetor-proxy; ao regerar com o Gemini, subir para 12.
-    check("A5 >= 10/14 pares com destaque", len(com_destaque) >= 10,
-          f"{len(com_destaque)}/14 -> {com_destaque}")
+    print("\n=== A5: INVARIANTE — campeao elegivel e SEMPRE promovido (e so ele) ===")
+    # POR QUE NAO E UMA CONTAGEM DE PARES:
+    # "quantos pares tem destaque" e propriedade do CATALOGO, nao do ranking.
+    # Medido com vetores de consulta REAIS do Gemini: dos 14 pares, so 11 tem
+    # campeao de venda DENTRO da categoria pedida — `fantasia` nas 2 lojas nao tem
+    # nenhuma campea, e `sutia`/FILIAL01 so tem CONJUNTO e CALCINHA, que o escopo
+    # lexical barra CERTO. Desses 11, 9 caem na janela de 0,05; os 2 de fora sao
+    # `cueca boxer`, com delta 0,1516 (sim_max 0,8455 contra campeao 0,6939) —
+    # existe uma cueca MUITO mais parecida com o pedido, e promover a campea ali
+    # seria o defeito que o plano alerta ("estoque antes de similaridade puxa
+    # categoria adjacente"). Alargar a janela de 0,05 para 0,15 nao muda nada
+    # (segue 9/11); so 0,20 cobriria — e 0,20 sobre uma faixa de 0,65-0,85
+    # praticamente desliga a trava. Ou seja: 0,05 esta calibrado.
+    # O QUE O CODIGO DEVE GARANTIR, e o que este assert mede, e o invariante nas
+    # DUAS direcoes, usando a propria RPC como fonte da elegibilidade (tier=1),
+    # sem reimplementar a regra em Python.
+    com_destaque = []
+    for termo, ln, lid in pares:
+        r = resultados[(termo, ln)]
+        tem_destaque = any(p.get('destaque') for p in r.get('produtos', []))
+        if tem_destaque:
+            com_destaque.append(f"{termo}/{ln}")
+        # Pool inteiro ranqueado pela RPC, sem ancora (para tier 1 nao ser
+        # mascarado por tier 0) e sem corte: quem sai com tier=1 aqui e, pela
+        # definicao da propria funcao, campeao elegivel na categoria.
+        resp = bot._rpc_busca({
+            'query_embedding': VETORES[termo], 'match_threshold': 0.5,
+            'match_count': bot.POOL_CANDIDATOS, 'filtro_tamanho': None,
+            'filtro_id_loja': lid, 'limite_produtos': bot.POOL_CANDIDATOS,
+            'ancora_semantica': 0,
+            'janela_similaridade': bot.JANELA_SIMILARIDADE,
+            'minimo_grade': bot.RANKING_MINIMO_GRADE,
+            'termo_tokens': [t.upper() for t in termo.split()], 'excluir_ids': None})
+        elegiveis = [x for x in (resp.data or []) if x.get('tier') == 1]
+        if elegiveis:
+            check(f"A5 {termo}/{ln}: existe campeao elegivel -> foi promovido",
+                  tem_destaque,
+                  f"{len(elegiveis)} elegivel(is), ex.: {elegiveis[0]['nome'][:40]}")
+        else:
+            check(f"A5 {termo}/{ln}: sem campeao elegivel -> nao inventa destaque",
+                  not tem_destaque,
+                  "pool nao tem tier=1")
+    print(f"  [info] pares com destaque: {len(com_destaque)}/{len(pares)} -> {com_destaque}")
 
     print("\n=== A6: mediana de produtos distintos por busca ===")
     med = statistics.median([len({p['id_produto'] for p in r.get('produtos', [])})
