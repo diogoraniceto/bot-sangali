@@ -1617,7 +1617,9 @@ def criar_tool_mostrar_fotos(user_id, pendentes):
             return {"status": "sem_novas", "id_produto": pid, "nome": nome,
                     "n_fotos": len(fotos), "ja_vistas": len(vistas), "vai_enviar": 0,
                     "msg": "O cliente ja recebeu TODAS as fotos deste produto. Diga que "
-                           "sao todas que voce tem e ofereca uma atendente."}
+                           "sao todas que voce tem e ofereca uma atendente para ajudar "
+                           "com os DETALHES da peca — nunca prometa que ela vai tirar "
+                           "ou mandar uma foto nova."}
 
         # Um produto por turno: a tool NAO PODE prometer mais do que o sender manda,
         # e o orcamento de envio do turno e o mesmo do produto (FOTOS_MAX_POR_TURNO).
@@ -1648,8 +1650,8 @@ def criar_tool_mostrar_fotos(user_id, pendentes):
             # modelo anunciasse ângulos no plural mentiria — e se o card desta mesma
             # resposta já levar essa foto, o sender não manda nada (a foto já foi).
             msg = ("Este produto tem UMA foto so, que e a mesma do card. Diga que e a "
-                   "unica foto que voce tem dessa peca e ofereca uma atendente se o "
-                   "cliente quiser ver mais detalhes. Nunca fale de angulos no plural.")
+                   "unica foto que voce tem dessa peca e ofereca uma atendente para os "
+                   "detalhes — sem prometer foto nova. Nunca fale de angulos no plural.")
         else:
             msg = ("O sistema vai enviar as fotos DEPOIS da sua resposta. Anuncie de "
                    "forma neutra ('outros angulos que eu tenho'), sem dizer qual lado "
