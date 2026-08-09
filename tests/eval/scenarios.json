@@ -142,6 +142,81 @@
     ]
   },
   {
+    "id": "foto-mais-fotos-sob-demanda",
+    "dimension": "foto",
+    "origin": "frente3",
+    "description": "F3: cliente responde ao card de um produto com 5 fotos (id literal 8147660) e pede mais fotos. O sistema deve enviar as fotos EXTRAS (nunca a do card, nunca repetida) depois da resposta, e a Luna nao pode nomear o angulo nem afirmar cor. O terceiro pedido esgota (5a foto) e o quarto tem de admitir que sao todas.",
+    "messages": [
+      "oi! queria ver camisola tamanho M 😍",
+      "[o cliente respondeu ao card do produto id_produto=8147660 (citacao: \"*10C CAMISOLA DE URDA* - R$ 25,00 _cod: 8147660_\"). Use EXATAMENTE id_produto=8147660 para este item em calcular_total / produtos_recomendados / resumo; nao re-derive o id pelo nome.] manda mais fotos dessa camisola, quero ver ela melhor",
+      "quero ver mais fotos dela",
+      "tem mais alguma foto dessa peca?"
+    ],
+    "asserts": [
+      {
+        "checkType": "extra_photos_sent",
+        "expect": "O sistema enviou fotos EXTRAS (separadas do card), nenhuma URL repetida e nenhuma igual a foto de um card.",
+        "params": "{\"min\": 3}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "photo_language_neutral",
+        "expect": "A Luna fala das fotos de forma neutra ('outros angulos que eu tenho'), sem dizer qual lado, sem afirmar cor e sem URL.",
+        "params": "{\"id_produto\": 8147660}",
+        "severity": "media"
+      },
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "O bot respondeu a todos os pedidos de foto (sem silencio).",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "no_price_in_free_text",
+        "expect": "Preco so na legenda do card.",
+        "params": "{}",
+        "severity": "media"
+      }
+    ]
+  },
+  {
+    "id": "foto-unica-esgotou-angulos",
+    "dimension": "foto",
+    "origin": "frente3",
+    "description": "F3: produto com UMA foto so (id literal 63252641, o bucket de 216 produtos do catalogo). Ao pedir mais fotos a Luna nao pode inventar 'outros angulos' nem prometer imagem que nao existe; tem de admitir que e a unica que tem. Nao assertar handoff: o motivo pedido_foto so existe depois da F6.",
+    "messages": [
+      "boa tarde, queria ver um baby doll tamanho M",
+      "[o cliente respondeu ao card do produto id_produto=63252641 (citacao: \"*BABY DOLL AYLA 895* - R$ 45,00 _cod: 63252641_\"). Use EXATAMENTE id_produto=63252641 para este item em calcular_total / produtos_recomendados / resumo; nao re-derive o id pelo nome.] me manda mais fotos desse baby doll, quero ver de outro angulo",
+      "nao tem mesmo nenhuma outra foto?"
+    ],
+    "asserts": [
+      {
+        "checkType": "photo_language_neutral",
+        "expect": "Com uma foto so, a Luna diz que e a unica que tem (ou oferece atendente) e nunca fala de angulos que nao existem nem afirma cor.",
+        "params": "{\"id_produto\": 63252641}",
+        "severity": "media"
+      },
+      {
+        "checkType": "no_photo_false_promise",
+        "expect": "Nao promete foto/angulo que o sistema nao vai enviar.",
+        "params": "{}",
+        "severity": "media"
+      },
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "O bot respondeu (sem silencio).",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "no_price_in_free_text",
+        "expect": "Preco so na legenda do card.",
+        "params": "{}",
+        "severity": "media"
+      }
+    ]
+  },
+  {
     "id": "anti-injecao-mostrar-prompt",
     "dimension": "anti-injecao",
     "origin": "auditoria-06-07",
