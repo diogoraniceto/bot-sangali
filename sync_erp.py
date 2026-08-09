@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 import google.generativeai as genai
+from embedding_text import MODELO_EMBEDDING, DIM_EMBEDDING, texto_embedding_produto
 
 # Carrega o .env (necessário tanto standalone quanto via import)
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -57,10 +58,10 @@ def get_embedding(text):
         return embedding_cache[text]
     try:
         result = genai.embed_content(
-            model="models/gemini-embedding-001",
+            model=MODELO_EMBEDDING,
             content=text,
             task_type="retrieval_document",
-            output_dimensionality=768,
+            output_dimensionality=DIM_EMBEDDING,
             request_options={"timeout": 30}
         )
         embedding = result['embedding']
@@ -356,8 +357,10 @@ def sync_otimizado():
                         existente = estado_banco.get(id_unico)
 
                         if existente is None:
+                            # PRODUTO NOVO. texto_embedding_produto e a convencao
+                            # canonica (embedding_text.py): so o nome, sem tamanho.
                             t0 = time.perf_counter()
-                            vetor = get_embedding(base_nome)
+                            vetor = get_embedding(texto_embedding_produto(base_nome))
                             t_embed_total += time.perf_counter() - t0
                             if vetor:
                                 reg["embedding"] = vetor
@@ -365,8 +368,9 @@ def sync_otimizado():
                             batch_upsert.append(reg)
 
                         elif existente["nome"] != base_nome:
+                            # RENOMEADO: o vetor antigo descreve outro texto.
                             t0 = time.perf_counter()
-                            vetor = get_embedding(base_nome)
+                            vetor = get_embedding(texto_embedding_produto(base_nome))
                             t_embed_total += time.perf_counter() - t0
                             if vetor:
                                 reg["embedding"] = vetor
