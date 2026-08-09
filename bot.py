@@ -107,6 +107,101 @@ FOTOS_MAX_USERS_REGISTRY = 500
 _fotos_vistas = collections.OrderedDict()
 _fotos_vistas_lock = threading.Lock()
 
+# ---------------- RANKING COMERCIAL (F5) ----------------
+# Pool de candidatos que a RPC ordena por similaridade ANTES de deduplicar por
+# produto. 60 e medido: com 10 a busca devolvia 3-8 produtos DISTINTOS (as outras
+# linhas eram o mesmo produto em outro tamanho); com 60 o pool tem 18-36 distintos
+# e sempre da para preencher o corte de 8.
+POOL_CANDIDATOS = int(os.getenv("POOL_CANDIDATOS", "60"))
+# Corte final: 8 produtos DISTINTOS. Nao alonga o turno — renderizar_mensagem_
+# estruturada tem cap de 5 cards e o prompt limita a 3 recomendacoes.
+LIMITE_PRODUTOS = int(os.getenv("LIMITE_PRODUTOS", "8"))
+# Quantos lugares do topo pertencem a similaridade pura (tier 0). A categoria que
+# o cliente pediu nunca perde o topo para um campeao de venda.
+ANCORA_SEMANTICA = int(os.getenv("ANCORA_SEMANTICA", "2"))
+# Janela absoluta de cosseno para um campeao de venda ser promovido. Medido na
+# base: a distancia do melhor campeao DA CATEGORIA ao topo fica em 0,0000-0,0316
+# nos 14 pares termo x loja; 0,05 cobre todos com folga.
+JANELA_SIMILARIDADE = float(os.getenv("JANELA_SIMILARIDADE", "0.05"))
+# Grade minima (soma de estoque do produto na loja) para promover um campeao.
+# [BLOQUEADO §10.3 item 5] 3 e escolha, nao medida — por isso e env, nao codigo.
+RANKING_MINIMO_GRADE = float(os.getenv("RANKING_MINIMO_GRADE", "3"))
+# [BLOQUEADO §10.3 item 6] No ATACADO, o revendedor ve primeiro os campeoes de
+# venda ("campeao", default) ou os de grade mais funda ("grade")? Em "grade" a
+# profundidade reordena DENTRO de cada tier — o escopo de categoria (tier) e
+# a ancora semantica continuam mandando, senao o modo viraria "estoque manda".
+ATACADO_RANKING = os.getenv("ATACADO_RANKING", "campeao").strip().lower()
+
+# Produtos JA MOSTRADOS a cada cliente, para o "tem mais?" trazer coisa inedita.
+# Escopo = CONVERSA (nao turno): "tem mais?" e sempre turno novo, entao escopo de
+# turno nao excluiria nada. {user_id: [(id_produto:str, ts), ...]} mais recentes
+# no fim, com TTL e teto. Memoria do PROCESSO (exige replicas=1, Gate 0.1).
+EXCLUIR_TTL_SEG = float(os.getenv("EXCLUIR_TTL_SEG", "1800"))
+EXCLUIR_MAX_IDS = int(os.getenv("EXCLUIR_MAX_IDS", "15"))
+EXCLUIR_MAX_USERS = 500
+# Piso de resultados abaixo do qual as exclusoes sao abandonadas e a busca refeita.
+# Sem isto trocariamos "repetiu os mesmos" por "nao achei nada", que e pior.
+EXCLUIR_MIN_RESULTADOS = int(os.getenv("EXCLUIR_MIN_RESULTADOS", "3"))
+_mostrados = collections.OrderedDict()
+_mostrados_lock = threading.Lock()
+
+
+def _registrar_mostrados(user_id, ids):
+    """Marca `ids` (id_produto) como JA VISTOS por este cliente.
+
+    Chamado no RENDER, um por card efetivamente enviado — o cliente so "viu" o que
+    virou card, nao os 8 que a tool devolveu ao modelo. Nunca levanta.
+    """
+    try:
+        if not user_id or not ids:
+            return
+        agora = time.time()
+        with _mostrados_lock:
+            reg = _mostrados.get(user_id)
+            if reg is None:
+                reg = []
+                _mostrados[user_id] = reg
+            _mostrados.move_to_end(user_id)
+            for pid in ids:
+                s = str(pid).strip()
+                if not s:
+                    continue
+                # re-mostrar move para o fim (mais recente), nao duplica
+                for i, (p, _t) in enumerate(reg):
+                    if p == s:
+                        reg.pop(i)
+                        break
+                reg.append((s, agora))
+            # trim explicito: `del reg[:-N]` com N=0 nao corta nada (-0 == 0)
+            if len(reg) > EXCLUIR_MAX_IDS:
+                del reg[:len(reg) - EXCLUIR_MAX_IDS]
+            while len(_mostrados) > EXCLUIR_MAX_USERS:
+                _mostrados.popitem(last=False)   # descarta o cliente mais antigo
+    except Exception as e:
+        print(f"[EXCLUIR] falha ao registrar mostrados: {e}")
+
+
+def _ids_ja_mostrados(user_id):
+    """list[str] de id_produto mostrados a ESTE cliente na conversa recente.
+
+    TTL `EXCLUIR_TTL_SEG`, teto `EXCLUIR_MAX_IDS`, mais recentes primeiro.
+    GUARD DEFENSIVO: devolve [] em QUALQUER erro e NUNCA levanta. A chamada vive
+    dentro do try da busca, cujo `except` responde "Erro ao consultar banco de
+    dados" — um NameError/KeyError aqui viraria apagao silencioso de 100% das
+    buscas, com diagnostico enganoso.
+    """
+    try:
+        if not user_id:
+            return []
+        corte = time.time() - EXCLUIR_TTL_SEG
+        with _mostrados_lock:
+            reg = _mostrados.get(user_id) or []
+            vivos = [p for (p, t) in reg if t >= corte]
+        return list(reversed(vivos))[:EXCLUIR_MAX_IDS]
+    except Exception as e:
+        print(f"[EXCLUIR] falha ao ler mostrados: {e}")
+        return []
+
 
 def _get_user_lock(user_id):
     """Lock CURTO do buffer (só mutação de `message_buffers`) para este user_id.
@@ -680,6 +775,35 @@ _TAMANHO_SENTINELA = frozenset({
     "SEM TAMANHO", "NAO INFORMADO", "NÃO INFORMADO", "-", "?", "NAO SE APLICA",
 })
 
+# Parametros que so existem na RPC da migration 0013. Se o banco ainda estiver na
+# assinatura de 5 args (deploy invertido: codigo antes da migration), o PostgREST
+# responde PGRST202 e TODA busca cairia. `_rpc_busca` degrada para os 5 args em vez
+# de devolver "Erro ao consultar banco de dados" — o ranking some, a busca fica.
+_PARAMS_RPC_0013 = ('excluir_ids', 'termo_tokens', 'limite_produtos',
+                    'ancora_semantica', 'janela_similaridade', 'minimo_grade')
+
+
+def _rpc_busca(rpc_params):
+    """Chama a RPC de busca; se a de 0013 nao existir, refaz com os 5 args legados."""
+    try:
+        return supabase.rpc('buscar_produtos_semantico', rpc_params).execute()
+    except Exception as e:
+        txt = f"{e}"
+        if 'PGRST202' not in txt and 'Could not find the function' not in txt:
+            raise
+        print("⚠️ [RANKING] RPC 0013 ausente no banco (deploy invertido). "
+              "Degradando para a assinatura de 5 args — SEM ranking comercial. "
+              "Aplique migrations/0013_rpc_ranking_comercial.sql.")
+        legado = {k: v for k, v in rpc_params.items() if k not in _PARAMS_RPC_0013}
+        legado['match_count'] = min(int(rpc_params.get('match_count') or 10), 10)
+        return supabase.rpc('buscar_produtos_semantico', legado).execute()
+
+
+def _em_modo_atacado(user_id):
+    """True se este cliente ja foi identificado como revendedor nesta execucao."""
+    return bool(user_id) and user_id in _atacado_users
+
+
 def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja: str = None):
     """
     Realiza busca semântica no estoque por similaridade vetorial + filtro de tamanho + filtro de loja.
@@ -710,6 +834,15 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         Cada item traz ainda `tem_foto` (o card sai com imagem) e `n_fotos` (quantas
         fotos existem no total). `n_fotos` maior que 1 significa que há OUTROS ÂNGULOS
         além do card — se o cliente pedir mais fotos, chame `mostrar_fotos_produto`.
+        `produtos` traz no máximo 8 itens, um por produto DISTINTO, já ordenados:
+        os primeiros são os mais parecidos com o que o cliente pediu; os seguintes
+        podem ser campeões de venda da MESMA categoria, marcados com
+        `destaque: true`. Ainda assim a lista pode conter item de categoria
+        vizinha: leia o nome de CADA produto e descarte o que não for a categoria
+        pedida. Entre os produtos da categoria certa, prefira os de
+        `destaque: true` — e nunca invente esse selo para os outros.
+        Produtos que você já mostrou nesta conversa saem da busca
+        automaticamente; `filtro_aplicado.excluir_ids_aplicados` diz quantos.
     """
     print(f"\n[SEMÂNTICO] Buscando: '{termo_cliente}' | Tamanho recebido: {tamanho} | Loja: {id_loja}")
 
@@ -758,52 +891,91 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         _log_filtro_evento(status_retornado="erro_embedding", **evento)
         return {"status": "erro", "msg": "Falha na geração do vetor de busca."}
 
+    # Palavras-chave do termo do cliente. Servem a DOIS consumidores: o escopo
+    # LEXICAL da tier 1 dentro da RPC (`termo_tokens`) e o desempate por
+    # palavra-chave aqui embaixo. Precisam existir ANTES da chamada.
+    palavras_chave = set()
+    try:
+        for palavra in termo_cliente.split():
+            p_up = palavra.upper()
+            if len(p_up) > 2:
+                palavras_chave.add(p_up)
+                if p_up.endswith('S'):
+                    palavras_chave.add(p_up[:-1])   # "CUECAS" -> "CUECA"
+    except Exception as e:
+        print(f"⚠️ Erro ao extrair palavras-chave: {e}")
+
+    # Exclusoes: produtos que ESTE cliente ja viu como card na conversa recente.
+    # Snapshot CONGELADO em `_executar_turno` antes do laco de retry — as 3
+    # tentativas mandam exatamente a mesma lista, senao o retry devolveria
+    # resultado diferente da tentativa que falhou (quebra de idempotencia).
+    excluir = [str(i) for i in (getattr(_turn_ctx, "excluir_ids", None) or []) if str(i).strip()]
+    excluir_aplicados = 0   # hoistado: entra em `filtro_aplicado`, fora do try
+
     # 2. Chama a RPC 'buscar_produtos_semantico' no Supabase
     try:
         rpc_params = {
             'query_embedding': vetor_busca,
+            # Inerte de proposito: o pior match legitimo medido fica em ~0,65.
+            # Quem corta o pool e o `match_count` + a ordenacao por distancia.
             'match_threshold': 0.5,
-            'match_count': 10,
+            'match_count': POOL_CANDIDATOS,
             'filtro_tamanho': tamanho_alvo,
-            'filtro_id_loja': id_loja_alvo
+            'filtro_id_loja': id_loja_alvo,
+            'limite_produtos': LIMITE_PRODUTOS,
+            'ancora_semantica': ANCORA_SEMANTICA,
+            'janela_similaridade': JANELA_SIMILARIDADE,
+            'minimo_grade': RANKING_MINIMO_GRADE,
+            'termo_tokens': sorted(palavras_chave) or None,   # escopo lexical da tier 1
+            'excluir_ids': excluir or None,
         }
-        response = supabase.rpc('buscar_produtos_semantico', rpc_params).execute()
-        produtos_candidatos = response.data
+        response = _rpc_busca(rpc_params)
+        produtos_candidatos = response.data or []
+
+        # FALLBACK OBRIGATORIO: com exclusoes demais a busca vira "nao achei nada",
+        # que e pior do que repetir. Refaz SEM exclusoes e declara isso no retorno.
+        excluir_aplicados = len(excluir)
+        if excluir and len(produtos_candidatos) < EXCLUIR_MIN_RESULTADOS:
+            print(f"[EXCLUIR] fallback sem exclusoes ({len(produtos_candidatos)} < "
+                  f"{EXCLUIR_MIN_RESULTADOS} com {len(excluir)} id(s) excluido(s))")
+            rpc_params['excluir_ids'] = None
+            response = _rpc_busca(rpc_params)
+            produtos_candidatos = response.data or []
+            excluir_aplicados = 0
 
         # OTIMIZAÇÃO: Remove o vetor de embedding (muito grande e inútil para a LLM) para economizar tokens
         for p in produtos_candidatos:
             p.pop('embedding', None)
 
-        # 2.1. HYBRID SEARCH (KEYWORD BOOSTING)
-        # Prioriza produtos que tenham a palavra exata no nome (ex: "RENDA")
+        # 2.1. DESEMPATE POR PALAVRA-CHAVE, DENTRO DO TIER
+        # O boost comercial de +10 por `nome_grupo == 'PRODUTOS MAIS VENDIDOS'`
+        # saiu daqui de proposito: ele premiava QUALQUER linha do grupo sem olhar
+        # categoria, e o prompt manda descartar o que esta fora da categoria
+        # pedida — ou seja, promovia exatamente o item que a LLM joga no lixo.
+        # Agora quem decide e o `tier` da RPC, que ja e escopado por categoria.
         try:
-            # Normalização de Plurais (Simples): Adiciona versão sem "S" final
-            palavras_originais = [palavra.upper() for palavra in termo_cliente.split() if len(palavra) > 2]
-            palavras_chave = set()
-            for p in palavras_originais:
-                palavras_chave.add(p)
-                if p.endswith('S'):
-                    palavras_chave.add(p[:-1]) # "CUECAS" -> "CUECA"
-
-            GRUPO_PRIORITARIO = "PRODUTOS MAIS VENDIDOS"
             for p in produtos_candidatos:
-                score_boost = 0
-                nome_prod = p.get('nome', '').upper()
-                for termo in palavras_chave:
-                    if termo in nome_prod:
-                        score_boost += 1
-                # Boost comercial: bestsellers sempre acima de matches por palavra-chave
-                if (p.get('nome_grupo') or '').upper() == GRUPO_PRIORITARIO:
-                    score_boost += 10
-                p['_score_boost'] = score_boost
+                nome_prod = (p.get('nome') or '').upper()
+                p['_score_boost'] = sum(1 for termo in palavras_chave if termo in nome_prod)
 
-            # Ordena: Quem tem mais palavras chave vai pro topo.
-            # O Python's sort é estável, então se empatar no boost, mantém a ordem original (semântica)
-            produtos_candidatos.sort(key=lambda x: x['_score_boost'], reverse=True)
-            print(f"[HYBRID] Reordenado! Palavras-chave usadas: {palavras_chave}")
+            # Sort estavel em 3 niveis: o tier do SQL manda; a palavra-chave
+            # desempata DENTRO do tier; e a ordem que o SQL ja deu (grade para
+            # tier 1, similaridade para o resto) sobrevive entre iguais.
+            # Ordenar por -boost ANTES do tier faria uma palavra-chave promover
+            # item tier 2 acima da ancora semantica — o ranking viraria decorativo.
+            # `tier` ausente (RPC antiga no ar) -> 0 para todos -> ordem inalterada.
+            if ATACADO_RANKING == "grade" and _em_modo_atacado(_ctx_user_id()):
+                produtos_candidatos.sort(key=lambda x: (x.get('tier') or 0,
+                                                        -float(x.get('estoque_grade') or 0),
+                                                        -x.get('_score_boost', 0)))
+            else:
+                produtos_candidatos.sort(key=lambda x: (x.get('tier') or 0,
+                                                        -x.get('_score_boost', 0)))
+            print(f"[RANKING] tiers={[p.get('tier') for p in produtos_candidatos]} "
+                  f"palavras-chave={sorted(palavras_chave)}")
 
         except Exception as e:
-            print(f"⚠️ Erro no Hybrid Boosting: {e}")
+            print(f"⚠️ Erro no desempate por palavra-chave: {e}")
 
         # 2.2. BUSCA DE IMAGENS — TODAS as fotos, em ordem determinística
         # `.order("id")` é obrigatório: sem ele o PostgREST devolve as rows em ordem
@@ -884,6 +1056,11 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         "tamanho": tamanho_alvo,
         "tamanho_tokens": sorted(tokens_alvo),
         "id_loja": id_loja_alvo,
+        # Quantos produtos ja mostrados foram EXCLUIDOS desta busca. 0 quando nao
+        # havia nada a excluir OU quando o fallback abandonou as exclusoes para
+        # nao devolver lista vazia — nos dois casos a lista pode repetir o que o
+        # cliente ja viu, e o modelo tem de saber disso.
+        "excluir_ids_aplicados": excluir_aplicados,
         "observacao_tamanho": (
             "Cada item traz seu proprio campo 'tamanho'. Ele pode ser COMPOSTO "
             "('P/M','G/GG') ou acentuado ('UNICO'/'ÚNICO') e ainda assim atender o "
@@ -918,14 +1095,23 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
                         f"literalmente; nao conclua nada sobre outro tamanho sem chamar "
                         f"a ferramenta de novo.")}
 
-    # 4. Top-K final preservando ordem do boost (set destruía ordenação)
+    # 4. Corte final: um produto DISTINTO por linha, preservando a ordem do ranking.
+    # A chave é `id_produto`, não `id_unico`: `id_unico` é a PK (produto+tamanho+loja),
+    # então dedupar por ela era inerte e a lista saía com o mesmo produto 2-4 vezes
+    # em tamanhos diferentes — 10 linhas viravam 3-6 produtos.
+    # Efeito colateral bom: `extrair_produtos_de_tool_results` indexa por
+    # `int(id_produto)` com last-write-wins; com 1 linha por produto o cache do
+    # card passa a ser determinístico. A RPC (0013) já deduplica, isto é a rede de
+    # segurança para o caso da RPC antiga estar no ar.
     vistos = set()
     selecao = []
-    for p in validados[:10]:
-        chave = p.get('id_unico')
+    for p in validados:
+        chave = str(p.get('id_produto') or '').strip()
         if chave and chave not in vistos:
             vistos.add(chave)
             selecao.append(p)
+        if len(selecao) >= LIMITE_PRODUTOS:
+            break
 
     # Sinal explícito de foto p/ o modelo: evita prometer imagem que o sistema
     # não vai enviar (card sem imagem sai só como texto — renderizar_mensagem_estruturada).
@@ -935,7 +1121,28 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         p['n_fotos'] = int(p.get('n_fotos') or 0)
         p['tem_foto'] = bool(p.get('imagem'))
 
-    print(f"[SEMÂNTICO] Retornando {len(selecao)} itens.")
+    # 4.1. Payload enxuto. Os campos internos do ranking vão para o LOG, não para o
+    # Gemini: `nome_grupo` vazaria rótulo do ERP, `similarity`/`tier`/`estoque_grade`
+    # são ruído caro (o custo de token é por chamada de tool, em todo turno de busca).
+    # `destaque` (booleano) carrega a mesma informação comercial e agora significa
+    # "promovido DENTRO da categoria pedida", não "pertence ao grupo do ERP".
+    for p in selecao:
+        print(f"  [RANK] tier={p.get('tier')} destaque={p.get('destaque')} "
+              f"grade={p.get('estoque_grade')} sim={p.get('similarity')} "
+              f"n_tam={p.get('n_tamanhos')} | {p.get('nome')}")
+    for p in selecao:
+        for k in ('id_loja', 'loja', 'grupo_id', 'nome_grupo', 'similarity',
+                  'tier', '_score_boost', 'estoque_grade', 'n_tamanhos'):
+            p.pop(k, None)
+        # `destaque` só existe na RPC 0013; sem ela a chave tem de existir mesmo
+        # assim, senão o modelo veria o campo em uns itens e não em outros.
+        p['destaque'] = bool(p.get('destaque'))
+
+    print(f"[SEMÂNTICO] Retornando {len(selecao)} produtos distintos "
+          f"({sum(1 for p in selecao if p['destaque'])} em destaque).")
+    # NAO acrescentar chaves novas a `evento`: ele vira insert direto em
+    # tool_filtro_eventos e uma coluna inexistente derruba o insert INTEIRO
+    # (falha silenciosa) — perderiamos a observabilidade da F2 sem aviso.
     _log_filtro_evento(status_retornado="sucesso", **evento)
     return {"status": "sucesso", "filtro_aplicado": filtro_aplicado,
             **({"aviso": aviso} if guard_acionou else {}),
@@ -2056,6 +2263,10 @@ def renderizar_mensagem_estruturada(user_id, resposta_texto, ids_recomendados, c
             wamid = enviar_mensagem_whatsapp(user_id, legenda)
         if WHATSAPP_PROVIDER == "cloud" and isinstance(wamid, str):
             registrar_card_enviado(wamid, user_id, int(pid), legenda)
+        # O cliente VIU este produto: sai das proximas buscas da conversa, para que
+        # "tem mais?" traga coisa inedita. Registrado por CARD (nao pelos 8 que a
+        # tool devolveu) — so o card chega ao cliente. Nunca levanta.
+        _registrar_mostrados(user_id, [pid])
         enviados += 1
     if ignorados:
         print(f"⚠️ ids fora do cache do turn: {ignorados}")
@@ -2308,6 +2519,23 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
             print("[HIST] insert sem id; removendo a linha atual por texto")
             history = history[:-1]
         history = _normalizar_history_para_gemini(history)
+
+        # SNAPSHOT CONGELADO dos "ja mostrados", ANTES do laco de retry: as 3
+        # tentativas tem de mandar exatamente a mesma lista de exclusoes, senao a
+        # 2a tentativa devolveria um conjunto diferente da 1a e o turno deixaria de
+        # ser idempotente. Mutacao IN-PLACE de proposito: `_snapshot_turn_ctx`
+        # entrega a MESMA referencia de lista a thread de trabalho onde as tools
+        # rodam — rebindar aqui e inofensivo (o snapshot vem depois), mas manter a
+        # referencia deixa a porta aberta para a tool escrever de volta.
+        _ja_vistos = _ids_ja_mostrados(user_id)
+        _lst_excluir = getattr(_turn_ctx, "excluir_ids", None)
+        if isinstance(_lst_excluir, list):
+            _lst_excluir[:] = _ja_vistos
+        else:
+            _turn_ctx.excluir_ids = list(_ja_vistos)
+        if _ja_vistos:
+            print(f"[EXCLUIR] {len(_ja_vistos)} produto(s) ja mostrado(s) sairao da busca: {_ja_vistos}")
+
         t_inicio = time.perf_counter()
         # Gemini as vezes trava/estoura o deadline (504), sobretudo em turns com cadeia
         # de tools (ex.: resposta-a-card -> consultar_estoque + calcular_total). Sem retry
