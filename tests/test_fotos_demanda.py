@@ -22,6 +22,8 @@ I  thread ABANDONADA: depois de `fechar()` a tool nao consegue mais agendar envi
 J  produto SEM foto -> `sem_foto`; turno que falha descarta os pedidos de foto
 J2 provider que RECUSA a midia nao marca a foto como vista (senao o cliente nunca
    receberia a foto e o bot diria 'sao todas que eu tenho')
+L  ordem real do turno (tool -> card -> sender): o card consome a foto
+   principal, o sender entrega o resto e NADA duplica
 K  `consultar_produto_por_id` nao e mais cega a foto, o cache nao grava
    `imagem: None`, a busca declara `n_fotos`, e a tool de fotos NAO entra no cache
    de cards (senao o card sairia duplicado)
@@ -425,9 +427,50 @@ def teste_k():
        bot.extrair_produtos_de_tool_results(hist2) == {})
 
 
+# --------------------------------------------------------------------------- L
+def teste_l():
+    """Ordem REAL dentro de um turno: tool -> render(card) -> sender.
+
+    A tool roda durante a chamada ao Gemini, o card so e renderizado depois e o
+    sender por ultimo. Se o modelo recomendar o MESMO produto e pedir fotos no
+    mesmo turno, o card consome a foto principal e o sender entrega uma a menos do
+    que a tool prometeu. O invariante que importa (NUNCA duplicar) continua valendo
+    — este teste existe para pinar isso e para que qualquer mudanca futura apareca.
+    """
+    print("\n### L. mesmo turno: card + fotos extras (tool -> render -> sender)")
+    uid = "t_fotos_l"
+    reset(uid)
+    fotos = bot._fotos_do_produto(PID_5)
+    p = bot._FotosPendentes()
+    r = bot.criar_tool_mostrar_fotos(uid, p)(PID_5)          # 1o: a tool
+    ok("L1 tool promete 4 (nada visto ainda)", r["vai_enviar"] == 4, r["vai_enviar"])
+    bot.renderizar_mensagem_estruturada(                      # 2o: o card
+        uid, "olha essa", [int(PID_5)],
+        {int(PID_5): {"nome": "X", "preco": 25.0, "imagem": fotos[0]}})
+    n = bot._enviar_fotos_extras_pendentes(uid, p)            # 3o: o sender
+    ok("L2 sender entrega 4 (2..5), o card levou a 1a", n == 4, f"n={n}")
+    ok("L3 5 midias, 5 URLs DISTINTAS — nenhuma duplicata",
+       len(_midias) == 5 and len(set(urls())) == 5, f"{len(_midias)}/{len(set(urls()))}")
+    ok("L4 o cliente viu TODAS as 5 fotos", set(urls()) == set(fotos))
+    # o mesmo com produto de 1 foto: o card leva a unica, o sender manda 0
+    reset("t_fotos_l2")
+    f1 = bot._fotos_do_produto(PID_1)
+    p2 = bot._FotosPendentes()
+    r2 = bot.criar_tool_mostrar_fotos("t_fotos_l2", p2)(PID_1)
+    bot.renderizar_mensagem_estruturada(
+        "t_fotos_l2", "olha", [int(PID_1)],
+        {int(PID_1): {"nome": "Y", "preco": 45.0, "imagem": f1[0]}})
+    n2 = bot._enviar_fotos_extras_pendentes("t_fotos_l2", p2)
+    ok("L5 1 foto: tool prometeu 1 mas o card ja a levou -> sender manda 0",
+       r2["vai_enviar"] == 1 and n2 == 0, f"promessa={r2['vai_enviar']} enviadas={n2}")
+    ok("L6 e a msg da tool ja mandava o modelo NAO falar em angulos",
+       "UMA foto" in r2["msg"], r2["msg"][:44])
+    ok("L7 sem duplicata: 1 midia so", len(_midias) == 1 and urls() == [f1[0]])
+
+
 _UIDS = ["t_fotos_b", "t_fotos_c", "t_fotos_d", "t_fotos_e", "t_fotos_e2",
          "t_fotos_f", "t_fotos_g", "t_fotos_h", "t_fotos_i", "t_fotos_j",
-         "t_fotos_j2"]
+         "t_fotos_j2", "t_fotos_l", "t_fotos_l2"]
 
 
 def _cleanup():
@@ -448,7 +491,7 @@ def main():
           f"FOTOS_MAX_POR_TURNO={bot.FOTOS_MAX_POR_TURNO} TTL={bot.FOTOS_TTL_SEG}s")
     try:
         for fn in (teste_a, teste_b, teste_c, teste_d, teste_e,
-                   teste_f, teste_g, teste_h, teste_i, teste_j, teste_j2, teste_k):
+                   teste_f, teste_g, teste_h, teste_i, teste_j, teste_j2, teste_k, teste_l):
             try:
                 fn()
             except Exception as e:
