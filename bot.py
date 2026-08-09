@@ -2188,6 +2188,11 @@ def health():
         "sync_last_ok": sync_erp.LAST_RUN_OK,
         "sync_last_info": sync_erp.LAST_RUN_INFO,
         "threshold_min": tol,
+        # ALARME: >0 persistente em repouso = buffer orfao, o vazamento voltou.
+        "buffers_pendentes": len(message_buffers),
+        # CONTADOR cumulativo de clientes distintos atendidos desde o boot — so
+        # cresce, NAO e alarme (um lock por user_id, criado on-demand).
+        "turnos_conhecidos_desde_boot": len(_user_turn_locks),
     }
     return jsonify(body), (200 if healthy else 503)
 
