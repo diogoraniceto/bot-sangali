@@ -42,15 +42,24 @@ session.headers.update(HEADERS)
 # a thread do scheduler e o sync para de rodar (foi a causa do estoque parar em 03/07).
 REQUEST_TIMEOUT = int(os.getenv("SYNC_HTTP_TIMEOUT", "30"))
 
+# Teto de CHAMADAS de embedding gastas por ciclo no reparo de linhas com vetor
+# NULL (nao conta linhas: o embedding_cache abaixo serve as repetidas de graca).
+# 293 textos distintos cobrem as 979 linhas nulas com estoque, entao 300 cura a
+# base em UM ciclo (~6,3 min extras, dentro do misfire_grace_time=600).
+# Se o ciclo passar a demorar demais, baixe por env — sem redeploy.
+REEMBED_MAX_POR_CICLO = int(os.getenv("SYNC_REEMBED_MAX", "300"))
+
 # Cache de embeddings em memória (por execução)
 embedding_cache = {}
 
 # Heartbeat do sync: atualizado a cada execucao concluida (mesmo com 0 mudancas).
 # E o sinal real de "o sync rodou" — diferente de last_sync na tabela, que so muda
 # quando um produto muda. Lido pelo /health e pelo watchdog de alerta (bot.py).
-LAST_RUN_AT = None    # datetime UTC da ultima execucao
-LAST_RUN_OK = None    # bool: ultima execucao terminou sem abortar
-LAST_RUN_INFO = ""    # resumo curto (contadores)
+LAST_RUN_AT = None       # datetime UTC da ultima execucao
+LAST_RUN_OK = None       # bool: ultima execucao terminou sem abortar E sem degradar
+LAST_RUN_INFO = ""       # resumo curto (contadores)
+LAST_RUN_EMB_NULOS = None  # int: linhas com embedding NULL no INICIO do ultimo ciclo
+LAST_RUN_REEMBEDS = None   # int: linhas que o ultimo ciclo reparou (vetor regravado)
 
 
 def get_embedding(text):
@@ -217,8 +226,36 @@ def carregar_estado_atual_do_banco():
     return estado
 
 
+def carregar_ids_sem_embedding():
+    """Set de id_unico cujo `embedding` esta NULL. Consulta SEPARADA de proposito.
+
+    Trazer a coluna `embedding` dentro de carregar_estado_atual_do_banco() seriam
+    ~65 MB de texto trafegados a cada ciclo so para descobrir um booleano. Aqui o
+    payload e so a PK das linhas nulas.
+    """
+    ids = set()
+    offset = 0
+    PAGE_SIZE = 1000
+    while True:
+        resp = supabase_client.table("produtos_estoque") \
+            .select("id_unico") \
+            .is_("embedding", "null") \
+            .order("id_unico") \
+            .range(offset, offset + PAGE_SIZE - 1) \
+            .execute()
+        if not resp.data:
+            break
+        for row in resp.data:
+            ids.add(row["id_unico"])
+        if len(resp.data) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return ids
+
+
 def sync_otimizado():
     global LAST_RUN_AT, LAST_RUN_OK, LAST_RUN_INFO
+    global LAST_RUN_EMB_NULOS, LAST_RUN_REEMBEDS
     t_inicio = time.perf_counter()
 
     total_processados = 0
@@ -226,6 +263,10 @@ def sync_otimizado():
     total_embeddings_gerados = 0
     total_skipped = 0
     total_zerados = 0
+    total_reembeds = 0            # linhas que receberam vetor pelo ramo de reparo
+    total_reembed_chamadas = 0    # chamadas de API gastas nesse reparo (o que o cap limita)
+    ciclo_ok = True               # vira False se alguma etapa degradar o ciclo
+    paginas_incompletas = False   # alguma pagina do ERP falhou -> nao da para zerar nada
 
     # 1) Busca lojas disponíveis
     lojas = get_lojas()
@@ -237,7 +278,9 @@ def sync_otimizado():
     # 2) Carrega estado do banco
     t0 = time.perf_counter()
     estado_banco = carregar_estado_atual_do_banco()
+    ids_sem_embedding = carregar_ids_sem_embedding()
     t_banco = time.perf_counter() - t0
+    log.info(f"[EMB] {len(ids_sem_embedding)} linhas sem vetor no inicio do ciclo")
 
     ids_vindos_do_erp = set()
     t_api_total = 0
@@ -268,6 +311,7 @@ def sync_otimizado():
 
                 if response.status_code != 200:
                     log.error(f"API status {response.status_code} | Loja {loja_nome}")
+                    paginas_incompletas = True   # ver GUARD da zeragem no passo 4
                     break
 
                 dados_erp = response.json().get('data', [])
@@ -377,6 +421,31 @@ def sync_otimizado():
                             total_embeddings_gerados += 1
                             batch_upsert.append(reg)
 
+                        elif id_unico in ids_sem_embedding:
+                            # RE-EMBED: a linha existe, o nome NAO mudou e o vetor
+                            # esta NULL. Duas origens: (1) um lote heterogeneo antigo
+                            # apagou; (2) get_embedding() falhou no insert e ninguem
+                            # nunca voltou. Sem este ramo a linha fica invisivel para
+                            # a RPC PARA SEMPRE — a comparacao abaixo so olha
+                            # estoque/preco/grupo, e o `else` a manda para skipped.
+                            # Tem de ficar DEPOIS dos ramos que ja re-embedam (novo e
+                            # renomeado) e ANTES da comparacao de estoque/preco.
+                            _txt = texto_embedding_produto(base_nome)
+                            # O cap protege contra rajada de CHAMADAS, nao de linhas:
+                            # 979 linhas nulas com estoque = 293 textos distintos, e o
+                            # embedding_cache atende as outras 686 de graca. Contar
+                            # linhas faria a cura levar 7 ciclos em vez de 1.
+                            if _txt and (_txt in embedding_cache or total_reembed_chamadas < REEMBED_MAX_POR_CICLO):
+                                if _txt not in embedding_cache:
+                                    total_reembed_chamadas += 1
+                                t0 = time.perf_counter()
+                                vetor = get_embedding(_txt)
+                                t_embed_total += time.perf_counter() - t0
+                                if vetor:
+                                    reg["embedding"] = vetor
+                                    total_reembeds += 1
+                            batch_upsert.append(reg)
+
                         elif (existente["estoque"] != reg["estoque"] or
                               existente["preco"] != reg["preco"] or
                               existente["preco_varejo"] != reg["preco_varejo"] or
@@ -407,6 +476,7 @@ def sync_otimizado():
 
             except Exception as e:
                 log.error(f"Erro página {pagina} loja {loja_nome}: {e}")
+                paginas_incompletas = True   # ver GUARD da zeragem no passo 4
                 break
 
         log.info(f"✅ Loja {loja_nome}: {loja_processados} produtos processados")
@@ -417,7 +487,12 @@ def sync_otimizado():
         if estado_banco[id_u]["estoque"] > 0
     ]
 
-    if ids_para_zerar:
+    # GUARD: "sumiu do ERP" so e conclusao valida se TODAS as paginas do ERP
+    # vieram. Com uma pagina falhando, os produtos dela nao entram em
+    # ids_vindos_do_erp e o codigo antigo zerava, EM SILENCIO, centenas de linhas
+    # boas. Trade-off aceito: um ciclo com pagina falhando deixa o estoque
+    # otimista por ~10 min; o dano oposto e muito maior.
+    if ids_para_zerar and not paginas_incompletas:
         t0 = time.perf_counter()
         for i in range(0, len(ids_para_zerar), 200):
             lote = ids_para_zerar[i:i + 200]
@@ -426,16 +501,30 @@ def sync_otimizado():
             ).execute()
         t_upsert_total += time.perf_counter() - t0
         total_zerados = len(ids_para_zerar)
+    elif ids_para_zerar:
+        log.error(f"[GUARD] {len(ids_para_zerar)} ids seriam zerados mas alguma pagina "
+                  f"do ERP falhou — zeragem ABORTADA neste ciclo")
+        ciclo_ok = False
+    elif paginas_incompletas:
+        # Nada a zerar, mas o ciclo NAO viu o ERP inteiro: o estoque desta rodada
+        # e parcial. LAST_RUN_OK=False leva isso ao /health e ao watchdog.
+        log.error("[GUARD] alguma pagina do ERP falhou — ciclo parcial")
+        ciclo_ok = False
 
     # 5) Log final com tempos
     t_total = time.perf_counter() - t_inicio
-    LAST_RUN_AT = datetime.now(timezone.utc); LAST_RUN_OK = True
-    LAST_RUN_INFO = f"upserts:{total_upserts} skipped:{total_skipped} zerados:{total_zerados}"
+    LAST_RUN_AT = datetime.now(timezone.utc); LAST_RUN_OK = ciclo_ok
+    LAST_RUN_EMB_NULOS = len(ids_sem_embedding)
+    LAST_RUN_REEMBEDS = total_reembeds
+    LAST_RUN_INFO = (f"upserts:{total_upserts} skipped:{total_skipped} zerados:{total_zerados} "
+                     f"emb_nulos_inicio:{LAST_RUN_EMB_NULOS} reembeds:{total_reembeds}")
     log.info(
-        f"SYNC OK | {t_total:.1f}s total | "
+        f"SYNC {'OK' if ciclo_ok else 'DEGRADADO'} | {t_total:.1f}s total | "
         f"lojas:{len(lojas)} banco:{t_banco:.1f}s api:{t_api_total:.1f}s embed:{t_embed_total:.1f}s upsert:{t_upsert_total:.1f}s | "
         f"processados:{total_processados} upserts:{total_upserts} "
-        f"embeds_novos:{total_embeddings_gerados} skipped:{total_skipped} zerados:{total_zerados}"
+        f"embeds_novos:{total_embeddings_gerados} skipped:{total_skipped} zerados:{total_zerados} "
+        f"emb_nulos_inicio:{LAST_RUN_EMB_NULOS} reembeds:{total_reembeds} "
+        f"reembed_chamadas:{total_reembed_chamadas}/{REEMBED_MAX_POR_CICLO}"
     )
 
 
