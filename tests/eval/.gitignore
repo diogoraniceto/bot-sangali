@@ -1,0 +1,4 @@
+# artefatos de execucao do harness (nao versionar)
+_*.log
+eval_results_*.csv
+__pycache__/
