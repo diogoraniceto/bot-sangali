@@ -84,6 +84,29 @@ RATE_LIMIT_WINDOW_SEC = 60
 RATE_LIMIT_MAX_MSGS = 10
 _rate_limit_history = {}
 
+# ---------------- FOTOS SOB DEMANDA (F3) ----------------
+# Kill switch: com FOTOS_SOB_DEMANDA=0 a tool sai da function declaration e o
+# sender vira no-op — rollback sem redeploy. `n_fotos`/ordem determinística
+# continuam valendo (são inofensivos e corrigem o card).
+FOTOS_SOB_DEMANDA = (os.getenv("FOTOS_SOB_DEMANDA", "1") != "0")
+# Teto de fotos extras por PEDIDO (= por produto, = por turno: um produto por turno).
+# Default 4 por dado: cobre INTEGRALMENTE 191 dos 208 produtos com 2+ fotos e
+# estoque; os 17 restantes (6-10 fotos) paginam pedindo de novo. Trocar o teto é
+# variável de ambiente, NÃO código — a decisão comercial (§10.3 item 7) segue aberta.
+FOTOS_MAX_POR_PEDIDO = max(1, int(os.getenv("FOTOS_MAX_POR_PEDIDO", "4")))
+# Um produto por turno: se PRODUTO e TURNO divergissem, a tool prometeria 4+4 e o
+# sender entregaria 4+2 — a tool tem de prometer exatamente o que o sender manda.
+FOTOS_MAX_POR_TURNO = FOTOS_MAX_POR_PEDIDO
+FOTOS_SLEEP_SEG = float(os.getenv("FOTOS_SLEEP_SEG", "0.8"))
+FOTOS_TTL_SEG = float(os.getenv("FOTOS_TTL_SEG", str(6 * 3600)))
+FOTOS_MAX_USERS_REGISTRY = 500
+# Registro de fotos JÁ ENVIADAS (memória do PROCESSO — exige replicas=1, Gate 0.1).
+# {user_id: {pid(str): {url: ts_envio}}}, com LRU por user_id e TTL por URL.
+# É a guarda de idempotência de último nível: mesmo que o sender rode duas vezes,
+# a URL já marcada não sai de novo. Restart zera (pior caso: 1 foto repetida).
+_fotos_vistas = collections.OrderedDict()
+_fotos_vistas_lock = threading.Lock()
+
 
 def _get_user_lock(user_id):
     """Lock CURTO do buffer (só mutação de `message_buffers`) para este user_id.
@@ -524,6 +547,129 @@ def _log_filtro_evento(**campos):
     except Exception as e:
         print(f"[tool_filtro_eventos] insert falhou: {str(e)[:160]}")
 
+
+# ================= FOTOS SOB DEMANDA (F3) =================
+# O catálogo tem 220 produtos com 2+ fotos (até 10), mas o bot só sabia mandar UMA
+# — e sem `.order`, uma qualquer. Aqui nasce a fonte única: `_fotos_do_produto`
+# (ordem determinística) + `_fotos_novas` (o que este cliente ainda não recebeu).
+
+
+def _fotos_pid(pid):
+    """Normaliza o id do produto para a chave canônica de string.
+
+    O MESMO cast tem de valer no registro e na leitura: gravar com `int` e ler com
+    `str` (ou vice-versa) faz `_fotos_ja_vistas` voltar sempre vazia, e aí a tool
+    promete N fotos e o sender manda N-1 (produto de 1 foto prometeria 1 e mandaria
+    0). O Gemini manda `54557957.0`, o banco guarda `'54557957'`. Levanta em lixo.
+    """
+    return str(int(float(pid)))
+
+
+def _fotos_do_produto(pid):
+    """URLs das fotos do produto, em ordem DETERMINÍSTICA (id ASC). [] em erro.
+
+    Por que `id ASC` é a ordem do ERP: `sync_images.py` faz UM insert em lote na
+    ordem do array `fotos` vindo do GestaoClick, então o id autoincrement preserva
+    essa ordem. `created_at` é idêntico em todas as rows do produto (insert em
+    lote) — é inútil para ordenar. Validado olhando 10 produtos amostrados: em
+    10/10 a foto de menor id é a foto de FRENTE/apresentação.
+
+    ATENÇÃO: o VALOR do id não pode ser persistido em lugar nenhum como chave —
+    `sync_images.py` faz DELETE+INSERT a cada sync e os ids mudam. Ordenar por
+    id é estável; guardar id de foto não é. Por isso o registro de "já vistas"
+    é chaveado por URL.
+
+    `imagem_url or imagem_mini_url` (nunca as duas): `mini_` é a MESMA foto em
+    baixa resolução — 843/843 rows têm mini diferente da full e nenhum mini nulo,
+    então mandar as duas duplicaria cada foto.
+    """
+    try:
+        pid = _fotos_pid(pid)
+    except (TypeError, ValueError):
+        return []
+    try:
+        r = (supabase.table("produtos_imagens")
+             .select("id, imagem_url, imagem_mini_url")
+             .eq("produto_id", pid)
+             .order("id", desc=False)
+             .execute())
+        rows = r.data or []
+    except Exception as e:
+        print(f"[fotos] leitura de produtos_imagens falhou pid={pid}: {str(e)[:140]}")
+        return []
+    # Cuidado de tipo: produtos_imagens.produto_id é BIGINT e produtos_estoque.id_produto
+    # é TEXT. Via PostgREST passar string funciona (o cast é do lado do servidor);
+    # nunca escrever SQL cru juntando as duas colunas sem `::text`.
+    fotos = []
+    for row in rows:
+        url = row.get("imagem_url") or row.get("imagem_mini_url")
+        if url and url not in fotos:      # dedupe defensivo: não há UNIQUE na tabela
+            fotos.append(url)
+    return fotos
+
+
+def _fotos_registry_do_user(user_id):
+    """Sub-dicionário {pid: {url: ts}} do user, aplicando LRU. Chamar sob o lock."""
+    reg = _fotos_vistas.get(user_id)
+    if reg is None:
+        reg = {}
+        _fotos_vistas[user_id] = reg
+    _fotos_vistas.move_to_end(user_id)
+    while len(_fotos_vistas) > FOTOS_MAX_USERS_REGISTRY:
+        _fotos_vistas.popitem(last=False)      # descarta o cliente mais antigo
+    return reg
+
+
+def _fotos_ja_vistas(user_id, pid):
+    """URLs deste produto que ESTE cliente já recebeu na janela de TTL."""
+    try:
+        pid = _fotos_pid(pid)
+    except (TypeError, ValueError):
+        return []
+    agora = time.time()
+    with _fotos_vistas_lock:
+        reg = _fotos_registry_do_user(user_id)
+        por_url = reg.get(pid) or {}
+        vivas = [u for u, ts in por_url.items() if (agora - ts) <= FOTOS_TTL_SEG]
+        # expira o que passou do TTL (o cliente volta dias depois e pode rever)
+        if len(vivas) != len(por_url):
+            reg[pid] = {u: por_url[u] for u in vivas}
+        return vivas
+
+
+def _marcar_fotos_vistas(user_id, pid, urls):
+    """Registra que estas URLs JÁ FORAM ENVIADAS a este cliente.
+
+    Chamado (a) no render do card, para a foto principal, e (b) no sender, DEPOIS
+    de cada envio bem-sucedido. Marcar depois do envio é de propósito: se a Meta
+    recusar a mídia, a foto continua "nova" e sai no próximo pedido.
+    """
+    try:
+        pid = _fotos_pid(pid)
+    except (TypeError, ValueError):
+        return
+    agora = time.time()
+    with _fotos_vistas_lock:
+        reg = _fotos_registry_do_user(user_id)
+        por_url = reg.setdefault(pid, {})
+        for u in urls or []:
+            if u:
+                por_url[u] = agora
+
+
+def _fotos_novas(user_id, pid):
+    """FONTE ÚNICA da tool e do sender: (fotos, vistas, novas).
+
+    A tool só ANUNCIA (read-only) e o sender ENVIA — os dois têm de concordar sobre
+    o número, senão a Luna promete uma coisa e o cliente recebe outra. Por isso a
+    conta vive aqui, e não duplicada nos dois lugares.
+    """
+    fotos = _fotos_do_produto(pid)
+    vistas = set(_fotos_ja_vistas(user_id, pid))
+    novas = [u for u in fotos if u not in vistas]
+    return fotos, sorted(vistas), novas
+
+
 # ================= NOVA FERRAMENTA DE BUSCA (SUPABASE) =================
 
 # Valores que o modelo escreve quando quer dizer "sem tamanho". Nenhum deles existe
@@ -561,6 +707,9 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         que pode ser COMPOSTO ('P/M', 'G/GG') ou acentuado ('ÚNICO') e ainda assim
         atender ao tamanho pedido — leia o campo do item; não diga que a peça é do
         tamanho X. Pode vir também `aviso`: instrução interna, nunca repita ao cliente.
+        Cada item traz ainda `tem_foto` (o card sai com imagem) e `n_fotos` (quantas
+        fotos existem no total). `n_fotos` maior que 1 significa que há OUTROS ÂNGULOS
+        além do card — se o cliente pedir mais fotos, chame `mostrar_fotos_produto`.
     """
     print(f"\n[SEMÂNTICO] Buscando: '{termo_cliente}' | Tamanho recebido: {tamanho} | Loja: {id_loja}")
 
@@ -656,28 +805,40 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         except Exception as e:
             print(f"⚠️ Erro no Hybrid Boosting: {e}")
 
-        # 2.2. BUSCA DE IMAGENS (NOVO)
-        # Para cada produto candidato, buscar a imagem associada
+        # 2.2. BUSCA DE IMAGENS — TODAS as fotos, em ordem determinística
+        # `.order("id")` é obrigatório: sem ele o PostgREST devolve as rows em ordem
+        # física (não garantida) e a foto do card mudava de execução para execução.
+        # Com id ASC a foto principal é sempre a primeira do ERP (validado em 10
+        # produtos: 10/10 a de menor id é a de frente). `n_fotos` diz ao modelo
+        # quantos ângulos existem, para ele poder oferecer `mostrar_fotos_produto`.
         ids_candidatos = [p['id_produto'] for p in produtos_candidatos]
         if ids_candidatos:
             try:
-                # Busca imagens onde produto_id está na lista de candidatos
-                # Traz apenas 1 imagem por produto por enquanto (ou todas e a gente filtra)
-                # O ideal seria um dicionário {id_produto: url}
-                res_imgs = supabase.table("produtos_imagens").select("produto_id, imagem_url, imagem_mini_url").in_("produto_id", ids_candidatos).execute()
-                mapa_imagens = {}
-                for img in res_imgs.data:
-                    pid = str(img['produto_id']) # Force string key
-                    # Prioriza imagem original, depois mini. E apenas a primeira encontrada para cada produto
-                    if pid not in mapa_imagens:
-                        mapa_imagens[pid] = img.get('imagem_url') or img.get('imagem_mini_url')
-                
-                # Anexa a imagem ao objeto do produto
+                res_imgs = (supabase.table("produtos_imagens")
+                            .select("produto_id, imagem_url, imagem_mini_url")
+                            .in_("produto_id", ids_candidatos)
+                            .order("id", desc=False)
+                            .execute())
+                mapa_fotos = {}
+                for img in res_imgs.data or []:
+                    pid = str(img['produto_id'])   # chave string: id_produto é TEXT
+                    url = img.get('imagem_url') or img.get('imagem_mini_url')
+                    if not url:
+                        continue
+                    lista = mapa_fotos.setdefault(pid, [])
+                    if url not in lista:           # dedupe (não há UNIQUE na tabela)
+                        lista.append(url)
+
                 for p in produtos_candidatos:
-                    p['imagem'] = mapa_imagens.get(str(p['id_produto'])) # Force string lookup
+                    fotos = mapa_fotos.get(str(p['id_produto'])) or []
+                    p['imagem'] = fotos[0] if fotos else None
+                    p['n_fotos'] = len(fotos)
+                    # A LISTA de URLs NÃO entra no payload do modelo: custo de token
+                    # e o §0 do prompt proíbe URL na resposta. O sender relê fresco.
             except Exception as e:
                 print(f"⚠️ Erro ao buscar imagens: {e}")
-        
+
+
         for i, p in enumerate(produtos_candidatos):
             print(f"  {i+1}. {p.get('nome')} | T:{p.get('tamanho')} | R$ {p.get('preco')}")
     except Exception as e:
@@ -768,7 +929,10 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
 
     # Sinal explícito de foto p/ o modelo: evita prometer imagem que o sistema
     # não vai enviar (card sem imagem sai só como texto — renderizar_mensagem_estruturada).
+    # `n_fotos` é normalizado AQUI (fora do try da busca de imagens) para que uma
+    # falha na leitura de produtos_imagens não deixe a chave ausente no payload.
     for p in selecao:
+        p['n_fotos'] = int(p.get('n_fotos') or 0)
         p['tem_foto'] = bool(p.get('imagem'))
 
     print(f"[SEMÂNTICO] Retornando {len(selecao)} itens.")
@@ -792,7 +956,11 @@ def consultar_produto_por_id(id_produto: int):
         id_produto: o id numérico do produto (campo id_produto da tabela produtos_estoque).
 
     Returns:
-        {status, produto: {id_produto, nome, nome_grupo, variacoes: [{id_unico, tamanho, preco_varejo, preco_atacado, estoque, loja}]}}
+        {status, produto: {id_produto, nome, nome_grupo, imagem, tem_foto, n_fotos,
+         variacoes: [{id_unico, tamanho, preco_varejo, preco_atacado, estoque, loja}]}}
+        `tem_foto` diz se o card sai com imagem; `n_fotos` é o total de fotos do
+        produto. `n_fotos` maior que 1 significa que há OUTROS ÂNGULOS além do card —
+        se o cliente pedir mais fotos, chame `mostrar_fotos_produto`.
     """
     # Gemini eventualmente passa id_produto como float (54557957.0). Cast para int
     # antes de virar string para evitar mismatch com '54557957' no banco.
@@ -829,12 +997,20 @@ def consultar_produto_por_id(id_produto: int):
         }
         for r in rows
     ]
+    # Esta tool era CEGA a foto: o produto revalidado por id voltava sem `imagem`,
+    # o cache gravava None e o card do mesmo produto saía como texto puro — o
+    # cliente "perdia" a foto que já tinha visto. Uma query extra indexada
+    # (idx_produtos_imagens_produto_id), no máximo 10 rows.
+    fotos = _fotos_do_produto(id_produto_normalizado)
     return {
         "status": "sucesso",
         "produto": {
             "id_produto": base["id_produto"],
             "nome": base.get("nome"),
             "nome_grupo": base.get("nome_grupo"),
+            "imagem": fotos[0] if fotos else None,
+            "tem_foto": bool(fotos),
+            "n_fotos": len(fotos),
             "variacoes": variacoes,
         },
     }
@@ -1448,7 +1624,10 @@ def extrair_produtos_de_tool_results(chat_history):
                     "preco": primeira.get('preco_varejo'),
                     "preco_varejo": primeira.get('preco_varejo'),
                     "preco_atacado": primeira.get('preco_atacado'),
-                    "imagem": None,
+                    # Era None fixo — e por isso o card de um produto revalidado por
+                    # id saía SEM foto. Agora `consultar_produto_por_id` devolve
+                    # `imagem` (F3) e o cache a repassa.
+                    "imagem": produto.get('imagem'),
                     "tamanho": primeira.get('tamanho'),
                     "id_unico": primeira.get('id_unico'),
                 }
@@ -1598,6 +1777,9 @@ def renderizar_mensagem_estruturada(user_id, resposta_texto, ids_recomendados, c
         if url:
             time.sleep(1.0)
             wamid = enviar_midia_whatsapp(user_id, url, legenda)
+            # A foto do card conta como JÁ VISTA: sem isto o pedido de "mais fotos"
+            # reenviaria exatamente a imagem que o cliente acabou de receber.
+            _marcar_fotos_vistas(user_id, pid, [url])
         else:
             time.sleep(0.5)
             wamid = enviar_mensagem_whatsapp(user_id, legenda)
