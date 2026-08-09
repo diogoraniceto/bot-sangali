@@ -138,6 +138,22 @@ O teto de tempo do turno (`TURNO_ORCAMENTO_S=150`) protege o **bot**, não o har
 
 ---
 
+## 3.9 Regra genérica no prompt não muda comportamento; instrução DINÂMICA no `function_response` muda
+
+Medido na F6 (09/08), decisão (b) do dono — *"a Luna avisa que a peça 'P/M' serve nos dois"*:
+
+| Onde a regra estava | Resultado medido |
+|---|---|
+| §6 do prompt ("tamanho composto → diga que serve nos dois") | **falhou** |
+| `filtro_aplicado.observacao_tamanho`, texto **estático** em todo payload | **falhou** |
+| `filtro_aplicado.instrucao_tamanho_composto`, **dinâmica e nomeando as peças** | **3/3 passou** |
+
+A resposta real com as duas primeiras: *"opções sem costura no M"* — o item `P/M` recomendado e o composto nunca mencionado. Com a terceira: *"a Calcinha Sem Costura Fio e a Calcinha Alta Fio são P/M e servem nos dois tamanhos 💕"*, nas três repetições.
+
+**A lição operacional:** instrução que vale para *toda* chamada vira ruído de fundo; o modelo a trata como preâmbulo. Instrução que aparece **só quando o caso ocorre** e que **nomeia os itens concretos** entra no `function_response` — o trecho mais recente do contexto — e é obedecida. Bônus: custo de token zero quando o caso não ocorre (as 38 linhas compostas do catálogo contra 6.739 no total).
+
+**Aplicar este padrão** antes de escrever mais parágrafo no prompt: se a regra depende de uma condição que o código sabe detectar, a regra pertence ao payload, não ao prompt.
+
 ## 4. Pendências desta política — NÃO ESQUECER
 
 Levantadas junto com este documento e ainda **não implementadas**:
@@ -154,9 +170,15 @@ Hoje o harness usa a **mesma chave da produção** (confirmado: mesmo `sha256`).
 
 Implementar: o harness lê `GEMINI_API_KEY_TEST` e, quando existir, sobrescreve `GEMINI_API_KEY` no ambiente **antes de importar `bot`** (o `genai.configure` acontece no import). Fallback para a chave atual quando a variável não existir, para não quebrar quem não tem a segunda chave.
 
-### 4.3 Encolher o system prompt — avaliar junto da F6
+### 4.3 Encolher o system prompt — AGORA MAIOR, não menor (medido em 09/08)
 
-7.460 tokens em toda chamada, ~60% de cada requisição. Enxugar tem efeito permanente em produção e em teste. **Não fazer isoladamente**: muda comportamento do bot e a F6 (deploy único de prompt) já está pendente de 4 decisões do dono.
+Era 7.460 tokens (24.265 chars). A F6 **subiu para ~8.806** (28.619 chars): **+1.340 tokens, +17,9%**, pagos em *toda* chamada de tool — e o `automatic function calling` reenvia o contexto inteiro a cada round-trip.
+
+Foi uma escolha consciente, não um descuido: o texto novo é o que ativa as F1–F5 (selo `destaque`, `filtro_aplicado`, tamanho composto, tool de fotos, variedade). Prompt menor com as frentes desligadas é economia falsa. Mas a dívida ficou **maior**, e por isso o alvo agora está identificado:
+
+**`medo_fraude` é explicado em QUATRO lugares** — §9 ESTRATÉGIA 3, §10.6 (roteiro de 4 passos), §15 caso 4 (linha da tabela) e §15.1 (protocolo detalhado). São ~2.400 chars (~740 tokens) descrevendo o mesmo comportamento. Consolidar em §15.1 com ponteiros nos outros três derruba de volta quase todo o crescimento da F6.
+
+**Por que não foi feito neste deploy:** violaria a regra §1 desta política — duas mudanças na mesma janela e não se sabe qual causou o delta na eval. Consolidar `medo_fraude` é mexer em comportamento (o roteiro de fraude tem cenário próprio na suíte), então merece a sua própria rodada de gate, com o baseline da F6 já estabelecido como referência.
 
 ### 4.4 `google.generativeai` está descontinuado
 

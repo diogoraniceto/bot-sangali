@@ -110,7 +110,24 @@ chama `LIMP +`). Hoje são 0 nulos ali, mas se ficarem, ninguém repara.
 **Depende da decisão §10.3 item 9** do plano: propagar o nome novo, excluir a loja
 do sync, ou zerar o estoque.
 
-### c) Janela do próprio backfill
+### c) O teste que guarda a camada 1 **não roda hoje**
+
+`tests/test_sync_upsert_homogeneo.py` é o que reproduz o bug que apagou 1.203 vetores
+(lote heterogêneo → `?columns=` → NULL). Ele depende de uma tabela de apoio,
+`public._test_emb_upsert`, que **não existe mais** no banco:
+
+```
+[X] tabela de apoio '_test_emb_upsert' inacessivel:
+    relation "public._test_emb_upsert" does not exist (42P01)
+```
+
+Ou seja: a regra dura da camada 1 está escrita, o código a respeita, mas a rede de
+proteção está **desligada** — uma regressão em `lotes_homogeneos` passaria sem alarme.
+Recriar exige DDL (Management API ou SQL Editor); o DDL está no docstring do próprio
+arquivo. **Enquanto não for recriada, tratar `lotes_homogeneos` como código sem
+teste** e reler o diff à mão em qualquer mudança no `upsert` do sync.
+
+### d) Janela do próprio backfill
 
 Enquanto o re-embed roda, **produção está com o código antigo** — que ainda apaga
 vetores em lote heterogêneo. Risco baixo (os ciclos recentes mostram

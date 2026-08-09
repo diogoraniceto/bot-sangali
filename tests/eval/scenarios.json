@@ -183,7 +183,7 @@
     "id": "foto-unica-esgotou-angulos",
     "dimension": "foto",
     "origin": "frente3",
-    "description": "F3: produto com UMA foto so (id literal 63252641, o bucket de 216 produtos do catalogo). Ao pedir mais fotos a Luna nao pode inventar 'outros angulos' nem prometer imagem que nao existe; tem de admitir que e a unica que tem. Nao assertar handoff: o motivo pedido_foto so existe depois da F6.",
+    "description": "F3: produto com UMA foto so (id literal 63252641, o bucket de 216 produtos do catalogo). Ao pedir mais fotos a Luna nao pode inventar 'outros angulos' nem prometer imagem que nao existe. DEPOIS DA F6: o status `sem_novas` tem destino definido — transferir com motivo `pedido_foto` (§15 caso 5) e mandar a frase aprovada pelo dono, que NAO promete foto nova.",
     "messages": [
       "boa tarde, queria ver um baby doll tamanho M",
       "[o cliente respondeu ao card do produto id_produto=63252641 (citacao: \"*BABY DOLL AYLA 895* - R$ 45,00 _cod: 63252641_\"). Use EXATAMENTE id_produto=63252641 para este item em calcular_total / produtos_recomendados / resumo; nao re-derive o id pelo nome.] me manda mais fotos desse baby doll, quero ver de outro angulo",
@@ -212,6 +212,12 @@
         "checkType": "no_price_in_free_text",
         "expect": "Preco so na legenda do card.",
         "params": "{}",
+        "severity": "media"
+      },
+      {
+        "checkType": "handoff_triggered",
+        "expect": "Esgotadas as fotos e o cliente insistindo, a Luna transfere com motivo pedido_foto (a atendente le 'QUER MAIS FOTOS').",
+        "params": "{\"motivo\": \"pedido_foto\"}",
         "severity": "media"
       }
     ]
@@ -659,7 +665,7 @@
     "id": "tamanho-composto-pm-aparece-para-m",
     "dimension": "tamanho",
     "origin": "frente2",
-    "description": "Tamanho COMPOSTO: 20 linhas 'P/M' (149 un.) e 18 'G/GG' (227 un.) com estoque eram invisiveis para a busca por igualdade exata. Depois do overlap de tokens a peca 'P/M' aparece numa busca por M — fisicamente correto. O card nao imprime tamanho nesta rodada (backlog B2), entao o risco novo e a Luna AFIRMAR que a peca e 'M'. FALHA CONHECIDA E ESPERADA ATE A F6: com o prompt de hoje a Luna diz 'separei no tamanho M' incluindo a peca 'P/M'. O lado de CODIGO desta frente esta completo (a peca aparece, que era o defeito); a linguagem correta ('essa e P/M, serve nos dois') e P6.2 do plano e depende da decisao travada em §10.2 item 1. Por isso o assert de `nao_nega_estoque_sem_base` esta como `media` NESTE cenario — volta a `grave` no deploy do prompt (o default em SEVERITY ja e grave).",
+    "description": "Tamanho COMPOSTO: 20 linhas 'P/M' (149 un.) e 18 'G/GG' (227 un.) com estoque eram invisiveis para a busca por igualdade exata. Depois do overlap de tokens a peca 'P/M' aparece numa busca por M. O card nao imprime tamanho (backlog B2), entao quem avisa e a Luna. DEPOIS DA F6 (decisao (b) do dono, 09/08): o prompt manda dizer 'essa e P/M, serve nos dois' e o assert de nao_nega_estoque_sem_base voltou a GRAVE — era 'media' so enquanto o prompt nao tinha a regra.",
     "messages": [
       "boa tarde, tem calcinha sem costura no M?"
     ],
@@ -672,9 +678,8 @@
       },
       {
         "checkType": "nao_nega_estoque_sem_base",
-        "expect": "A Luna nao pode negar estoque em M. Afirmar que um item 'P/M' e do tamanho M e violacao do criterio (3) e so o prompt da F6 corrige — por isso `media` ate o P6.2.",
-        "params": "{}",
-        "severity": "media"
+        "expect": "A Luna nao pode negar estoque em M NEM afirmar que um item 'P/M' e do tamanho M: com o P6.2 no ar ela tem de dizer que a peca e P/M e serve nos dois.",
+        "params": "{}"
       },
       {
         "checkType": "sent_at_least_one_message",

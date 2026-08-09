@@ -332,12 +332,48 @@ def check_no_price_in_free_text(tc, params):
     return "pass", "apenas mencao do minimo/politica de atacado (permitido)"
 
 
+def _nomes_da_categoria_na_busca(tc, key_norm):
+    """Nomes que a busca devolveu neste cenario e casam com a categoria pedida.
+
+    None quando nenhum digest de busca pode ser lido (o `result_digest` e truncado
+    em 4.000 chars). ACHAR item e evidencia confiavel; NAO achar nao e, porque a
+    truncagem pode ter cortado o resto da lista. Por isso quem chama so REPROVA com
+    evidencia positiva — na duvida passa ou pula.
+    """
+    achou_digest = False
+    nomes = []
+    for r in tc["responses"]:
+        if r["name"] not in SEARCH_TOOLS:
+            continue
+        digest = r.get("result_digest") or ""
+        if not digest:
+            continue
+        achou_digest = True
+        for m in re.finditer(r'"nome"\s*:\s*"([^"]{3,120})"', digest):
+            nome = m.group(1)
+            if key_norm and key_norm in _norm(nome):
+                nomes.append(nome)
+    return nomes if achou_digest else None
+
+
 def check_recommended_only_in_category(tc, params):
     cat = params.get("categoria", "")
     ids = tc["produtos_recomendados"]
-    if not ids:
-        return "pass", "produtos_recomendados vazio"
     key = _norm(cat)
+    if not ids:
+        # Lista vazia NAO e passe automatico. O §4 do prompt permite `[]` so quando
+        # nao havia item da categoria para oferecer; se a busca TROUXE item da
+        # categoria e o modelo nao recomendou nenhum, isso e VENDA PERDIDA.
+        # Era o buraco que tornava a curadoria infalsificavel: ficar calado passava.
+        # Importa agora porque a F6 apertou a curadoria ("na duvida deixe FORA") —
+        # o modo de falha novo e exatamente recomendar nada.
+        disponiveis = _nomes_da_categoria_na_busca(tc, key)
+        if disponiveis is None:
+            return "skipped", "lista vazia e nenhum digest de busca legivel"
+        if disponiveis:
+            return ("fail", f"nao recomendou nada, mas a busca trouxe "
+                            f"{len(disponiveis)} de '{cat}': {disponiveis[:3]}")
+        return "pass", f"lista vazia e a busca nao trouxe item de '{cat}'"
     resolved = 0
     fora = []
     for pid in ids:
@@ -387,8 +423,22 @@ def check_calcular_total_uses_ids(tc, params):
 
 
 def check_handoff_triggered(tc, params):
-    called = any(c["name"] == "transferir_para_atendente" for c in tc["calls"])
-    return ("pass" if called else "fail"), f"calls={[c['name'] for c in tc['calls']]}"
+    """Houve handoff. Com `params={"motivo": "X"}` exige TAMBEM que o motivo seja X.
+
+    Sem o motivo o check e passe fraco: qualquer transferencia (fechamento_venda,
+    pedido_humano...) satisfazia um cenario que existe para provar um motivo
+    especifico. `params` vazio mantem o contrato antigo dos 2 cenarios que ja usam.
+    """
+    chamadas = [c for c in tc["calls"] if c["name"] == "transferir_para_atendente"]
+    if not chamadas:
+        return "fail", f"calls={[c['name'] for c in tc['calls']]}"
+    esperado = (params or {}).get("motivo")
+    if not esperado:
+        return "pass", f"calls={[c['name'] for c in tc['calls']]}"
+    motivos = [str((c.get("args") or {}).get("motivo") or "") for c in chamadas]
+    if esperado in motivos:
+        return "pass", f"motivo={esperado}"
+    return "fail", f"esperava motivo={esperado}, veio {motivos}"
 
 
 def _buscas_com_tamanho(tc):
@@ -672,9 +722,10 @@ SEVERITY = {
     "min_computed_over_atacado": "grave",
     "stays_on_requested_category": "media",
     "handoff_triggered": "media",
-    # F5: `leve` de proposito ate o P6.1 (Frente 6) mandar o modelo preferir
-    # `destaque: true`. Antes do prompt, um fail aqui mede o prompt antigo.
-    "destaque_preferido": "leve",
+    # F5: era `leve` enquanto o prompt nao mandava preferir `destaque: true` — um
+    # fail media o prompt antigo, nao o ranking. O P6.1 (F6, deploy de 09/08) passou
+    # a mandar, entao o check agora mede o que diz medir.
+    "destaque_preferido": "media",
     "tone_appropriate": "leve",
     # F2: os dois sao GRAVES — falso "nao tenho" e afirmacao sobre tamanho sem base
     # sao exatamente o defeito P3 (cliente desiste da compra).

@@ -476,6 +476,30 @@ def _em_silencio_pos_handoff(user_id):
     return delta < timedelta(minutes=HANDOFF_SILENCIO_MIN)
 
 
+def _avisar_cliente(user_id, texto):
+    """Manda uma mensagem AVULSA ao cliente, respeitando o silencio pos-handoff.
+
+    Existe porque a checagem de silencio vivia SO dentro de `_executar_turno`, e os
+    avisos de fallback nao passam por lá: `_processar_midia_async` responde antes de
+    enfileirar (audio ilegivel / foto que nao abre) e o `except` de
+    `process_and_respond` pede para reenviar. Resultado: a cliente estava com a
+    atendente humana, mandava um audio que nao transcrevia, e o bot "em silencio"
+    respondia por cima do atendimento — exatamente o que a decisao 3 do dono proibe.
+
+    NAO usar para a mensagem do operador nem para os alarmes: aqueles TEM de sair
+    durante o handoff (é a atendente/o time que lê, não a cliente).
+    """
+    try:
+        if _em_silencio_pos_handoff(user_id):
+            print(f"⏸️ [silencio] aviso ao cliente suprimido (handoff ativo) | {user_id}")
+            return None
+    except Exception as e:
+        # Falha ao consultar handoff nao pode engolir o aviso: sem aviso a cliente
+        # fica sem resposta nenhuma. Degrada para "manda" (comportamento antigo).
+        print(f"[silencio] falha ao checar handoff ({e}) — enviando aviso")
+    return enviar_mensagem_whatsapp(user_id, texto)
+
+
 # ================= AUXILIARES DE INTELIGÊNCIA =================
 
 def get_embedding(text):
@@ -1138,6 +1162,24 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         # assim, senão o modelo veria o campo em uns itens e não em outros.
         p['destaque'] = bool(p.get('destaque'))
 
+    # Decisao (b) do dono (09/08): quando a peca e COMPOSTA, a Luna tem de avisar que
+    # serve nos dois. A regra generica de `observacao_tamanho` e a do prompt NAO
+    # bastaram — medido no gate: a tool devolveu dois itens 'P/M' e a resposta saiu
+    # "opcoes sem costura no M", sem citar o composto. Entao a instrucao passa a ser
+    # DINAMICA e a NOMEAR as pecas, e so aparece quando ha item composto na selecao
+    # (38 linhas do catalogo) — custo de token zero no resto das buscas.
+    # Fica DEPOIS do strip: le `selecao` ja no formato final que o modelo recebe.
+    compostos = [p for p in selecao if "/" in (p.get("tamanho") or "")]
+    if compostos:
+        quais = "; ".join(f"{(p.get('nome') or '?')[:40]} = {p.get('tamanho')}"
+                          for p in compostos[:3])
+        filtro_aplicado["instrucao_tamanho_composto"] = (
+            f"{len(compostos)} item(ns) desta lista tem tamanho COMPOSTO ({quais}). "
+            "Se recomendar um deles, DIGA ao cliente, em resposta_texto, que a peca e "
+            "daquele tamanho composto e que serve nos dois (ex.: 'essa e P/M, serve nos "
+            "dois'). NAO diga que a lista toda e de um tamanho unico so.")
+        print(f"[TAMANHO] {len(compostos)} item(ns) composto(s) na selecao — instrucao dinamica enviada")
+
     print(f"[SEMÂNTICO] Retornando {len(selecao)} produtos distintos "
           f"({sum(1 for p in selecao if p['destaque'])} em destaque).")
     # NAO acrescentar chaves novas a `evento`: ele vira insert direto em
@@ -1623,12 +1665,25 @@ def calcular_frete_estimado(
 
 # ================= HANDOFF PARA ATENDENTE HUMANO =================
 
+# Quem le esta mensagem no WhatsApp e a atendente, nao o time tecnico: slug
+# ("pedido_foto") nao e linguagem de atendimento. O slug cru continua gravado em
+# conversation_handoffs.motivo — aqui e so a apresentacao. Motivo novo/desconhecido
+# cai no proprio slug, entao esquecer de mapear degrada, nao quebra.
+_MOTIVO_LABEL = {
+    "pedido_humano": "Cliente pediu para falar com uma pessoa",
+    "fechamento_venda": "Fechamento de venda — confirmar cor/variação",
+    "confusao_repetida": "Cliente confuso ou irritado",
+    "medo_fraude": "Desconfiança / quer videochamada",
+    "pedido_foto": "Cliente QUER MAIS FOTOS da peça (já recebeu todas as que temos)",
+}
+
+
 def _montar_mensagem_operador(user_id, motivo, resumo, produtos_interesse):
     linhas = [
         "🔔 Transferência — Sangali Bot",
         "",
         f"Cliente: {user_id}",
-        f"Motivo: {motivo}",
+        f"Motivo: {_MOTIVO_LABEL.get(motivo, motivo)}",
     ]
     if produtos_interesse:
         linhas.append(f"Produtos de interesse: {produtos_interesse}")
@@ -1659,11 +1714,14 @@ def criar_tool_transferir(user_id):
         (2) a venda estiver quase fechando e for necessário confirmar uma variação
             que o bot não tem (ex: cor);
         (3) o cliente demonstrar irritação clara ou houver confusão repetida
-            (2 ou mais mal-entendidos seguidos).
+            (2 ou mais mal-entendidos seguidos);
+        (4) o cliente desconfiar que a loja é fraude ou pedir videochamada;
+        (5) o cliente já recebeu TODAS as fotos que existem da peça
+            (`mostrar_fotos_produto` devolveu `sem_novas`) e ainda quer ver mais.
 
         Args:
             motivo: curto e categórico. Ex: "fechamento_venda", "pedido_humano",
-                    "confusao_repetida".
+                    "confusao_repetida", "medo_fraude", "pedido_foto".
             resumo: 2 a 4 frases descrevendo o que aconteceu na conversa e o que
                     o atendente precisa saber para continuar.
             produtos_interesse: nomes/códigos dos produtos mencionados, separados
@@ -2409,7 +2467,10 @@ def process_and_respond(user_id):
             # drenado, então não há mais o "retry acidental" que o vazamento dava).
             traceback.print_exc()
             try:
-                enviar_mensagem_whatsapp(user_id, "Ops, tive um probleminha tecnico aqui 😅 Pode reenviar sua ultima mensagem, por favor?")
+                # `_avisar_cliente` e nao `enviar_...`: save_message roda ANTES da
+                # checagem de silencio, entao uma falha de banco ali cairia aqui e
+                # falaria por cima da atendente humana.
+                _avisar_cliente(user_id, "Ops, tive um probleminha tecnico aqui 😅 Pode reenviar sua ultima mensagem, por favor?")
             except Exception:
                 pass
             try:
@@ -3029,17 +3090,31 @@ def _processar_midia_async(numero, tipo, media_id, caption, ctx_id):
     como texto no pipeline (mesmo molde do reply-to-card). Roda em THREAD para o webhook
     responder 200 rapido (evita reentrega da Meta). Falha -> pede texto ao cliente."""
     try:
+        # Silencio pos-handoff ANTES de baixar/transcrever. Duas razoes:
+        # 1) a decisao 3 do dono manda DESCARTAR a mensagem mas PERSISTIR para a
+        #    atendente ler — este caminho nunca chega ao save_message de
+        #    `_executar_turno`, entao ele grava o marcador aqui;
+        # 2) transcrever_audio/descrever_imagem sao chamadas MULTIMODAIS do Gemini:
+        #    fazer o download e a transcricao para depois jogar fora queimava quota
+        #    a cada midia recebida durante o handoff (e a chave ja estourou o teto).
+        if _em_silencio_pos_handoff(numero):
+            try:
+                save_message(numero, "user", f"[cliente enviou {tipo} durante o atendimento humano]")
+            except Exception as e_save:
+                print(f"[cloud] marcador de midia no handoff falhou: {e_save}")
+            print(f"⏸️ Handoff ativo para {numero} — {tipo} registrado, sem resposta e sem Gemini.")
+            return
         b, mime = _cloud_baixar_midia(media_id)
         if tipo == "audio":
             txt = transcrever_audio(b, mime) if b else None
             if not txt:
-                enviar_mensagem_whatsapp(numero, "Não consegui ouvir seu áudio 😅 me escreve o que você precisa?")
+                _avisar_cliente(numero, "Não consegui ouvir seu áudio 😅 me escreve o que você precisa?")
                 return
             raw_text = f"[transcrição de áudio do cliente:] {txt}"
         else:  # image
             desc = descrever_imagem(b, mime, caption) if b else None
             if not desc:
-                enviar_mensagem_whatsapp(numero, "Recebi sua foto mas não consegui abrir 😅 me manda o código da peça ou descreve pra mim?")
+                _avisar_cliente(numero, "Recebi sua foto mas não consegui abrir 😅 me manda o código da peça ou descreve pra mim?")
                 return
             raw_text = f"[o cliente enviou uma foto que parece: {desc}]"
             if caption:
