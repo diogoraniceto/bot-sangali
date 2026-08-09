@@ -1,6 +1,7 @@
 import os
 import requests
 import logging
+from collections import defaultdict
 from supabase import create_client
 import time
 from datetime import datetime, timezone
@@ -151,6 +152,26 @@ def _extrair_precos(valores_list, valor_venda_base):
     return out
 
 
+def lotes_homogeneos(batch):
+    """Quebra um lote de registros em sub-lotes com EXATAMENTE o mesmo conjunto de chaves.
+
+    O postgrest-py monta `?columns=<UNIAO das chaves do lote>` num upsert de lista.
+    Num lote heterogeneo, o registro que NAO traz 'embedding' e gravado com NULL
+    nessa coluna (o default da coluna e NULL, logo `Prefer: missing=default`
+    tambem nao salva o valor antigo — ja testado). Foi assim que 1.203 vetores
+    foram apagados. Agrupar por conjunto de chaves resolve a CLASSE do bug.
+    NUNCA volte a fazer um upsert unico com shapes diferentes.
+
+    Ordem: os sub-lotes saem na ordem da PRIMEIRA aparicao de cada shape, e dentro
+    de cada sub-lote a ordem original e preservada — o mesmo id_unico repetido no
+    mesmo shape continua sendo aplicado na ordem em que entrou.
+    """
+    grupos = defaultdict(list)
+    for _reg in (batch or []):
+        grupos[frozenset(_reg.keys())].append(_reg)
+    return list(grupos.values())
+
+
 def carregar_estado_atual_do_banco():
     """Carrega todos os registros do banco: id_unico -> {nome, estoque, preço, id_loja}."""
     estado = {}
@@ -158,8 +179,15 @@ def carregar_estado_atual_do_banco():
     PAGE_SIZE = 1000
 
     while True:
+        # .order("id_unico") e OBRIGATORIO: sem ORDER BY explicito o Postgres nao
+        # garante a mesma ordem entre as paginas do .range(), e uma linha pulada
+        # some do `estado`. Linha ausente do estado e tratada como registro NOVO
+        # (ramo `existente is None`), leva get_embedding() e entra no lote COM a
+        # chave 'embedding' — ou seja, a paginacao instavel FABRICA o portador que
+        # apagava o vetor das outras linhas da mesma pagina.
         resp = supabase_client.table("produtos_estoque") \
             .select("id_unico, nome, estoque, preco, preco_varejo, preco_varejo_avista, preco_atacado, preco_atacado_aprazo, id_loja, grupo_id, nome_grupo") \
+            .order("id_unico") \
             .range(offset, offset + PAGE_SIZE - 1) \
             .execute()
 
@@ -361,10 +389,13 @@ def sync_otimizado():
                     total_processados += 1
                     loja_processados += 1
 
-                # Upsert em lote
+                # Upsert em lote — SEMPRE por shape homogeneo (ver lotes_homogeneos).
+                # Os dois dict literais de registro acima tem chaves identicas; a
+                # unica condicional e 'embedding', logo aqui saem 1 ou 2 sub-lotes.
                 if batch_upsert:
                     t0 = time.perf_counter()
-                    supabase_client.table("produtos_estoque").upsert(batch_upsert).execute()
+                    for _lote in lotes_homogeneos(batch_upsert):
+                        supabase_client.table("produtos_estoque").upsert(_lote).execute()
                     t_upsert_total += time.perf_counter() - t0
                     total_upserts += len(batch_upsert)
 

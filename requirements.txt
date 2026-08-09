@@ -1,7 +1,19 @@
-flask
-python-dotenv
-google-generativeai
-google-api-core
-supabase
-requests
-apscheduler
+# Pins obrigatorios. O bug de "upsert apaga embedding" e o fix (lote homogeneo)
+# dependem do comportamento exato do postgrest-py, que monta ?columns=<UNIAO das
+# chaves do lote>. Sem pin, um build futuro pode trocar esse comportamento sem
+# aviso e o fix de sync_erp.py vira no-op silencioso (ou o bug volta).
+# Versoes conferidas no venv local em 08/08/2026 (Python 3.11.9, runtime.txt).
+flask==3.1.3
+python-dotenv==1.2.2
+google-generativeai==0.8.6
+google-api-core==2.33.0
+supabase==2.31.0
+requests==2.34.2
+apscheduler==3.11.3
+
+# Transitivas, mas load-bearing: e aqui que vive o ?columns= do upsert.
+# supabase==2.31.0 ja exige postgrest==2.31.0 e httpx>=0.26,<0.29 — os pins
+# abaixo sao explicitos so para que a versao usada na prova (tests/
+# test_sync_upsert_homogeneo.py) esteja declarada no repo.
+postgrest==2.31.0
+httpx==0.28.1
