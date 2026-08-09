@@ -7,6 +7,7 @@ import collections
 import requests
 import time
 import threading
+import traceback
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -71,6 +72,8 @@ _message_buffers_global_lock = threading.Lock()  # protege escrita no dict globa
 # atacado no card (modo_preco) mesmo quando o modelo esquece de setar o campo.
 _atacado_users = set()
 _user_locks = {}  # threading.Lock() por user_id (criado on-demand)
+_user_turn_locks = {}  # threading.Lock() por user_id: serializa o TURNO INTEIRO
+                       # (segurado por dezenas de segundos — nunca na thread do webhook)
 
 # Última mensagem do user por user_id, usada para validar tamanho contra LLM drift.
 # Quando LLM passa um tamanho diferente do que o user disse, forçamos o do user.
@@ -87,13 +90,59 @@ _rate_limit_history = {}
 
 
 def _get_user_lock(user_id):
-    """Retorna o Lock dedicado a este user_id (cria se não existir)."""
+    """Lock CURTO do buffer (só mutação de `message_buffers`) para este user_id.
+
+    Adquirido pela thread do webhook Flask — PROIBIDO segurar por I/O.
+    Para serializar o turno inteiro use `_get_turn_lock`.
+    """
     with _message_buffers_global_lock:
         lock = _user_locks.get(user_id)
         if lock is None:
             lock = threading.Lock()
             _user_locks[user_id] = lock
         return lock
+
+
+def _get_turn_lock(user_id):
+    """Lock do TURNO deste user_id (cria se não existir).
+
+    NUNCA adquirir na thread do webhook Flask: é segurado por dezenas de segundos
+    (Gemini + tools) e estouraria o timeout da Meta, causando reentrega.
+    ORDEM DE AQUISIÇÃO: turn_lock -> buffer_lock; nunca o inverso.
+    """
+    with _message_buffers_global_lock:
+        lock = _user_turn_locks.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            _user_turn_locks[user_id] = lock
+        return lock
+
+
+# Contexto do turno NA THREAD atual (cada turno roda na sua Timer thread).
+# Substitui os globais de módulo, que vazavam o contexto de um cliente para outro.
+_turn_ctx = threading.local()
+
+
+def _set_turn_ctx(user_id, texto):
+    _turn_ctx.user_id = user_id
+    _turn_ctx.last_msg = texto
+    _turn_ctx.excluir_ids = []
+
+
+def _clear_turn_ctx():
+    _turn_ctx.user_id = None
+    _turn_ctx.last_msg = None
+    _turn_ctx.excluir_ids = []
+
+
+def _ctx_last_msg():
+    """Última mensagem do cliente NESTE turno. None fora de um turno."""
+    return getattr(_turn_ctx, "last_msg", None)
+
+
+def _ctx_user_id():
+    """user_id do turno corrente nesta thread. None fora de um turno."""
+    return getattr(_turn_ctx, "user_id", None)
 
 
 def _check_rate_limit(user_id):
@@ -1318,16 +1367,70 @@ def _erro_ia_transitorio(e):
 
 
 def process_and_respond(user_id):
+    """Serializa o turno deste cliente e drena o buffer ANTES de executá-lo.
+
+    Ordem: adquire turn_lock -> pop do buffer (sob buffer_lock) -> executa.
+    Bloquear ANTES de drenar é de propósito: o turno B fica esperando com o buffer
+    ainda cheio, então a msg3 que chegar entra no MESMO buffer e B a drena junto.
+    Drenar antes de bloquear geraria duas respostas separadas.
+    """
     global _consultar_estoque_active_user_id
-    buffer = message_buffers.get(user_id)
-    if not buffer: return
-    texto_completo = buffer['text']
-    print(f"DEBUG INPUT: '{texto_completo}'")
+    turn_lock = _get_turn_lock(user_id)
+    buf_lock = _get_user_lock(user_id)      # resolve AMBOS antes de adquirir qualquer um
+    t0 = time.perf_counter()
+    with turn_lock:
+        espera_ms = int((time.perf_counter() - t0) * 1000)
+        with buf_lock:
+            buffer = message_buffers.pop(user_id, None)
+        if buffer is None:                  # 'is None': dict drenado e sempre truthy
+            print(f"[TURNO] {user_id}: buffer vazio (ja coalescido por outro turno)")
+            return
+        tmr = buffer.get("timer")
+        if tmr is not None:
+            try:
+                tmr.cancel()
+            except Exception:
+                pass
+        texto_completo = (buffer.get("text") or "")
+        if not texto_completo.strip():
+            print(f"[TURNO] {user_id}: texto vazio — ignorando")
+            return
+        print(f"[TURNO] {user_id}: espera_lock={espera_ms}ms | chars={len(texto_completo)}")
+        print(f"DEBUG INPUT: '{texto_completo}'")
+        _set_turn_ctx(user_id, texto_completo)
+        # Contexto do turno usado por tools (defesa B4 em consultar_estoque).
+        # C1.1 MANTEM os globais para o guard continuar idêntico; C1.2 os remove.
+        _user_last_msg[user_id] = texto_completo
+        _consultar_estoque_active_user_id = user_id
+        fotos_pendentes = []                # F3 usa; aqui fica vazio e inerte
+        turno_ok = False
+        try:
+            _executar_turno(user_id, texto_completo, fotos_pendentes)
+            turno_ok = True
+        except Exception as e:
+            # save_message roda DENTRO de _executar_turno; sem este try uma falha de
+            # rede ali descartaria a mensagem do cliente em silêncio (o buffer já foi
+            # drenado, então não há mais o "retry acidental" que o vazamento dava).
+            traceback.print_exc()
+            try:
+                enviar_mensagem_whatsapp(user_id, "Ops, tive um probleminha tecnico aqui 😅 Pode reenviar sua ultima mensagem, por favor?")
+            except Exception:
+                pass
+            try:
+                log_turn(user_id, texto_completo, [], "", 0, "", "error", True, error=str(e))
+            except Exception:
+                pass
+        finally:
+            _clear_turn_ctx()
+        return turno_ok
 
-    # Define contexto do turno usado por tools (defesa B4 em consultar_estoque)
-    _user_last_msg[user_id] = texto_completo
-    _consultar_estoque_active_user_id = user_id
 
+def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
+    """Corpo do turno: config -> Gemini (tools) -> render -> log.
+
+    NÃO mexe em buffer nem em lock; assume turno já serializado por
+    `process_and_respond` e contexto de thread já setado.
+    """
     save_message(user_id, "user", texto_completo)
 
     try:
@@ -1487,10 +1590,6 @@ def process_and_respond(user_id):
         except Exception:
             pass
 
-    # Cleanup protegido pelo lock (evita race com novo webhook chegando no fim do turn)
-    user_lock = _get_user_lock(user_id)
-    with user_lock:
-        message_buffers.pop(user_id, None)
 
 def _cloud_send(payload):
     """POST na WhatsApp Cloud API (Graph). Retorna o wamid (str) ou None. Levanta em erro HTTP."""
@@ -1845,6 +1944,9 @@ def _enqueue_user_message(user_id, raw_text):
             if existing_timer:
                 existing_timer.cancel()
         t = threading.Timer(10.0, process_and_respond, args=[user_id])
+        # daemon: um Timer de 10s pendente penduraria qualquer processo de teste
+        # que chame _enqueue_user_message (T0/T1) ate o timer disparar.
+        t.daemon = True
         message_buffers[user_id]["timer"] = t
         t.start()
     return True
