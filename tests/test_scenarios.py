@@ -770,6 +770,10 @@ def main():
                 try:
                     bot.supabase.table("chat_history").delete().eq("user_id", uid).execute()
                     bot.supabase.table("bot_turns").delete().eq("user_id", uid).execute()
+                    # F2: esta suite tambem escreve em tool_filtro_eventos (1 linha por
+                    # chamada da tool de busca). Sem isto a metrica do filtro de tamanho
+                    # mistura trafego de teste com trafego de cliente.
+                    bot.supabase.table("tool_filtro_eventos").delete().eq("user_id", uid).execute()
                 except Exception as e:
                     print(f"  cleanup erro user={uid}: {e}")
 
