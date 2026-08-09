@@ -564,6 +564,57 @@ def check_min_computed_over_atacado(tc, params):
     return _judge(rubrica, tc["cliente_hist"], _all_bot_text(tc), fatos)
 
 
+def check_destaque_preferido(tc, params):
+    """Frente 5: o campeao de venda DA CATEGORIA chegou ao cliente?
+
+    Existe porque A5/A6 de `tests/test_ranking_comercial.py` medem a fronteira da
+    TOOL — com a suite verde, o defeito que o dono da loja reclamou (o mais vendido
+    nao aparece) continuaria de pe se o modelo descartasse o item marcado. Este
+    check olha o CARD: se a lista da tool trouxe algum item `destaque: true` cujo
+    nome casa com a categoria pedida, um deles tem de estar em
+    `produtos_recomendados`.
+
+    Le o `result_digest`, que e truncado em 4.000 chars — por isso 'skipped'
+    (nunca 'fail') quando nao da para ler nem um par nome/destaque.
+
+    SEVERIDADE: hoje `leve`. O prompt em producao ainda NAO manda preferir
+    `destaque` — essa frase entra no P6.1 (Frente 6). Subir para `media` depois do
+    deploy do prompt; antes disso um 'fail' aqui mede o prompt antigo, nao o
+    ranking.
+    """
+    cat = _norm(params.get("categoria", ""))
+    marcados = []
+    for r in tc["responses"]:
+        if r["name"] not in SEARCH_TOOLS:
+            continue
+        digest = r.get("result_digest") or ""
+        # cada produto sai como {"id_unico": ..., "id_produto": "N", "nome": "X",
+        # ..., "destaque": true/false}. Casa o bloco de um produto por vez.
+        for m in re.finditer(
+                r'"id_produto"\s*:\s*"?(\d+)"?(.{0,400}?)"destaque"\s*:\s*(true|false)',
+                digest, re.DOTALL):
+            pid, meio, dest = int(m.group(1)), m.group(2), m.group(3)
+            if dest != "true":
+                continue
+            mn = re.search(r'"nome"\s*:\s*"([^"]+)"', meio)
+            nome = mn.group(1) if mn else ""
+            if cat and cat in _norm(nome):
+                marcados.append((pid, nome))
+    if not marcados:
+        return "skipped", f"nenhum item destaque=true da categoria '{cat}' legivel no digest"
+    ids = set(tc["produtos_recomendados"])
+    if not ids:
+        # coerente com recommended_only_in_category: lista vazia nao e violacao
+        # (handoff, pedido sem estoque, pergunta que nao pede card).
+        return "skipped", "produtos_recomendados vazio"
+    escolhidos = [(p, n) for p, n in marcados if p in ids]
+    if escolhidos:
+        return "pass", f"recomendou o campeao {escolhidos[0][1]!r} (id {escolhidos[0][0]})"
+    return "fail", (f"a tool marcou {len(marcados)} campeao(oes) da categoria "
+                    f"{[n for _, n in marcados][:3]} e nenhum entrou em "
+                    f"produtos_recomendados={sorted(ids)}")
+
+
 def check_stays_on_requested_category(tc, params):
     cat = params.get("categoria", "")
     ids = tc["produtos_recomendados"]
@@ -599,6 +650,7 @@ CHECKS = {
     "nao_nega_estoque_sem_base": check_nao_nega_estoque_sem_base,
     "extra_photos_sent": check_extra_photos_sent,
     "photo_language_neutral": check_photo_language_neutral,
+    "destaque_preferido": check_destaque_preferido,
 }
 
 JUDGE_CHECKS = {
@@ -620,6 +672,9 @@ SEVERITY = {
     "min_computed_over_atacado": "grave",
     "stays_on_requested_category": "media",
     "handoff_triggered": "media",
+    # F5: `leve` de proposito ate o P6.1 (Frente 6) mandar o modelo preferir
+    # `destaque: true`. Antes do prompt, um fail aqui mede o prompt antigo.
+    "destaque_preferido": "leve",
     "tone_appropriate": "leve",
     # F2: os dois sao GRAVES — falso "nao tenho" e afirmacao sobre tamanho sem base
     # sao exatamente o defeito P3 (cliente desiste da compra).

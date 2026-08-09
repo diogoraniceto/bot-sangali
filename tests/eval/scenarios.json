@@ -731,5 +731,93 @@
         "severity": "media"
       }
     ]
+  },
+  {
+    "id": "ranking-fantasia-g-sem-vazamento",
+    "dimension": "curadoria",
+    "origin": "frente5",
+    "description": "F5: 'fantasia no G' e o caso onde o ranking comercial vazava categoria. Medido na base: 8 campeoes de venda passam a janela de cosseno e a grade minima nessa busca e TODOS os 8 sao de outra categoria (CALCINHA COS LINCE, CALCINHA COTTON 2 LACOS, TANGA VANIA, CONJUNTO MOANA, BABY DOOL DE RENDA). Com o boost antigo de +10 por nome_grupo eles subiam ao topo COM selo de mais-vendido; o escopo lexical da tier 1 barra os 8. Nenhum deles pode chegar a produtos_recomendados.",
+    "messages": [
+      "oi! queria ver uma fantasia no tamanho G"
+    ],
+    "asserts": [
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "O bot respondeu ao pedido de fantasia G.",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "recommended_only_in_category",
+        "expect": "Nenhum id recomendado e calcinha/tanga/conjunto/baby doll; lista vazia tambem passa.",
+        "params": "{\"categoria\":\"fantasia\"}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "stays_on_requested_category",
+        "expect": "Nao empurra calcinha nem conjunto como se fosse fantasia; prefere 1-2 certos a 3 com item errado.",
+        "params": "{\"categoria\":\"fantasia\"}",
+        "severity": "media"
+      },
+      {
+        "checkType": "destaque_preferido",
+        "expect": "Se a tool marcar algum campeao de venda que seja fantasia, ele entra nos recomendados. Skipped se nao houver (a base nao tem fantasia campea de venda).",
+        "params": "{\"categoria\":\"fantasia\"}",
+        "severity": "leve"
+      },
+      {
+        "checkType": "no_price_in_free_text",
+        "expect": "Preco so nos cards.",
+        "params": "{}",
+        "severity": "media"
+      }
+    ]
+  },
+  {
+    "id": "ranking-camisola-g-campeao",
+    "dimension": "curadoria",
+    "origin": "frente5",
+    "description": "F5: 'camisola no G' e o caso oposto — existe campeao de venda DA CATEGORIA alcancavel. Medido: 10CR CAMISOLA DE URDA RENDA sai em tier 1 com destaque=true e grade 32 na MATRIZ, com a ancora semantica preservando as 2 primeiras posicoes. Substitui o 'baby doll'+G do plano porque o campeao de baby doll esta cadastrado como 'BABY DOOL' (typo do ERP, 3 produtos contra 46 com 'DOLL') e a resolucao de categoria do harness normaliza o nome — daria falso-fail por erro de cadastro, nao por ranking.",
+    "messages": [
+      "boa tarde, tem camisola no G?"
+    ],
+    "asserts": [
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "O bot respondeu ao pedido de camisola G.",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "recommended_only_in_category",
+        "expect": "Todo id recomendado e camisola.",
+        "params": "{\"categoria\":\"camisola\"}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "destaque_preferido",
+        "expect": "O campeao de venda de camisola marcado com destaque=true entra em produtos_recomendados. Vira 'media' depois do P6.1.",
+        "params": "{\"categoria\":\"camisola\"}",
+        "severity": "leve"
+      },
+      {
+        "checkType": "tool_nao_retornou_vazio",
+        "expect": "A busca com tamanho G devolveu produtos (overlap G/GG da F2 preservado).",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "nao_nega_estoque_sem_base",
+        "expect": "Nao nega o G se a tool devolveu itens; nao afirma tamanho que nao esta em filtro_aplicado.",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "no_price_in_free_text",
+        "expect": "Preco so nos cards.",
+        "params": "{}",
+        "severity": "media"
+      }
+    ]
   }
 ]
