@@ -114,6 +114,46 @@ def _get_turn_lock(user_id):
         return lock
 
 
+# Blocos que o BOT injeta no texto do turno e que NÃO são fala do cliente:
+#   [o cliente respondeu ao card do produto id_produto=6743024 (citacao: "*CAMISOLA* - R$ 49,90 _cod: 6743024_")]
+#   [transcrição de áudio do cliente:] / [o cliente enviou uma foto que parece: ...]
+# A legenda citada carrega PREÇO, e a parte inteira do preço (30-69) casa com o
+# regex de tamanho numérico de `_tamanhos_validos_na_msg` — que devolve os números
+# ANTES das letras. Resultado medido: 'R$ 49,90 ... tem no M?' -> ['49','M'], e o
+# guard forçava a busca em '49'. 46,5% das linhas com estoque têm preço nessa faixa
+# e existem tamanhos numéricos REAIS (40..54), então às vezes o preço "casava" e
+# devolvia grade errada com cara de acerto. Daí sanear ANTES de extrair tamanho.
+_RE_BLOCO_INJETADO = re.compile(r"\[[^\[\]]*\]")
+_RE_PRECO = re.compile(r"R\$\s*[\d.,]+", re.IGNORECASE)
+_RE_DECIMAL = re.compile(r"\b\d{1,6}[.,]\d+\b")
+_RE_COD = re.compile(r"\b(?:c[oó]d(?:igo)?|id_produto)\s*[:=]?\s*\d+", re.IGNORECASE)
+
+
+def _texto_cliente_puro(texto):
+    """Só o que o CLIENTE escreveu/falou, sem o que o bot injetou no texto do turno.
+
+    Remove (nesta ordem) blocos `[...]` de preâmbulo/citação, preços (`R$ 49,90` e
+    decimais soltos) e códigos de produto (`cod: 6743024`, `id_produto=6743024`).
+    É a ÚNICA fonte válida para inferir o tamanho que o cliente pediu: usar o texto
+    cru faria o guard forçar a parte inteira do preço da legenda como tamanho.
+    Preserva a transcrição de áudio e a legenda escrita pelo cliente na foto —
+    essas SÃO fala do cliente e ficam fora dos colchetes.
+    """
+    if not texto:
+        return ""
+    t = texto
+    # loop: bloco removido pode revelar outro (colchetes aninhados no preâmbulo)
+    for _ in range(4):
+        novo = _RE_BLOCO_INJETADO.sub(" ", t)
+        if novo == t:
+            break
+        t = novo
+    t = _RE_PRECO.sub(" ", t)
+    t = _RE_COD.sub(" ", t)
+    t = _RE_DECIMAL.sub(" ", t)
+    return t.strip()
+
+
 # Contexto do turno NA THREAD atual (cada turno roda na sua Timer thread).
 # Substitui os globais de módulo, que vazavam o contexto de um cliente para outro.
 _turn_ctx = threading.local()
@@ -122,18 +162,31 @@ _turn_ctx = threading.local()
 def _set_turn_ctx(user_id, texto):
     _turn_ctx.user_id = user_id
     _turn_ctx.last_msg = texto
+    _turn_ctx.msg_cliente = _texto_cliente_puro(texto)
     _turn_ctx.excluir_ids = []
 
 
 def _clear_turn_ctx():
     _turn_ctx.user_id = None
     _turn_ctx.last_msg = None
+    _turn_ctx.msg_cliente = None
     _turn_ctx.excluir_ids = []
 
 
 def _ctx_last_msg():
-    """Última mensagem do cliente NESTE turno. None fora de um turno."""
+    """Última mensagem do cliente NESTE turno, CRUA (com preâmbulo). None fora de um turno."""
     return getattr(_turn_ctx, "last_msg", None)
+
+
+def _ctx_msg_cliente():
+    """Só a fala do cliente neste turno (sem preâmbulo/legenda/preço). "" fora de um turno.
+
+    Fallback saneando `last_msg` para o caso de contexto setado por caminho antigo.
+    """
+    v = getattr(_turn_ctx, "msg_cliente", None)
+    if v is None:
+        return _texto_cliente_puro(_ctx_last_msg())
+    return v
 
 
 def _ctx_user_id():
@@ -185,17 +238,47 @@ def _tamanhos_validos_na_msg(texto):
     return encontrados
 
 
+# Espelho EXATO de public.normalize_tamanho_tokens(text) — as duas strings abaixo
+# sao copia literal do prosrc da funcao SQL (migration 0001). A RPC casa tamanho por
+# `tamanho_tokens && tokens_alvo` (overlap); o Python precisa da MESMA normalizacao,
+# senao o re-filtro local derruba o que o banco aprovou.
+# Ordem igual ao SQL: translate ANTES de upper. Sem unicodedata/NFKD de proposito.
+_TRANS_TAMANHO = str.maketrans(
+    "ÁÀÂÃÄÅÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇÑáàâãäåéèêëíìîïóòôõöúùûüçñ",
+    "AAAAAAEEEEIIIIOOOOOUUUUCNAAAAAAEEEEIIIIOOOOOUUUUCN",
+)
+_SEP_TAMANHO = re.compile(r"[\s\-/(),|]+")
+
+
+def _tokens_tamanho(txt):
+    """Tokens canonicos de um valor de tamanho. Espelha normalize_tamanho_tokens (SQL).
+
+    'G/GG' -> ['G','GG'] · 'ÚNICO' -> ['UNICO'] · '38-40' -> ['38','40'] · '' -> []
+    """
+    if not txt:
+        return []
+    norm = str(txt).translate(_TRANS_TAMANHO).upper()
+    return [t for t in (tok.strip() for tok in _SEP_TAMANHO.split(norm)) if t]
+
+
+def _tokens_tamanho_do_cliente():
+    """Tokens de tamanho que o CLIENTE escreveu neste turno. Fonte única do guard e do log.
+
+    Lê `_ctx_msg_cliente()` (sem preâmbulo/legenda/preço) — nunca o texto cru.
+    """
+    return _tamanhos_validos_na_msg(_ctx_msg_cliente())
+
+
 def _resolver_tamanho_alvo(tamanho_alvo):
     """(tamanho_efetivo, corrigido: bool). Lê o contexto do TURNO, não global de módulo.
 
     Defesa contra LLM drift (Risco B4): se o cliente disse uma letra ('G') e o
     modelo passou outra ('GG'), vale o que o cliente escreveu nesta mensagem.
-    Fora de um turno (`_ctx_last_msg()` None) o guard não inventa correção.
+    Fora de um turno (`_ctx_msg_cliente()` vazio) o guard não inventa correção.
     """
     if not tamanho_alvo:
         return None, False
-    ultimo_user = _ctx_last_msg()
-    tokens_user = _tamanhos_validos_na_msg(ultimo_user) if ultimo_user else []
+    tokens_user = _tokens_tamanho_do_cliente()
     if tokens_user and tamanho_alvo not in tokens_user:
         print(f"[GUARD] tamanho '{tamanho_alvo}' fora da msg do cliente {tokens_user} -> forcando '{tokens_user[0]}'")
         return tokens_user[0], True
