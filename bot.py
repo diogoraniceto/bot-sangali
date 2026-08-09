@@ -1738,6 +1738,13 @@ def _enviar_fotos_extras_pendentes(user_id, pendentes):
             except Exception as e:
                 print(f"[fotos] envio de {url[-16:]} falhou: {str(e)[:120]}")
                 continue
+            # No provider cloud, `None` significa que a Meta recusou a mídia. Nesse
+            # caso NÃO marcar como vista: senão o cliente nunca recebe a foto e o bot
+            # passa a achar que recebeu (e diria "são todas que eu tenho"). No uazapi
+            # a função devolve None mesmo em sucesso, então não há sinal — marca.
+            if WHATSAPP_PROVIDER == "cloud" and wamid is None:
+                print(f"[fotos] provider recusou {url[-16:]} — segue como foto NOVA")
+                continue
             # isinstance(str) é obrigatório: o stub da suíte devolve dict.
             if WHATSAPP_PROVIDER == "cloud" and isinstance(wamid, str):
                 registrar_card_enviado(wamid, user_id, int(pid), legenda)
@@ -2034,7 +2041,10 @@ def renderizar_mensagem_estruturada(user_id, resposta_texto, ids_recomendados, c
             wamid = enviar_midia_whatsapp(user_id, url, legenda)
             # A foto do card conta como JÁ VISTA: sem isto o pedido de "mais fotos"
             # reenviaria exatamente a imagem que o cliente acabou de receber.
-            _marcar_fotos_vistas(user_id, pid, [url])
+            # Exceto se o provider cloud recusou a mídia (wamid None): aí o cliente
+            # não viu nada e a foto tem de continuar candidata.
+            if not (WHATSAPP_PROVIDER == "cloud" and wamid is None):
+                _marcar_fotos_vistas(user_id, pid, [url])
         else:
             time.sleep(0.5)
             wamid = enviar_mensagem_whatsapp(user_id, legenda)

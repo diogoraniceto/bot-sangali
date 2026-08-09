@@ -20,6 +20,8 @@ H  a tool funciona DE DENTRO da thread de trabalho (`_ia_send_com_teto`) e o pid
 I  thread ABANDONADA: depois de `fechar()` a tool nao consegue mais agendar envio,
    e um segundo sender nao manda nada
 J  produto SEM foto -> `sem_foto`; turno que falha descarta os pedidos de foto
+J2 provider que RECUSA a midia nao marca a foto como vista (senao o cliente nunca
+   receberia a foto e o bot diria 'sao todas que eu tenho')
 K  `consultar_produto_por_id` nao e mais cega a foto, o cache nao grava
    `imagem: None`, a busca declara `n_fotos`, e a tool de fotos NAO entra no cache
    de cards (senao o card sairia duplicado)
@@ -321,6 +323,28 @@ def teste_i():
 
 
 # --------------------------------------------------------------------------- J
+def teste_j2():
+    print("\n### J2. provider que recusa a midia nao marca a foto como vista")
+    uid = "t_fotos_j2"
+    reset(uid)
+    prov, bot.WHATSAPP_PROVIDER = bot.WHATSAPP_PROVIDER, "cloud"
+    bot.enviar_midia_whatsapp = lambda n, u, l: None      # Meta recusou
+    try:
+        p = bot._FotosPendentes()
+        bot.criar_tool_mostrar_fotos(uid, p)(PID_5)
+        n = bot._enviar_fotos_extras_pendentes(uid, p)
+        ok("J2a nada contabilizado como enviado", n == 0, f"n={n}")
+        ok("J2b nenhuma foto marcada como vista", bot._fotos_ja_vistas(uid, PID_5) == [])
+    finally:
+        bot.enviar_midia_whatsapp = _stub_midia
+        bot.WHATSAPP_PROVIDER = prov
+    # com o provider de volta, as 4 fotos saem normalmente
+    p2 = bot._FotosPendentes()
+    r = bot.criar_tool_mostrar_fotos(uid, p2)(PID_5)
+    ok("J2c ainda promete as 4 (nada foi consumido)", r["vai_enviar"] == 4, str(r["vai_enviar"]))
+    ok("J2d agora envia", bot._enviar_fotos_extras_pendentes(uid, p2) == 4)
+
+
 def teste_j():
     print("\n### J. sem foto nenhuma + turno que falha")
     uid = "t_fotos_j"
@@ -402,7 +426,8 @@ def teste_k():
 
 
 _UIDS = ["t_fotos_b", "t_fotos_c", "t_fotos_d", "t_fotos_e", "t_fotos_e2",
-         "t_fotos_f", "t_fotos_g", "t_fotos_h", "t_fotos_i", "t_fotos_j"]
+         "t_fotos_f", "t_fotos_g", "t_fotos_h", "t_fotos_i", "t_fotos_j",
+         "t_fotos_j2"]
 
 
 def _cleanup():
@@ -423,7 +448,7 @@ def main():
           f"FOTOS_MAX_POR_TURNO={bot.FOTOS_MAX_POR_TURNO} TTL={bot.FOTOS_TTL_SEG}s")
     try:
         for fn in (teste_a, teste_b, teste_c, teste_d, teste_e,
-                   teste_f, teste_g, teste_h, teste_i, teste_j, teste_k):
+                   teste_f, teste_g, teste_h, teste_i, teste_j, teste_j2, teste_k):
             try:
                 fn()
             except Exception as e:
