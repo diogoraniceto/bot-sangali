@@ -3183,6 +3183,12 @@ SYNC_STALE_ALERT_MIN = int(os.getenv("SYNC_STALE_ALERT_MIN", "30"))
 ALERT_WHATSAPP = os.getenv("ALERT_WHATSAPP", "")   # numero sem '+', ex: 5514997767200
 ALERT_EMAIL = os.getenv("ALERT_EMAIL", "")
 _alert_state = {"alerting": False, "last_alert_at": None}
+# Limiar 20 = folga para falha transitoria de embedding. Depois que o re-embed
+# total curar a base o regime normal e 0: o ramo de re-embed do sync_erp repara
+# sozinho a cada ciclo. Ver POLITICA_DE_VETORIZACAO.md.
+EMB_NULL_ALERT_MAX = int(os.getenv("EMB_NULL_ALERT_MAX", "20"))
+_emb_alert_state = {"alerting": False, "last_alert_at": None}
+_emb_health_cache = {"at": None, "data": {}}
 
 
 def _sync_age_min():
@@ -3193,6 +3199,26 @@ def _sync_age_min():
         # Ainda nao rodou desde o boot: tolera boot + 1 ciclo antes de considerar parado.
         return (now - PROCESS_START_AT).total_seconds() / 60.0, None, SYNC_STALE_ALERT_MIN + 15
     return (now - last).total_seconds() / 60.0, last, SYNC_STALE_ALERT_MIN
+
+
+def _embeddings_health(ttl_seg=600):
+    """Metrica de embeddings nulos via RPC embeddings_health() (migration 0012).
+
+    Cache de 10 min: /health e sonda de liveness do Railway e nao pode virar uma
+    query por probe. Em erro devolve o ultimo valor conhecido e NUNCA levanta —
+    /health nao pode cair porque a metrica de qualidade de dado falhou.
+    """
+    now = datetime.now(timezone.utc)
+    at = _emb_health_cache["at"]
+    if at is not None and (now - at).total_seconds() < ttl_seg:
+        return _emb_health_cache["data"]
+    try:
+        r = supabase.rpc("embeddings_health").execute()
+        _emb_health_cache["data"] = (r.data or [{}])[0] or {}
+        _emb_health_cache["at"] = now
+    except Exception as e:
+        print(f"[EMB] health falhou (mantendo ultimo valor): {e}")
+    return _emb_health_cache["data"]
 
 
 @app.route('/health', methods=['GET'])
@@ -3211,6 +3237,14 @@ def health():
         # CONTADOR cumulativo de clientes distintos atendidos desde o boot — so
         # cresce, NAO e alarme (um lock por user_id, criado on-demand).
         "turnos_conhecidos_desde_boot": len(_user_turn_locks),
+        # ALARME: `nulos_com_estoque` > 0 = produto com estoque INVISIVEL para a
+        # busca semantica (a RPC descarta linha sem vetor). Regime normal e 0.
+        "embeddings": _embeddings_health(),
+        # Do ultimo ciclo do sync: quantas linhas nulas ele viu e quantas reparou.
+        # None ate o primeiro ciclo, e sempre None se o cron dedicado for ligado
+        # (a metrica real continua vindo de "embeddings", que independe do processo).
+        "sync_emb_nulos_inicio": sync_erp.LAST_RUN_EMB_NULOS,
+        "sync_reembeds": sync_erp.LAST_RUN_REEMBEDS,
     }
     return jsonify(body), (200 if healthy else 503)
 
@@ -3248,7 +3282,11 @@ def _verificar_sync_e_alertar():
     try:
         now = datetime.now(timezone.utc)
         age, last, tol = _sync_age_min()
-        if age > tol:
+        # Sem a 2a condicao o guard de zeragem do sync_erp nasce MUDO: um ciclo
+        # que abortou a zeragem por falha de pagina do ERP e RECENTE, nao velho,
+        # e passaria batido por um alarme que so olha idade.
+        degradado = (sync_erp.LAST_RUN_OK is False)
+        if age > tol or degradado:
             la = _alert_state["last_alert_at"]
             reenvio = la is None or (now - la).total_seconds() > 3 * 3600
             if not _alert_state["alerting"] or reenvio:
@@ -3256,6 +3294,7 @@ def _verificar_sync_e_alertar():
                     "O sync de estoque do bot Sangali parece parado.\n"
                     f"Ultima execucao: {last.isoformat() if last else 'nenhuma desde o boot'}\n"
                     f"Ha ~{int(age)} min (limite {int(tol)} min).\n"
+                    f"Ultimo ciclo terminou {'DEGRADADO' if degradado else 'ok'}: {sync_erp.LAST_RUN_INFO}\n"
                     "Verifique o servico no Railway."
                 )
                 _disparar_alerta("Sync de estoque parado", corpo)
@@ -3270,6 +3309,44 @@ def _verificar_sync_e_alertar():
             _alert_state["alerting"] = False
     except Exception as e:
         print(f"[WATCHDOG] erro: {e}")
+
+
+def _verificar_embeddings_e_alertar():
+    """Alerta quando produtos com estoque estao invisiveis para a busca semantica.
+
+    Mensagem COMERCIAL de proposito: quem le e o dono da loja, e o efeito visivel
+    e "o cliente nao encontra esses produtos", nao "a coluna embedding esta NULL".
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        h = _embeddings_health()
+        nulos = h.get("nulos_com_estoque")
+        if nulos is None:
+            return                      # metrica indisponivel: nao alarma no escuro
+        if nulos > EMB_NULL_ALERT_MAX:
+            la = _emb_alert_state["last_alert_at"]
+            reenvio = la is None or (now - la).total_seconds() > 12 * 3600
+            if not _emb_alert_state["alerting"] or reenvio:
+                corpo = (
+                    f"{nulos} produtos COM ESTOQUE nao aparecem na busca da Luna "
+                    "— o cliente pede e ela responde que nao tem.\n"
+                    f"Campeoes de venda afetados: {h.get('nulos_mais_vendidos')}\n"
+                    f"Produtos distintos: {h.get('produtos_com_nulo')} de {h.get('linhas_total')} linhas.\n"
+                    "O sync repara sozinho ate 300 por ciclo; se este numero nao cair "
+                    "em ~1h, rode: python regenerar_embeddings.py --only-missing"
+                )
+                _disparar_alerta("Produtos invisiveis na busca", corpo)
+                _emb_alert_state["alerting"] = True
+                _emb_alert_state["last_alert_at"] = now
+                print(f"[WATCHDOG] alerta de embeddings enviado (nulos_com_estoque={nulos})")
+        else:
+            if _emb_alert_state["alerting"]:
+                _disparar_alerta("Busca normalizada",
+                                 f"Os produtos voltaram a aparecer na busca (restam {nulos}).")
+                print("[WATCHDOG] embeddings normalizados")
+            _emb_alert_state["alerting"] = False
+    except Exception as e:
+        print(f"[WATCHDOG] erro no alarme de embeddings: {e}")
 
 
 if __name__ == '__main__':
@@ -3288,6 +3365,8 @@ if __name__ == '__main__':
     scheduler.add_job(_job_purge_bot_turns, 'cron', hour=7, minute=0, misfire_grace_time=3600)
     scheduler.add_job(_verificar_sync_e_alertar, 'interval', minutes=15,
                       misfire_grace_time=300, coalesce=True, max_instances=1)
+    scheduler.add_job(_verificar_embeddings_e_alertar, 'interval', minutes=60,
+                      misfire_grace_time=600, coalesce=True, max_instances=1)
     scheduler.start()
     print("Schedulers iniciados: Imagens diario 6h BRT | Purge bot_turns diario 4h BRT")
 
