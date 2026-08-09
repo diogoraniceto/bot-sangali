@@ -486,6 +486,22 @@ def log_turn(user_id, user_input, tool_calls, final_output, latency_ms, model_na
                 return
         print(f"log_turn falhou: {e}")
 
+
+def _log_filtro_evento(**campos):
+    """Insere uma linha em tool_filtro_eventos. Falha silenciosa — nunca propaga.
+
+    APPEND-ONLY e com duplicata ESPERADA: o modelo chama a tool varias vezes por
+    turno e o retry de 3 tentativas replaya as tool calls. Metrica agrupa por
+    turno, nunca conta linhas cruas. `user_id` vem do contexto da THREAD — nunca
+    de global de modulo, que vazaria o id de outro cliente.
+    """
+    campos.setdefault("user_id", _ctx_user_id())
+    campos.setdefault("tool", "consultar_estoque_supabase")
+    try:
+        supabase.table("tool_filtro_eventos").insert(campos).execute()
+    except Exception as e:
+        print(f"[tool_filtro_eventos] insert falhou: {str(e)[:160]}")
+
 # ================= NOVA FERRAMENTA DE BUSCA (SUPABASE) =================
 
 def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja: str = None):
@@ -534,9 +550,23 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     # early-return de embedding abaixo.
     id_loja_alvo = str(id_loja).strip() if id_loja not in (None, "") else None
 
+    # Base do evento de observabilidade — o mesmo dict alimenta os 4 returns, para
+    # que count(*) seja de fato "chamadas da tool" e nenhum denominador saia errado.
+    evento = {
+        "termo_cliente": termo_cliente,
+        "tamanho_llm": tamanho_llm,
+        "tamanho_user_tokens": tokens_user_log,
+        "tamanho_aplicado": tamanho_alvo,
+        "tamanho_aplicado_tokens": sorted(tokens_alvo),
+        "guard_acionou": guard_acionou,
+        "llm_omitiu_tamanho": llm_omitiu_tamanho,
+        "id_loja_aplicado": id_loja_alvo,
+    }
+
     # 1. Gera o vetor da pergunta do cliente
     vetor_busca = get_embedding(termo_cliente)
     if not vetor_busca:
+        _log_filtro_evento(status_retornado="erro_embedding", **evento)
         return {"status": "erro", "msg": "Falha na geração do vetor de busca."}
 
     # 2. Chama a RPC 'buscar_produtos_semantico' no Supabase
@@ -612,6 +642,7 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
             print(f"  {i+1}. {p.get('nome')} | T:{p.get('tamanho')} | R$ {p.get('preco')}")
     except Exception as e:
         print(f"❌ Erro RPC: {e}")
+        _log_filtro_evento(status_retornado="erro_rpc", **evento)
         return {"status": "erro", "msg": "Erro ao consultar banco de dados."}
 
     # 3. Re-filtro por OVERLAP DE TOKENS — mesma regra da RPC (0009:55,
@@ -669,7 +700,16 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
              f"o cliente escreveu nesta mensagem — se precisar de outro tamanho, PERGUNTE "
              f"ao cliente.")
 
+    evento.update({
+        "n_candidatos": len(produtos_candidatos or []),
+        "n_validados": len(validados),
+        "n_dropados_overlap": len(dropados),
+        "n_dropados_igualdade_legado": n_dropados_igualdade_legado,
+        "tamanhos_dropados": [str(t) for t in dropados if t],
+    })
+
     if not validados:
+        _log_filtro_evento(status_retornado="vazio", **evento)
         return {"status": "vazio", "filtro_aplicado": filtro_aplicado,
                 **({"aviso": aviso} if guard_acionou else {}),
                 "msg": (f"Nenhum produto com estoque para o termo buscado no tamanho "
@@ -692,6 +732,7 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         p['tem_foto'] = bool(p.get('imagem'))
 
     print(f"[SEMÂNTICO] Retornando {len(selecao)} itens.")
+    _log_filtro_evento(status_retornado="sucesso", **evento)
     return {"status": "sucesso", "filtro_aplicado": filtro_aplicado,
             **({"aviso": aviso} if guard_acionou else {}),
             "produtos": selecao}

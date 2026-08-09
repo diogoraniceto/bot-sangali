@@ -9,7 +9,8 @@ Aplicar **em ordem** via Supabase Dashboard → SQL Editor (uma de cada vez).
 3. `0003_bot_turns.sql` — tabela de logging estruturado por turno. Resolve Dimensão 7.
 4. `0004_promocoes_ativas.sql` — tabela de Dia S e similares. Resolve Risco 3.
 5. `0009_rpc_buscar_produtos_semantico_id_loja.sql` — adiciona `filtro_id_loja` na RPC. **Pré-requisito:** 0002 aplicada.
-6. `0012_embeddings_health.sql` — função `embeddings_health()`: quantas linhas estão invisíveis para a busca semântica. Consumida pelo `/health` e pelo alarme (Frente 4).
+6. `0010_tool_filtro_eventos.sql` — tabela de observabilidade do filtro de tamanho da tool de busca (Frente 2). **Aplicada.** Inclui `purge_tool_filtro_eventos(dias)` para expurgo manual (backlog B14).
+7. `0012_embeddings_health.sql` — função `embeddings_health()`: quantas linhas estão invisíveis para a busca semântica. Consumida pelo `/health` e pelo alarme (Frente 4).
 
 ## Numeração reservada (PLANO_CORRECAO_4_DEFEITOS.md §1)
 
@@ -17,7 +18,7 @@ Para não haver colisão entre as frentes em andamento:
 
 | Nº | Frente | Conteúdo |
 |---|---|---|
-| 0010 | F2 | `tool_filtro_eventos` |
+| **0010** | **F2** | **`tool_filtro_eventos` — aplicada** |
 | 0011 | F2 | drop da sobrecarga legada de 3 args de `buscar_produtos_semantico` |
 | **0012** | **F4** | **`embeddings_health()` — aplicada** |
 | 0013 | F5 | RPC de ranking comercial |

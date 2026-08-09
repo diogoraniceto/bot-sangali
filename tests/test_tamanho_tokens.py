@@ -170,13 +170,21 @@ CANDIDATOS = [
 ]
 
 
+EVENTOS = []          # tudo que _log_filtro_evento tentou gravar
+
+
 class _FakeQuery:
-    """produtos_imagens: devolve zero imagens (o teste nao depende de foto)."""
+    """produtos_imagens devolve zero imagens; tool_filtro_eventos captura o insert."""
+    def __init__(self, tabela): self.tabela = tabela
     def select(self, *a, **k): return self
     def in_(self, *a, **k): return self
     def eq(self, *a, **k): return self
     def limit(self, *a, **k): return self
     def order(self, *a, **k): return self
+    def insert(self, payload):
+        if self.tabela == "tool_filtro_eventos":
+            EVENTOS.append(payload)
+        return self
     def execute(self): return type("R", (), {"data": []})()
 
 
@@ -186,7 +194,7 @@ class _FakeSupabase:
         self.ultimos_params = params
         rows = self.rows
         return type("R", (), {"execute": lambda _s=None, _r=rows: type("X", (), {"data": [dict(r) for r in _r]})()})()
-    def table(self, *a, **k): return _FakeQuery()
+    def table(self, nome, *a, **k): return _FakeQuery(nome)
 
 
 _emb_real, _sb_real = bot.get_embedding, bot.supabase
@@ -251,6 +259,41 @@ try:
     r6 = bot.consultar_estoque_supabase("algema", "M", "220540")
     ok(r6 == {"status": "erro", "msg": "Falha na geração do vetor de busca."},
        "E6 erro de embedding preserva o contrato antigo", r6)
+    bot.get_embedding = lambda t: [0.0] * 768
+
+    print("\n### F. tool_filtro_eventos: 1 linha por chamada, nos 4 caminhos")
+    status_vistos = [e.get("status_retornado") for e in EVENTOS]
+    ok(len(EVENTOS) == 6, "F1 uma linha por chamada da tool (6 chamadas em E1-E6)",
+       (len(EVENTOS), status_vistos))
+    ok(status_vistos == ["sucesso", "sucesso", "sucesso", "vazio", "sucesso", "erro_embedding"],
+       "F2 status_retornado cobre sucesso/vazio/erro", status_vistos)
+    ok(all(e.get("user_id") == "u_test" and e.get("tool") == "consultar_estoque_supabase"
+           for e in EVENTOS), "F3 user_id vem do contexto da THREAD",
+       [e.get("user_id") for e in EVENTOS])
+    e_guard = EVENTOS[1]
+    ok(e_guard["guard_acionou"] is True and e_guard["tamanho_llm"] == "GG"
+       and e_guard["tamanho_aplicado"] == "M" and e_guard["tamanho_user_tokens"] == ["M"],
+       "F4 evento do guard registra LLM x cliente x aplicado", e_guard)
+    e_ok = EVENTOS[0]
+    ok(e_ok["n_candidatos"] == 4 and e_ok["n_validados"] == 2
+       and e_ok["n_dropados_overlap"] == 2 and e_ok["n_dropados_igualdade_legado"] == 1
+       and sorted(e_ok["tamanhos_dropados"]) == ["GG", UNICO_ACENTO],
+       "F5 contadores do overlap corretos (1 salva pelo overlap, 2 dropadas)", e_ok)
+    e_emb = EVENTOS[-1]
+    ok(e_emb["id_loja_aplicado"] == "220540" and e_emb["tamanho_aplicado"] == "M",
+       "F6 erro de embedding ja registra id_loja (hoist antes do try)", e_emb)
+    # llm_omitiu_tamanho: cliente deu tamanho, o LLM nao passou
+    EVENTOS.clear()
+    bot._set_turn_ctx("u_test", "quero uma camisola GG")
+    bot.consultar_estoque_supabase("camisola", None, "220540")
+    ok(EVENTOS[0]["llm_omitiu_tamanho"] is True
+       and EVENTOS[0]["tamanho_user_tokens"] == ["GG"],
+       "F7 llm_omitiu_tamanho pega o LLM ignorando o tamanho do cliente", EVENTOS[0])
+    EVENTOS.clear()
+    bot._set_turn_ctx("u_test", "me mostra algemas")
+    bot.consultar_estoque_supabase("algema", None, None)
+    ok(EVENTOS[0]["llm_omitiu_tamanho"] is False,
+       "F8 cliente sem tamanho nao acusa omissao do LLM", EVENTOS[0])
 finally:
     bot.get_embedding, bot.supabase = _emb_real, _sb_real
     bot._clear_turn_ctx()
