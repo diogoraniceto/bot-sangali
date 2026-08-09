@@ -20,6 +20,9 @@ H  a tool funciona DE DENTRO da thread de trabalho (`_ia_send_com_teto`) e o pid
 I  thread ABANDONADA: depois de `fechar()` a tool nao consegue mais agendar envio,
    e um segundo sender nao manda nada
 J  produto SEM foto -> `sem_foto`; turno que falha descarta os pedidos de foto
+K  `consultar_produto_por_id` nao e mais cega a foto, o cache nao grava
+   `imagem: None`, a busca declara `n_fotos`, e a tool de fotos NAO entra no cache
+   de cards (senao o card sairia duplicado)
 """
 import os
 import sys
@@ -344,6 +347,60 @@ def teste_j():
     ok("J6 nenhuma foto sai de turno que falhou", n == 0, f"n={n}")
 
 
+# --------------------------------------------------------------------------- K
+class _FakeFR:
+    def __init__(self, name, response):
+        self.name = name
+        self.response = response
+
+
+class _FakePart:
+    def __init__(self, fr):
+        self.function_response = fr
+        self.function_call = None
+
+
+class _FakeContent:
+    def __init__(self, parts):
+        self.parts = parts
+
+
+def teste_k():
+    print("\n### K. n_fotos na busca + o cache nao grava imagem None")
+    # K1: consultar_produto_por_id deixou de ser cega
+    r = bot.consultar_produto_por_id(float(PID_5))     # float de propósito
+    p = r["produto"]
+    fotos = bot._fotos_do_produto(PID_5)
+    ok("K1 produto_por_id traz imagem", p.get("imagem") == fotos[0], str(p.get("imagem"))[-14:])
+    ok("K2 produto_por_id traz n_fotos/tem_foto",
+       p.get("n_fotos") == 5 and p.get("tem_foto") is True, f"{p.get('n_fotos')}/{p.get('tem_foto')}")
+    # K3: o cache do render repassa a imagem (era None fixo)
+    hist = [_FakeContent([_FakePart(_FakeFR("consultar_produto_por_id", {"result": r}))])]
+    cache = bot.extrair_produtos_de_tool_results(hist)
+    info = cache.get(int(PID_5)) or {}
+    ok("K3 cache NAO grava imagem None", info.get("imagem") == fotos[0], str(info.get("imagem"))[-14:])
+    # K4: a busca semantica declara n_fotos e a foto principal e a de menor id
+    res = bot.consultar_estoque_supabase("camisola", "M", "244033")
+    prods = res.get("produtos") or []
+    ok("K4 busca voltou produtos", res.get("status") == "sucesso" and prods, res.get("status"))
+    faltando = [x.get("id_produto") for x in prods if not isinstance(x.get("n_fotos"), int)]
+    ok("K5 todo item tem n_fotos int", not faltando, f"sem n_fotos: {faltando}")
+    incoerentes = [x.get("id_produto") for x in prods
+                   if bool(x.get("tem_foto")) != (x.get("n_fotos", 0) > 0)]
+    ok("K6 tem_foto coerente com n_fotos", not incoerentes, str(incoerentes))
+    erradas = []
+    for x in prods[:4]:
+        esperado = bot._fotos_do_produto(x["id_produto"])
+        if (esperado[0] if esperado else None) != x.get("imagem") or len(esperado) != x.get("n_fotos"):
+            erradas.append(x.get("id_produto"))
+    ok("K7 imagem do card = foto de menor id, e n_fotos bate", not erradas, str(erradas))
+    # K8: mostrar_fotos_produto NAO entra no cache (senao o card sairia duplicado)
+    hist2 = [_FakeContent([_FakePart(_FakeFR("mostrar_fotos_produto",
+                                             {"result": {"status": "ok", "id_produto": PID_5}}))])]
+    ok("K8 tool de fotos fora do cache de cards",
+       bot.extrair_produtos_de_tool_results(hist2) == {})
+
+
 _UIDS = ["t_fotos_b", "t_fotos_c", "t_fotos_d", "t_fotos_e", "t_fotos_e2",
          "t_fotos_f", "t_fotos_g", "t_fotos_h", "t_fotos_i", "t_fotos_j"]
 
@@ -366,7 +423,7 @@ def main():
           f"FOTOS_MAX_POR_TURNO={bot.FOTOS_MAX_POR_TURNO} TTL={bot.FOTOS_TTL_SEG}s")
     try:
         for fn in (teste_a, teste_b, teste_c, teste_d, teste_e,
-                   teste_f, teste_g, teste_h, teste_i, teste_j):
+                   teste_f, teste_g, teste_h, teste_i, teste_j, teste_k):
             try:
                 fn()
             except Exception as e:
