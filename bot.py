@@ -273,24 +273,34 @@ def get_embedding(text):
 # ================= PERSISTÊNCIA (SUPABASE) =================
 
 def save_message(user_id, role, content):
-    supabase.table("chat_history").insert({
+    """Grava a linha em chat_history e devolve o `id` (uuid) da linha, ou None."""
+    r = supabase.table("chat_history").insert({
         "user_id": user_id,
         "role": role,
         "content": content
     }).execute()
+    try:
+        return (r.data or [{}])[0].get("id")
+    except Exception:
+        return None
 
-def get_history(user_id, limit=30):
+def get_history(user_id, limit=30, excluir_id=None):
     """Carrega historico recente do user, descartando 'conversa antiga'.
 
     Conversa antiga = mensagens antes de um gap >= CONVERSA_GAP_HORAS, OU
     mensagens antes do ultimo handoff (atendente humana ja resolveu).
     O banco mantem tudo para auditoria — quem filtra eh so o contexto do Gemini.
+
+    excluir_id: id de linha a remover do contexto — usado para tirar a mensagem
+    ATUAL do cliente, que ja vai ao modelo via chat.send_message(). Busca
+    `limit + 1` nesse caso, entao o contexto efetivo continua sendo `limit`.
+    Exclusao por ID, nao por texto: imune a cliente que repete a mesma frase.
     """
     response = supabase.table("chat_history") \
-        .select("role, content, created_at") \
+        .select("id, role, content, created_at") \
         .eq("user_id", user_id) \
         .order("created_at", desc=True) \
-        .limit(limit) \
+        .limit(limit + 1 if excluir_id is not None else limit) \
         .execute()
 
     rows = response.data or []
@@ -319,9 +329,33 @@ def get_history(user_id, limit=30):
             if (ts := _parse_iso_ts(r.get("created_at"))) and ts > ts_handoff
         ]
 
+    # 2.1. Remove a mensagem atual (ja entregue ao modelo por send_message).
+    if excluir_id is not None:
+        rows = [r for r in rows if r.get("id") != excluir_id]
+
     # 3. Reverte para ordem cronologica (oldest -> newest) para o Gemini.
     rows.reverse()
     return [{"role": r["role"], "parts": [r["content"]]} for r in rows]
+
+
+def _normalizar_history_para_gemini(history):
+    """Deixa o history nas duas pontas que a API exige. Muta e devolve a lista.
+
+    CAUDA: colapsa corrida final de turnos 'user' adjacentes (turno que errou deixa
+    linha `user` orfa; o cliente reenvia e nascem dois `user` seguidos). Mantem o
+    mais recente. Dois turnos `user` adjacentes sao a forma exata que produzia
+    respostas do tipo "nao temos GG" para quem tinha pedido G.
+    CABECA: a API exige que o historico comece em turno do usuario.
+    """
+    _n = 0
+    while len(history) >= 2 and history[-1]["role"] == "user" and history[-2]["role"] == "user":
+        history.pop(-2)
+        _n += 1
+    if _n:
+        print(f"[HIST] cauda user colapsada: {_n}")
+    while history and history[0]["role"] != "user":
+        history.pop(0)
+    return history
 
 
 def _job_purge_bot_turns():
@@ -1433,7 +1467,10 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
     NÃO mexe em buffer nem em lock; assume turno já serializado por
     `process_and_respond` e contexto de thread já setado.
     """
-    save_message(user_id, "user", texto_completo)
+    # NAO mover este save para depois do get_history: durante o silencio pos-handoff
+    # a atendente humana le a mensagem do cliente em chat_history, e
+    # _montar_mensagem_operador tambem a le no MEIO do turno.
+    msg_id = save_message(user_id, "user", texto_completo)
 
     try:
         # --- BUSCA CONFIGURAÇÃO NO BANCO ---
@@ -1495,7 +1532,15 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
             model = genai.GenerativeModel(**modelo_args)
             json_mode_enabled = False
 
-        history = get_history(user_id)
+        # A mensagem atual vai ao modelo UMA vez, por chat.send_message() la embaixo.
+        # Antes ela vinha tambem no history (o save acontece acima) — o modelo via a
+        # mesma frase duas vezes, em dois turnos 'user' adjacentes.
+        history = get_history(user_id, excluir_id=msg_id)
+        if (msg_id is None and history and history[-1]["role"] == "user"
+                and history[-1]["parts"] == [texto_completo]):
+            print("[HIST] insert sem id; removendo a linha atual por texto")
+            history = history[:-1]
+        history = _normalizar_history_para_gemini(history)
         t_inicio = time.perf_counter()
         # Gemini as vezes trava/estoura o deadline (504), sobretudo em turns com cadeia
         # de tools (ex.: resposta-a-card -> consultar_estoque + calcular_total). Sem retry
@@ -1575,6 +1620,13 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
             _fallback = "Ops, tive um probleminha tecnico aqui 😅 Pode reenviar sua ultima mensagem, por favor?"
         try:
             enviar_mensagem_whatsapp(user_id, _fallback)
+        except Exception:
+            pass
+        # Fecha o par user/model: sem isto todo turno com erro deixava uma linha
+        # 'user' orfa e, como o fallback pede reenvio, o cliente reenviava e nascia
+        # o par 'user'/'user' identico que envenena o contexto do turno seguinte.
+        try:
+            save_message(user_id, "model", _fallback)
         except Exception:
             pass
         try:
