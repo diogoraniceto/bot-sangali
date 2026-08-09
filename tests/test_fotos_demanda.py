@@ -207,6 +207,11 @@ def teste_e():
     ok("E2 promete 1", r["vai_enviar"] == 1 and r["restantes"] == 0)
     n = bot._enviar_fotos_extras_pendentes(uid, p)
     ok("E3 enviou exatamente 1", n == 1 and len(_midias) == 1, f"n={n}")
+    # produto de 1 foto NAO tem "outro angulo": a legenda nao pode mentir
+    cap = _midias[0]["caption"].lower()
+    ok("E3b legenda nao promete outro angulo", "outro ângulo" not in cap
+       and "outros ângulos" not in cap, _midias[0]["caption"][:48])
+    ok("E3c legenda diz que e a unica", "única foto" in cap, _midias[0]["caption"][:48])
     p2 = bot._FotosPendentes()
     r2 = bot.criar_tool_mostrar_fotos(uid, p2)(PID_1)
     ok("E4 2o pedido: sem_novas", r2["status"] == "sem_novas", r2["status"])

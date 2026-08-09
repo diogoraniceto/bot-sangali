@@ -1573,8 +1573,11 @@ def criar_tool_mostrar_fotos(user_id, pendentes):
           o sistema não sabe o que cada foto mostra. Fale sempre de forma neutra —
           "outros ângulos que eu tenho dessa peça".
         - NUNCA afirme a cor de uma foto. Fotos do mesmo produto podem ser de outra
-          cor ou de outra estampa; para confirmar cor, chame uma atendente.
+          cor ou de outra estampa.
         - Anuncie no máximo o que `vai_enviar` diz. Não prometa número diferente.
+        - NUNCA diga que uma atendente vai TIRAR ou MANDAR uma foto: você não sabe
+          se ela vai. Se for chamar atendente, diga que ela ajuda com os detalhes
+          da peça.
 
         Args:
             id_produto: o id numérico do produto (campo id_produto).
@@ -1586,10 +1589,12 @@ def criar_tool_mostrar_fotos(user_id, pendentes):
               fotos: se o cliente pedir mais, chame esta ferramenta de novo no
               próximo turno.
             - "sem_foto": este produto não tem foto nenhuma cadastrada. Seja
-              transparente e não prometa imagem.
+              transparente ("ainda não temos foto desse item aqui no sistema"),
+              não prometa imagem e NÃO ofereça atendente por causa da foto.
             - "sem_novas": o cliente JÁ RECEBEU TODAS as fotos que existem. Diga que
-              essas são todas que você tem e — SÓ neste caso — ofereça passar para
-              uma atendente, que pode mandar mais detalhes.
+              essas são todas que você tem. SÓ neste caso você pode oferecer uma
+              atendente — e para ajudar com os DETALHES da peça, nunca prometendo
+              que ela vai tirar ou mandar foto nova.
             - "limite_turno": você já pediu as fotos de outro produto nesta resposta.
               Trate um produto por vez; peça o outro no próximo turno.
             - "erro": id inválido.
@@ -1638,6 +1643,17 @@ def criar_tool_mostrar_fotos(user_id, pendentes):
                     "msg": "Nao foi possivel agendar o envio agora; peca de novo."}
         print(f"[fotos] tool pid={pid}: ok n_fotos={len(fotos)} ja_vistas={len(vistas)} "
               f"vai_enviar={vai_enviar} novo_no_turno={novo}")
+        if len(fotos) == 1:
+            # Produto de UMA foto (216 no catálogo): não existe "outro ângulo". Se o
+            # modelo anunciasse ângulos no plural mentiria — e se o card desta mesma
+            # resposta já levar essa foto, o sender não manda nada (a foto já foi).
+            msg = ("Este produto tem UMA foto so, que e a mesma do card. Diga que e a "
+                   "unica foto que voce tem dessa peca e ofereca uma atendente se o "
+                   "cliente quiser ver mais detalhes. Nunca fale de angulos no plural.")
+        else:
+            msg = ("O sistema vai enviar as fotos DEPOIS da sua resposta. Anuncie de "
+                   "forma neutra ('outros angulos que eu tenho'), sem dizer qual lado "
+                   "e sem afirmar cor, e sem escrever URL.")
         return {
             "status": "ok",
             "id_produto": pid,
@@ -1646,9 +1662,7 @@ def criar_tool_mostrar_fotos(user_id, pendentes):
             "ja_vistas": len(vistas),
             "vai_enviar": vai_enviar,
             "restantes": max(0, len(novas) - vai_enviar),
-            "msg": "O sistema vai enviar as fotos DEPOIS da sua resposta. Anuncie de "
-                   "forma neutra ('outros angulos que eu tenho'), sem dizer qual lado "
-                   "e sem afirmar cor, e sem escrever URL.",
+            "msg": msg,
         }
 
     return mostrar_fotos_produto
@@ -1666,16 +1680,21 @@ def _nome_do_produto(pid):
         return None
 
 
-def _legenda_fotos_extra(pid, n_envio):
+def _legenda_fotos_extra(pid, n_envio, n_total):
     """Legenda da 1ª foto extra. NUNCA nomeia o ângulo nem afirma cor.
 
     Decisão do dono da loja: não identificamos "parte de trás" (não existe dado de
     ordem/tipo/cor em produtos_imagens, e há produtos cuja 2ª foto é de outra
     estampa) — a linguagem é sempre "outros ângulos que eu tenho".
+
+    `n_total` é obrigatório porque produto de UMA foto não tem "outro ângulo": a
+    legenda genérica mentiria justamente no maior bucket do catálogo (216 produtos).
     O marcador `_cód: {pid}_` é o MESMO do card (acentuado), para `card_envios.legenda`
     e o reply-to-card ficarem consistentes.
     """
-    if n_envio <= 1:
+    if n_total <= 1:
+        titulo = "Essa é a única foto que eu tenho dessa peça 💕"
+    elif n_envio <= 1:
         titulo = "Aqui outro ângulo que eu tenho dessa peça 💕"
     else:
         titulo = "Aqui os outros ângulos que eu tenho dessa peça 💕"
@@ -1711,7 +1730,7 @@ def _enviar_fotos_extras_pendentes(user_id, pendentes):
             continue
         escolhidas = novas[:min(FOTOS_MAX_POR_PEDIDO, orcamento)]
         for i, url in enumerate(escolhidas):
-            legenda = (_legenda_fotos_extra(pid, len(escolhidas)) if i == 0
+            legenda = (_legenda_fotos_extra(pid, len(escolhidas), len(fotos)) if i == 0
                        else f"_cód: {int(pid)}_")   # nunca legenda vazia: o payload
                                                     # cloud sempre manda `caption`
             try:
