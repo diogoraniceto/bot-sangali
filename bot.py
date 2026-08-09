@@ -1500,6 +1500,239 @@ def criar_tool_transferir(user_id):
     return transferir_para_atendente
 
 
+class _FotosPendentes:
+    """Coletor dos pedidos de foto do turno — a ponte entre a tool e o sender.
+
+    Por que uma classe e não uma lista: a thread de trabalho do Gemini
+    (`_ia_send_com_teto`) é ABANDONADA de propósito quando o orçamento do turno
+    estoura, e as tools dela JÁ RODARAM — ela pode acordar depois do fallback e
+    chamar `mostrar_fotos_produto` de novo. `fechar()` fecha a janela de uma vez:
+    todo `add` posterior é ignorado, então a thread zumbi não consegue disparar
+    envio de foto para um turno que já terminou. Uma lista nua não sabe dizer
+    "não" — `clear()` + append tardio reabriria a janela.
+
+    Só o pid entra aqui, nunca URL: as URLs são relidas frescas na hora do envio.
+    """
+
+    __slots__ = ("_pids", "_fechado", "_lock")
+
+    def __init__(self):
+        self._pids = []
+        self._fechado = False
+        self._lock = threading.Lock()
+
+    def add(self, pid):
+        """True se o pid entrou agora; False se já estava, ou se a janela fechou."""
+        with self._lock:
+            if self._fechado or pid in self._pids:
+                return False
+            self._pids.append(pid)
+            return True
+
+    def fechar(self):
+        """Drena e FECHA. Idempotente: a 2ª chamada devolve [] — é o que garante
+        que o sender só possa enviar uma vez, mesmo se for chamado duas vezes."""
+        with self._lock:
+            self._fechado = True
+            pids, self._pids = self._pids, []
+            return pids
+
+    def __contains__(self, pid):
+        with self._lock:
+            return pid in self._pids
+
+    def __len__(self):
+        with self._lock:
+            return len(self._pids)
+
+    def __bool__(self):
+        return len(self) > 0
+
+
+def criar_tool_mostrar_fotos(user_id, pendentes):
+    """Retorna a tool de fotos amarrada ao user_id e ao coletor DESTE turno.
+
+    Closure no molde de `criar_tool_transferir`: nada de global de módulo nem de
+    leitura do contexto de thread. É o que faz a tool funcionar de dentro da thread
+    de trabalho de `_ia_send_com_teto` sem depender de `_restore_turn_ctx`.
+    """
+
+    def mostrar_fotos_produto(id_produto: int):
+        """
+        Registra que o cliente quer VER MAIS FOTOS de um produto. O sistema envia as
+        fotos automaticamente DEPOIS da sua resposta — você não envia nada.
+
+        Use quando o cliente pedir mais imagens de uma peça específica: "manda mais
+        fotos", "tem outra foto?", "quero ver melhor", "mostra de outro ângulo".
+        Não use para o primeiro card de um produto (o card já vai com a foto
+        principal); use quando ele quiser ver ALÉM do card.
+
+        REGRAS DE LINGUAGEM (obrigatórias):
+        - NUNCA escreva URL de imagem na sua resposta.
+        - NUNCA diga qual ângulo/lado é a foto ("aqui a de trás", "essa é a frente"):
+          o sistema não sabe o que cada foto mostra. Fale sempre de forma neutra —
+          "outros ângulos que eu tenho dessa peça".
+        - NUNCA afirme a cor de uma foto. Fotos do mesmo produto podem ser de outra
+          cor ou de outra estampa; para confirmar cor, chame uma atendente.
+        - Anuncie no máximo o que `vai_enviar` diz. Não prometa número diferente.
+
+        Args:
+            id_produto: o id numérico do produto (campo id_produto).
+
+        Returns:
+            dict com `status`:
+            - "ok": o sistema VAI enviar `vai_enviar` foto(s) depois da sua resposta.
+              Anuncie de forma neutra. Se `restantes` for maior que 0, ainda sobram
+              fotos: se o cliente pedir mais, chame esta ferramenta de novo no
+              próximo turno.
+            - "sem_foto": este produto não tem foto nenhuma cadastrada. Seja
+              transparente e não prometa imagem.
+            - "sem_novas": o cliente JÁ RECEBEU TODAS as fotos que existem. Diga que
+              essas são todas que você tem e — SÓ neste caso — ofereça passar para
+              uma atendente, que pode mandar mais detalhes.
+            - "limite_turno": você já pediu as fotos de outro produto nesta resposta.
+              Trate um produto por vez; peça o outro no próximo turno.
+            - "erro": id inválido.
+        """
+        try:
+            pid = _fotos_pid(id_produto)
+        except (TypeError, ValueError):
+            return {"status": "erro", "msg": f"id_produto invalido: {id_produto!r}"}
+
+        fotos, vistas, novas = _fotos_novas(user_id, pid)
+        nome = _nome_do_produto(pid)
+
+        if not fotos:
+            print(f"[fotos] tool pid={pid}: sem_foto")
+            return {"status": "sem_foto", "id_produto": pid, "nome": nome, "n_fotos": 0,
+                    "msg": "Esse produto nao tem foto cadastrada. Seja transparente e "
+                           "nao prometa imagem."}
+        if not novas:
+            print(f"[fotos] tool pid={pid}: sem_novas (n_fotos={len(fotos)})")
+            return {"status": "sem_novas", "id_produto": pid, "nome": nome,
+                    "n_fotos": len(fotos), "ja_vistas": len(vistas), "vai_enviar": 0,
+                    "msg": "O cliente ja recebeu TODAS as fotos deste produto. Diga que "
+                           "sao todas que voce tem e ofereca uma atendente."}
+
+        # Um produto por turno: a tool NAO PODE prometer mais do que o sender manda,
+        # e o orcamento de envio do turno e o mesmo do produto (FOTOS_MAX_POR_TURNO).
+        if pid not in pendentes and len(pendentes) >= 1:
+            print(f"[fotos] tool pid={pid}: limite_turno")
+            return {"status": "limite_turno", "id_produto": pid, "nome": nome,
+                    "n_fotos": len(fotos), "vai_enviar": 0,
+                    "msg": "Voce ja pediu fotos de outro produto nesta resposta. Trate um "
+                           "produto por vez; peca este no proximo turno."}
+
+        # Idempotência por construção: a tool é READ-ONLY (não envia e não escreve em
+        # `_fotos_vistas`) e o `add` dedupa. Logo o replay do retry de 3 tentativas e
+        # as chamadas repetidas que o modelo faz por decisão própria são inofensivas:
+        # todas devolvem o MESMO payload e o pid entra uma única vez.
+        novo = pendentes.add(pid)
+        vai_enviar = min(len(novas), FOTOS_MAX_POR_PEDIDO)
+        if not novo and pid not in pendentes:
+            # Janela fechada (turno já terminou e a thread abandonada acordou).
+            # Não pode prometer envio: ninguém vai ler este coletor.
+            print(f"[fotos] tool pid={pid}: janela do turno FECHADA — pedido ignorado")
+            return {"status": "limite_turno", "id_produto": pid, "nome": nome,
+                    "n_fotos": len(fotos), "vai_enviar": 0,
+                    "msg": "Nao foi possivel agendar o envio agora; peca de novo."}
+        print(f"[fotos] tool pid={pid}: ok n_fotos={len(fotos)} ja_vistas={len(vistas)} "
+              f"vai_enviar={vai_enviar} novo_no_turno={novo}")
+        return {
+            "status": "ok",
+            "id_produto": pid,
+            "nome": nome,
+            "n_fotos": len(fotos),
+            "ja_vistas": len(vistas),
+            "vai_enviar": vai_enviar,
+            "restantes": max(0, len(novas) - vai_enviar),
+            "msg": "O sistema vai enviar as fotos DEPOIS da sua resposta. Anuncie de "
+                   "forma neutra ('outros angulos que eu tenho'), sem dizer qual lado "
+                   "e sem afirmar cor, e sem escrever URL.",
+        }
+
+    return mostrar_fotos_produto
+
+
+def _nome_do_produto(pid):
+    """Nome do produto para a tool de fotos poder citar a peça. None se não achar."""
+    try:
+        r = (supabase.table("produtos_estoque").select("nome")
+             .eq("id_produto", _fotos_pid(pid)).limit(1).execute())
+        rows = r.data or []
+        return rows[0].get("nome") if rows else None
+    except Exception as e:
+        print(f"[fotos] nome do produto {pid}: {str(e)[:120]}")
+        return None
+
+
+def _legenda_fotos_extra(pid, n_envio):
+    """Legenda da 1ª foto extra. NUNCA nomeia o ângulo nem afirma cor.
+
+    Decisão do dono da loja: não identificamos "parte de trás" (não existe dado de
+    ordem/tipo/cor em produtos_imagens, e há produtos cuja 2ª foto é de outra
+    estampa) — a linguagem é sempre "outros ângulos que eu tenho".
+    O marcador `_cód: {pid}_` é o MESMO do card (acentuado), para `card_envios.legenda`
+    e o reply-to-card ficarem consistentes.
+    """
+    if n_envio <= 1:
+        titulo = "Aqui outro ângulo que eu tenho dessa peça 💕"
+    else:
+        titulo = "Aqui os outros ângulos que eu tenho dessa peça 💕"
+    return f"{titulo}\n_cód: {int(pid)}_"
+
+
+def _enviar_fotos_extras_pendentes(user_id, pendentes):
+    """Envia as fotos extras pedidas neste turno. Roda DEPOIS da resposta do modelo.
+
+    Ordem importa: o texto do modelo ("já te mando outros ângulos") tem de chegar
+    antes das imagens. Roda ainda DENTRO do `turn_lock` — fora dele a mídia deste
+    turno se intercalaria com os cards do turno seguinte. Como o pop do buffer
+    acontece no INÍCIO do turno (F1), a mensagem que chegar durante estes segundos
+    entra num buffer novo e espera no lock; nada se perde.
+
+    Três guardas de idempotência, independentes:
+      1. `pendentes.fechar()` drena e fecha — 2ª chamada não tem o que enviar;
+      2. `_fotos_novas` relê o registro antes de cada produto;
+      3. `_marcar_fotos_vistas` grava URL por URL DEPOIS do envio — uma foto já
+         enviada nunca é candidata de novo (nem em outro turno, dentro do TTL).
+    """
+    pids = pendentes.fechar()
+    if not pids:
+        return 0
+    orcamento = FOTOS_MAX_POR_TURNO
+    enviadas = 0
+    for pid in pids:
+        if orcamento <= 0:
+            break
+        fotos, vistas, novas = _fotos_novas(user_id, pid)
+        if not novas:
+            print(f"[fotos] pid={pid}: nada novo para enviar (n_fotos={len(fotos)})")
+            continue
+        escolhidas = novas[:min(FOTOS_MAX_POR_PEDIDO, orcamento)]
+        for i, url in enumerate(escolhidas):
+            legenda = (_legenda_fotos_extra(pid, len(escolhidas)) if i == 0
+                       else f"_cód: {int(pid)}_")   # nunca legenda vazia: o payload
+                                                    # cloud sempre manda `caption`
+            try:
+                wamid = enviar_midia_whatsapp(user_id, url, legenda)
+            except Exception as e:
+                print(f"[fotos] envio de {url[-16:]} falhou: {str(e)[:120]}")
+                continue
+            # isinstance(str) é obrigatório: o stub da suíte devolve dict.
+            if WHATSAPP_PROVIDER == "cloud" and isinstance(wamid, str):
+                registrar_card_enviado(wamid, user_id, int(pid), legenda)
+            _marcar_fotos_vistas(user_id, pid, [url])
+            enviadas += 1
+            orcamento -= 1
+            if FOTOS_SLEEP_SEG:
+                time.sleep(FOTOS_SLEEP_SEG)
+    # `tool_chamada` mede a taxa de acionamento: sem o bloco de prompt (F6) a tool
+    # depende só da docstring, e é este log que diz se o modelo a está usando.
+    print(f"[fotos] tool_chamada={1 if pids else 0} pids={pids} extras_enviadas={enviadas}")
+    return enviadas
+
+
 # ================= CONFIGURAÇÃO DA IA (MODELO) =================
 
 # Schema da resposta final do LLM. resposta_texto NÃO deve conter URLs;
@@ -1588,6 +1821,9 @@ def extrair_produtos_de_tool_results(chat_history):
             if not fr:
                 continue
             tool_name = getattr(fr, 'name', None)
+            # `mostrar_fotos_produto` fica FORA desta tupla de propósito: se o pid dela
+            # entrasse no cache e o modelo o listasse em `produtos_recomendados`, o
+            # renderizador reenviaria o CARD com a foto principal — foto duplicada.
             if tool_name not in ('consultar_estoque_supabase', 'consultar_produto_por_id'):
                 continue
             response_dict = _coerce_to_dict(getattr(fr, 'response', None))
@@ -1914,7 +2150,9 @@ def process_and_respond(user_id):
         # Contexto do turno usado pelas tools (defesa B4 em consultar_estoque).
         # É por THREAD: dois clientes simultâneos não enxergam o texto um do outro.
         _set_turn_ctx(user_id, texto_completo)
-        fotos_pendentes = []                # F3 usa; aqui fica vazio e inerte
+        # Coletor dos pedidos de foto deste turno (F3). A tool só ANOTA aqui; o envio
+        # acontece depois, uma vez, abaixo.
+        fotos_pendentes = _FotosPendentes()
         turno_ok = False
         try:
             _executar_turno(user_id, texto_completo, fotos_pendentes)
@@ -1934,6 +2172,15 @@ def process_and_respond(user_id):
                 pass
         finally:
             _clear_turn_ctx()
+        # Fotos extras DEPOIS da resposta e ainda DENTRO do turn_lock: o cliente lê o
+        # anúncio antes das imagens e nada se intercala com o turno seguinte.
+        # Chamado UMA vez por turno; `fechar()` lá dentro garante que uma segunda
+        # chamada (por qualquer caminho) não envie nada.
+        if turno_ok and FOTOS_SOB_DEMANDA and fotos_pendentes:
+            try:
+                _enviar_fotos_extras_pendentes(user_id, fotos_pendentes)
+            except Exception as e:
+                print(f"[fotos] envio extra falhou: {e}")
         return turno_ok
 
 
@@ -1985,18 +2232,27 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
         # Instancia o modelo com a instrução ATUALIZADA
         transferir_para_atendente = criar_tool_transferir(user_id)
 
+        _tools = [
+            consultar_estoque_supabase,
+            consultar_produto_por_id,
+            calcular_total,
+            verificar_promocao_hoje,
+            transferir_para_atendente,
+            calcular_frete_estimado,
+        ]
+        # Kill switch da F3: com FOTOS_SOB_DEMANDA=0 a tool nem aparece na function
+        # declaration e o sender vira no-op — rollback sem redeploy.
+        # `fotos_pendentes is None` = chamador que não passa coletor (testes que
+        # chamam `_executar_turno` com 2 args): sem coletor o sender não teria como
+        # saber o que enviar, então a tool também não entra.
+        if FOTOS_SOB_DEMANDA and fotos_pendentes is not None:
+            _tools.append(criar_tool_mostrar_fotos(user_id, fotos_pendentes))
+
         # Tenta com response_schema; se a versão do SDK / modelo recusar
         # generation_config + tools, recria sem schema (cai no fallback regex).
         modelo_args = dict(
             model_name='gemini-3-flash-preview',
-            tools=[
-                consultar_estoque_supabase,
-                consultar_produto_por_id,
-                calcular_total,
-                verificar_promocao_hoje,
-                transferir_para_atendente,
-                calcular_frete_estimado,
-            ],
+            tools=_tools,
             system_instruction=system_instruction_dinamica,
             safety_settings=SAFETY_SETTINGS,
         )
@@ -2103,6 +2359,14 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
         import traceback
         err_str = f"{e}\n{traceback.format_exc()}"
         print(f"Erro IA: {err_str}")
+        # O turno morreu: NÃO mandar as fotos extras. O anúncio ("já te mando outros
+        # ângulos") nunca chegou ao cliente — ele receberia imagens soltas depois de
+        # um "reenvie sua mensagem". `fechar()` também trava a janela contra a thread
+        # abandonada, que pode acordar depois deste ponto e chamar a tool de novo.
+        if fotos_pendentes is not None:
+            descartados = fotos_pendentes.fechar()
+            if descartados:
+                print(f"[fotos] turno falhou — {len(descartados)} pedido(s) de foto descartado(s): {descartados}")
         # Degradacao graciosa: NUNCA deixar o cliente sem resposta (nem em bloqueio/timeout).
         _low = str(e).lower()
         if any(k in _low for k in ("block", "prohibited", "safety", "finish_reason", "blocked")):
