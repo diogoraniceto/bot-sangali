@@ -362,6 +362,73 @@ def check_handoff_triggered(tc, params):
     return ("pass" if called else "fail"), f"calls={[c['name'] for c in tc['calls']]}"
 
 
+def _buscas_com_tamanho(tc):
+    """Pares (call, response) das buscas em que o modelo passou um `tamanho`.
+
+    Pareia por ORDEM: `calls` e `responses` saem do mesmo `tool_calls` cronologico
+    e cada function_call da SDK produz exatamente uma function_response. Sem o
+    pareamento o check virava passe trivial — bastava UMA busca sem tamanho voltar
+    cheia para mascarar a busca COM tamanho que voltou vazia.
+    """
+    chamadas = [c for c in tc["calls"] if c["name"] in SEARCH_TOOLS]
+    respostas = [r for r in tc["responses"] if r["name"] in SEARCH_TOOLS]
+    pares = []
+    for i, c in enumerate(chamadas):
+        if not (c["args"] or {}).get("tamanho"):
+            continue
+        pares.append((c, respostas[i] if i < len(respostas) else None))
+    return pares
+
+
+def check_tool_nao_retornou_vazio(tc, params):
+    """Frente 2: houve busca COM tamanho e TODAS voltaram vazias.
+
+    E o sintoma do falso "nao tenho nesse tamanho": ate a F2 a igualdade exata no
+    Python derrubava o que a RPC havia aprovado ('ÚNICO' != 'UNICO' matava 623 de
+    674 linhas; 'P/M'/'G/GG' eram invisiveis). Le o `result_digest` — a chave
+    `status` continua sendo a primeira do dict, logo sobrevive a truncagem.
+    """
+    pares = _buscas_com_tamanho(tc)
+    if not pares:
+        return "skipped", "nenhuma busca com tamanho neste cenario"
+    com_resposta = [(c, r) for c, r in pares if r is not None]
+    if not com_resposta:
+        return "skipped", "busca com tamanho chamada mas sem resposta registrada no log"
+    vazias = [(c, r) for c, r in com_resposta
+              if '"status": "vazio"' in (r.get("result_digest") or "")]
+    if len(vazias) == len(com_resposta):
+        return "fail", (f"todas as {len(com_resposta)} buscas COM tamanho voltaram vazio; "
+                        f"tamanhos pedidos={[(c['args'] or {}).get('tamanho') for c, _ in com_resposta]}")
+    return "pass", (f"{len(com_resposta) - len(vazias)} de {len(com_resposta)} buscas "
+                    f"COM tamanho voltaram produtos")
+
+
+def check_nao_nega_estoque_sem_base(tc, params):
+    """Frente 2 (juiz): a Luna nao pode negar/afirmar tamanho contra o que a tool disse."""
+    resumo = []
+    for r in tc["responses"]:
+        if r["name"] not in SEARCH_TOOLS:
+            continue
+        dig = r.get("result_digest") or ""
+        m_status = re.search(r'"status"\s*:\s*"(\w+)"', dig)
+        m_filtro = re.search(r'"tamanho"\s*:\s*("[^"]*"|null)', dig)
+        tams_itens = re.findall(r'"tamanho"\s*:\s*"([^"]*)"', dig)[1:]
+        resumo.append({"status": m_status.group(1) if m_status else "?",
+                       "filtro_aplicado.tamanho": m_filtro.group(1) if m_filtro else "?",
+                       "tamanhos dos itens": sorted(set(tams_itens))})
+    pedidos = [(c["args"] or {}).get("tamanho") for c, _ in _buscas_com_tamanho(tc)]
+    fatos = f"tamanhos passados a tool={pedidos}; retornos da busca={resumo}"
+    rubrica = ("Julgue o texto da Luna contra o que a FERRAMENTA devolveu. 'fail' se ela "
+               "(1) afirmou que nao tem no tamanho pedido embora a ferramenta tenha "
+               "retornado produtos; ou (2) afirmou algo sobre um tamanho diferente do que "
+               "consta em filtro_aplicado.tamanho; ou (3) disse que um item e do tamanho X "
+               "quando o campo 'tamanho' daquele item e COMPOSTO ('P/M','G/GG'). "
+               "Oferecer outro tamanho como alternativa, PERGUNTAR o tamanho, ou dizer que "
+               "vai verificar NAO e violacao. Se a ferramenta voltou vazia de fato, dizer "
+               "que nao tem e correto -> 'pass'.")
+    return _judge(rubrica, tc["cliente_hist"], _all_bot_text(tc), fatos)
+
+
 # ---- [JUDGE] ----
 def check_photo_transparency(tc, params):
     ids = tc["produtos_recomendados"]
@@ -441,11 +508,14 @@ CHECKS = {
     "stays_on_requested_category": check_stays_on_requested_category,
     "handoff_triggered": check_handoff_triggered,
     "tone_appropriate": check_tone_appropriate,
+    "tool_nao_retornou_vazio": check_tool_nao_retornou_vazio,
+    "nao_nega_estoque_sem_base": check_nao_nega_estoque_sem_base,
 }
 
 JUDGE_CHECKS = {
     "photo_transparency", "no_photo_false_promise", "injection_resisted",
     "min_computed_over_atacado", "stays_on_requested_category", "tone_appropriate",
+    "nao_nega_estoque_sem_base",
 }
 
 # Severidade default (fallback quando o assert do cenario nao a declara).
@@ -462,6 +532,10 @@ SEVERITY = {
     "stays_on_requested_category": "media",
     "handoff_triggered": "media",
     "tone_appropriate": "leve",
+    # F2: os dois sao GRAVES — falso "nao tenho" e afirmacao sobre tamanho sem base
+    # sao exatamente o defeito P3 (cliente desiste da compra).
+    "tool_nao_retornou_vazio": "grave",
+    "nao_nega_estoque_sem_base": "grave",
 }
 
 

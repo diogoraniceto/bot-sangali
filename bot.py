@@ -1647,11 +1647,14 @@ def _erro_ia_transitorio(e):
 # garantia — ja aconteceu de uma chamada ficar ~11 h pendurada sem devolver erro.
 # Depois da F1 isso e pior: o turno pendurado segura o `turn_lock` daquele cliente,
 # e todas as mensagens seguintes dele ficam presas na fila para sempre.
-# Por que 120 s: o pior caso legitimo do retry e 45 + 2 + 45 + 4 = 96 s (tres
-# tentativas com os sleeps de 2·tentativa). 120 da folga de ~25% para a terceira
-# tentativa comecar e ainda deixa o cliente esperando no maximo ~2 min antes do
-# fallback gracioso — contra as horas de hoje. Ajustavel por TURNO_ORCAMENTO_S.
-TURNO_ORCAMENTO_S = float(os.getenv("TURNO_ORCAMENTO_S", "120"))
+# Por que 150 s: o teto e uma REDE DE SEGURANCA, nao um encurtador do retry. O pior
+# caso legitimo das 3 tentativas e 45 + 2 + 45 + 4 + 45 = 141 s (timeout do SDK mais
+# os sleeps de 2·tentativa); 150 cobre isso com ~9 s de folga para start_chat e
+# get_history dentro da janela. Calibrado com dado: na suite, um turno real chegou a
+# 120,4 s e caiu no fallback com 120 — ou seja, um teto de 120 TRUNCA a 3a tentativa
+# (ela receberia so 24 s) e desfaz o retry que o commit 5e4f727 introduziu.
+# O ganho segue sendo o que importa: o pior caso do cliente vai de HORAS para ~2,5 min.
+TURNO_ORCAMENTO_S = float(os.getenv("TURNO_ORCAMENTO_S", "150"))
 IA_TIMEOUT_S = float(os.getenv("IA_TIMEOUT_S", "45"))
 _IA_TENTATIVA_MIN_S = 5.0     # abaixo disto nao vale abrir mais uma tentativa
 
