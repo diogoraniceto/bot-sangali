@@ -1180,6 +1180,53 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
             "dois'). NAO diga que a lista toda e de um tamanho unico so.")
         print(f"[TAMANHO] {len(compostos)} item(ns) composto(s) na selecao — instrucao dinamica enviada")
 
+    # Curadoria dinamica — mesmo padrao do §3.9 da POLITICA_DE_GATE que resolveu o
+    # tamanho composto. Motivo medido (09/08): a Matriz tem UMA unidade de UMA
+    # fantasia (40214981); pedimos ate 3 e o modelo completa a lista com vizinhos —
+    # SEX SHOP para quem pediu fantasia, com os MESMOS ids nos dois bracos do A/B.
+    # A regra ja esta no §4 do prompt e nao pega: regra generica vira preambulo.
+    #
+    # Substantivo-cabeca: em portugues o termo do cliente comeca pelo substantivo
+    # ("fantasia de enfermeira", "calcinha sem costura"), entao a 1a palavra com mais
+    # de 2 letras E a categoria. Nao uso `palavras_chave` porque ela inclui preposicao
+    # ("SEM" em "calcinha sem costura"), e exigir todos os tokens derrubaria itens
+    # legitimos.
+    #
+    # So dispara com 1-2 itens casando E havendo outros na lista. Fora disso a lista
+    # ja e majoritariamente da categoria, e o alerta seria ruido — ou pior, faria a
+    # Luna deixar venda na mesa, que e o defeito que o `recommended_only_in_category`
+    # passou a enxergar.
+    cabeca = ""
+    for palavra in (termo_cliente or "").split():
+        p_up = palavra.upper().strip(".,;:!?()")
+        if len(p_up) > 2:
+            cabeca = p_up[:-1] if (p_up.endswith("S") and len(p_up) > 3) else p_up
+            break
+    if cabeca and selecao:
+        na_cat = [p for p in selecao if cabeca in (p.get("nome") or "").upper()]
+        if not na_cat:
+            # O caso PIOR, e o que mais falhava: a lista veio cheia e NENHUM item e da
+            # categoria. Acontece muito com filtro de tamanho — a unica fantasia da
+            # Matriz e tamanho UNICO, e UNICO nao faz overlap com 'M', entao uma busca
+            # por "fantasia M" devolve 8 itens, zero fantasias. Sem esta instrucao o
+            # modelo recomenda os vizinhos (medido: SEX SHOP, BABY DOLL INFANTIL).
+            filtro_aplicado["instrucao_curadoria"] = (
+                f"NENHUM item desta lista tem '{cabeca}' no nome — a busca nao achou a "
+                f"categoria que o cliente pediu. NAO recomende nenhum destes itens como "
+                f"'{cabeca}': use produtos_recomendados = [] e seja honesta (§4). Voce "
+                f"pode PERGUNTAR se ele quer ver outra categoria, mas sem mandar card.")
+            print(f"[CURADORIA] ZERO itens com '{cabeca}' na lista — instrucao de lista vazia")
+        elif len(na_cat) <= 2 < len(selecao):
+            quais = "; ".join(f"id {p.get('id_produto')} = {(p.get('nome') or '')[:44]}"
+                              for p in na_cat)
+            filtro_aplicado["instrucao_curadoria"] = (
+                f"De todos os itens desta lista, apenas {len(na_cat)} tem '{cabeca}' no "
+                f"nome: {quais}. Recomende SOMENTE esse(s) id(s), e diga ao cliente que e "
+                f"o que voce tem dessa categoria agora. Os outros itens sao de OUTRA "
+                f"categoria: recomendar um deles e erro grave. NAO complete a lista ate 3.")
+            print(f"[CURADORIA] so {len(na_cat)} item(ns) com '{cabeca}' na lista — "
+                  f"instrucao dinamica enviada")
+
     print(f"[SEMÂNTICO] Retornando {len(selecao)} produtos distintos "
           f"({sum(1 for p in selecao if p['destaque'])} em destaque).")
     # NAO acrescentar chaves novas a `evento`: ele vira insert direto em

@@ -154,6 +154,26 @@ A resposta real com as duas primeiras: *"opções sem costura no M"* — o item 
 
 **Aplicar este padrão** antes de escrever mais parágrafo no prompt: se a regra depende de uma condição que o código sabe detectar, a regra pertence ao payload, não ao prompt.
 
+## 3.10 Rodada contaminada parece MELHOR que rodada limpa — sempre leia os skips
+
+Aconteceu em 10/08 e quase virou baseline:
+
+| Rodada | Resultado aparente | Skips | Wall | Veredito |
+|---|---|---|---|---|
+| Gate #2 | 94%, graves 46/48, **5 falhas** | 2 | 18 min | **válido** |
+| Gate #3 | **99%, graves 44/44, 1 falha** | **6** | **13,9 h** | **INVÁLIDO** |
+
+O gate #3 teve 26× 504, 15× `DeadlineExceeded`, 13 retries e — o que mata — **4× `orcamento do turno` + 4× `thread abandonada`**: quatro turnos estouraram `TURNO_ORCAMENTO_S` e morreram. Turno morto não faz busca; sem busca os checks devolvem `skipped`. Então **4 graves saíram da conta** e a taxa subiu de 94% para 99% justamente porque a rodada foi pior.
+
+**A propriedade perigosa:** a taxa é `pass / (pass + fail)`. Skip não entra no denominador. Logo **qualquer** falha de infraestrutura que impeça o cenário de rodar *melhora* o número. O incentivo é invertido.
+
+**Regra:** antes de aceitar qualquer rodada como baseline, conferir os três, na ordem:
+1. `orcamento do turno` / `thread abandonada` → **qualquer** ocorrência invalida.
+2. Contagem de `skipped` maior que a do baseline anterior → investigar item por item; skip é "não medido", nunca "passou".
+3. Wall time fora da faixa conhecida (~18-21 min para 25 cenários) → a máquina dormiu ou a API travou.
+
+E reportar sempre `graves X/Y` com o Y explícito: "44/44 com 4 pulados" e "46/48" não são comparáveis, e o primeiro parece melhor.
+
 ## 4. Pendências desta política — NÃO ESQUECER
 
 Levantadas junto com este documento e ainda **não implementadas**:

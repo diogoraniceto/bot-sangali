@@ -320,6 +320,50 @@ if db_prompt is not None:
            f"local={len(PROMPT)} chars, banco={len(db_prompt)} chars")
 
 
+# =========================================================================
+# Instrucao DINAMICA de curadoria (padrao §3.9): a regra generica do §4 nao
+# impedia o modelo de completar a lista com vizinhos. Estes testes batem no banco
+# real porque o que importa e o gatilho com o catalogo de verdade.
+print("\n### C — instrucao dinamica de curadoria (fantasia tem 1 unidade na Matriz)")
+
+
+def _instr_curadoria(termo, tam):
+    r = bot.consultar_estoque_supabase(termo, tamanho=tam, id_loja="244033")
+    if r.get("status") != "sucesso":
+        return None, r.get("status")
+    return (r.get("filtro_aplicado") or {}).get("instrucao_curadoria"), len(r.get("produtos") or [])
+
+
+try:
+    ins, n = _instr_curadoria("fantasia", None)
+    if n in (None, "erro"):
+        skip("C1", f"busca indisponivel ({n})")
+    else:
+        ok(ins is not None and "apenas 1" in ins and "40214981" in ins,
+           "C1 'fantasia' (1 item na lista) -> instrucao NOMEIA o id do unico item",
+           (ins or "")[:110])
+
+    ins, n = _instr_curadoria("fantasia de enfermeira", "M")
+    ok(ins is not None and "NENHUM" in ins and "[]" in ins,
+       "C2 'fantasia M' (o unico e UNICO, filtrado) -> manda lista VAZIA, nao vizinhos",
+       (ins or "")[:110])
+
+    # Categoria bem estocada: o alerta seria ruido, e pior — faria a Luna deixar
+    # venda na mesa. Silencio aqui e requisito, nao acidente.
+    for termo, tam in (("calcinha sem costura", "M"), ("camisola", "GG")):
+        ins, n = _instr_curadoria(termo, tam)
+        ok(ins is None,
+           f"C3 '{termo}' ({tam}) e categoria estocada -> SEM instrucao (nao suprime venda)",
+           (ins or "")[:90])
+except Exception as e:
+    skip("C1-C3", f"banco/Gemini indisponivel ({type(e).__name__}: {str(e)[:60]})")
+
+ok("instrucao_curadoria" in PROMPT,
+   "C4 prompt sabe que `instrucao_curadoria` e obrigatoria quando vier")
+ok("instrucao_tamanho_composto" in PROMPT,
+   "C4 prompt sabe que `instrucao_tamanho_composto` e obrigatoria quando vier")
+
+
 print("\n" + ("=" * 60))
 if pulados:
     print(f"PULADOS ({len(pulados)}): {pulados}")

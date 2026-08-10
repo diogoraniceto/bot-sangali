@@ -769,6 +769,27 @@ Um único `inserir_prompt.py`, **depois** de F1-F5 no ar e verdes.
 3. **Silêncio pós-handoff / bot desligado**: mensagens do cliente passam a ser **descartadas** (continuam em `chat_history` para a atendente ler, mas a Luna nunca responde). Hoje o comportamento acidental é acumular e responder a um texto que junta **até 8,9 dias**. Confirma descartar, ou quando a atendente devolve a conversa a Luna deve responder à **última** mensagem? → o plano implementa **descartar** (é o correto); a alternativa exige código extra.
 4. **Mensagem nova durante resposta em voo**: o desenho responde às duas, **em ordem** (nunca os mesmos cards de novo). A alternativa é engolir a nova quando a resposta que saiu já a contempla. → o plano implementa "sempre responder, só em ordem".
 
+### 10.2-bis DECISÃO NOVA, descoberta em 09/08 — **tamanho ÚNICO desaparece de toda busca com tamanho**
+
+Achado ao investigar a falha crônica de `fantasia`, e é a causa raiz de verdade — mais fundo que "só tem 1 fantasia em estoque".
+
+O filtro de tamanho da RPC casa por overlap de tokens: `_tokens_tamanho('ÚNICO')` → `['UNICO']`, que **nunca** faz overlap com `['M']`. Então **qualquer** busca em que o cliente diz um tamanho exclui **todas** as peças de tamanho único:
+
+| Recorte | Linhas | Produtos |
+|---|---|---|
+| Tamanho ÚNICO no catálogo | **1.154** (17,1% de 6.739) | — |
+| … com estoque > 0 | 674 | **404** |
+| … com estoque, na Matriz (a única loja que o prompt permite) | 166 | **166** |
+
+Ou seja: **166 produtos com estoque na Matriz ficam invisíveis** quando o cliente menciona tamanho. É a mesma classe do bug de `embedding` NULL que corrigimos hoje — o cliente pede, a Luna diz que não tem — só que por caminho diferente. Foi exatamente isso que produziu a falha de `fantasia`: a única fantasia da Matriz é ÚNICO, então "fantasia tamanho M" devolvia 8 itens e **zero** fantasias, e o modelo completava com SEX SHOP.
+
+**A decisão:** peça de tamanho único deve aparecer para quem pediu M/G/GG?
+- **(a) Sim** — é o mesmo formato da decisão (b) que o dono já tomou para `P/M`: a peça aparece e a Luna avisa o tamanho real ("essa é tamanho único"). A regra de aviso **já está no prompt** (§6), então o custo é só o overlap no filtro. Consistente com a decisão já tomada.
+- **(b) Não** — mantém como está e os 166 produtos seguem invisíveis em busca com tamanho.
+- **(c) Sim, mas só quando a busca sem ÚNICO vier vazia** — fallback; mais código, menos previsível.
+
+**Não implementado de propósito:** muda o resultado de **toda** busca com tamanho (não só fantasia), então precisa da decisão do dono + janela de gate própria. A mitigação que ENTROU nesta rodada é a `instrucao_curadoria` dinâmica: quando nenhum item da lista é da categoria, a Luna não recomenda nenhum e é honesta — medido, o modelo passou a **buscar de novo sem o filtro de tamanho** e achar a peça ÚNICO por conta própria.
+
 ### 10.3 BLOQUEADO — calibração comercial (não trava código; muda só um número/env)
 5. **`minimo_grade`**: 3, 5 ou 10 peças somadas para um campeão de venda ser promovido? (3 é escolha minha, não medida.)
 6. **Atacado**: revendedor vê primeiro os **campeões de venda** (default entregue) ou os de **grade mais funda**?
@@ -801,4 +822,5 @@ Um único `inserir_prompt.py`, **depois** de F1-F5 no ar e verdes.
 | B14 | **Retenção/expurgo de `tool_filtro_eventos`** | Guarda termo buscado e user_id. Se o dono quiser, política de 90 dias + RLS com policy de insert para anon (decidir junto, não improvisar) |
 | B15 | **`{percentual}` e `{total/6}` não existem no retorno de `calcular_total`** — achado da revisão adversarial da F6 (09/08). O retorno real é `{status, modo, primeira_compra, subtotal_varejo, total, desconto, minimo_exigido, minimo_atingido, falta_para_minimo, parcelado, itens_detalhados}` (bot.py:1372-1383). O template **obrigatório** de atacado usa `🎁 VOCÊ ESTÁ ECONOMIZANDO: R$ {desconto} ({percentual}% de desconto!)`, e as TÉCNICAS 1 e 6 usam `R$ {total/6}` — ou seja, o prompt manda o modelo **calcular de cabeça** exatamente onde diz "VOCÊ NÃO CALCULA TOTAL DE CABEÇA. NUNCA". **Agravante:** `percentual` existe em OUTRA tool (`verificar_promocao_hoje`, bot.py:1399) — há colisão de nome, e o modelo pode trazer o percentual de uma promoção para o resumo de atacado. | Predata a F6 e muda comportamento de **atacado** (que tem 4 cenários próprios na suíte). Mexer aqui na mesma janela do prompt violaria a §1 da `POLITICA_DE_GATE.md`. Correção provável: `calcular_total` devolver `percentual_desconto` e `parcela_6x` calculados no Python (fonte única), e o prompt citar os campos novos |
 | B16 | **Docstring de `calcular_total` anuncia `parcelado_6x`; o código devolve `parcelado`** | Mesma revisão. Uma linha, mas é contrato de tool: entra junto com B15 para não gastar duas janelas de gate |
+| B18 | **`produtos_recomendados` com id sem busca no turno** — `recommended_empty_when_no_search` falhou nos **dois** gates completos, com ids diferentes (`[0]` no #2, `[14681170]` no #3). O modelo põe id no JSON em turno que não chamou busca | Inócuo em produção: `renderizar_mensagem_estruturada` ignora id fora do cache do turno, então nenhum card errado sai. É desobediência de contrato, `media`, e some se o §0 ganhar uma linha — mas §0 é o bloco mais lido do prompt e mexer nele sem gate próprio é risco desproporcional ao dano |
 | B17 | **A falha crônica de `fantasia` é ESTOQUE, não prompt** — medido em 09/08: a Matriz (`id_loja=244033`, a única que o prompt permite) tem **1 linha** de fantasia com estoque: `40214981 FANTASIA LUXO DIVERSAS`, tamanho ÚNICO, **1 unidade**. Existem 11 linhas com "FANTASIA" no nome no catálogo, 10 delas em **outras lojas**. Ou seja: pedimos ao modelo até 3 fantasias e existe 1 unidade de 1 fantasia — toda falha é ele completando a lista com vizinhos. **A/B com 3 repetições por braço** provou que não é regressão da F6: `curadoria-fantasia-off-category` falha 1/3 no prompt antigo e 2/3 no novo, **com os ids idênticos** (34176431 SEX SHOP TESÃO DE TOURO, 44094069 SEX SHOP VIBRADOR) nos dois — n=3 não distingue 1/3 de 2/3 | Não se corrige com texto. Três caminhos, todos fora desta rodada: (i) **dado** — a loja repor fantasia; (ii) **código** — instrução dinâmica no payload no molde do §3.9 ("só 1 item desta lista é da categoria; recomende só ele"), que é o mesmo padrão que resolveu o tamanho composto 3/3; (iii) **teste** — o cenário aceitar 1 card como sucesso em vez de esperar 3. A (ii) é a de melhor retorno e tem precedente medido |
