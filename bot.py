@@ -3391,6 +3391,15 @@ def webhook(evento=None, tipo=None):
                 return jsonify({"status": "bad_signature"}), 403
         data = request.get_json(silent=True) or {}
         for entry in data.get("entry", []):
+            # `entry.id` E o WhatsApp Business Account ID (WABA). E a unica forma de
+            # descobri-lo com o token que temos: o System User tem
+            # whatsapp_business_management mas NAO business_management, entao todas as
+            # arestas (/me/businesses, assigned_whatsapp_business_accounts, o no do
+            # telefone) devolvem vazio ou Missing Permission. E o WABA e obrigatorio para
+            # criar/consultar template — sem ele o alerta da atendente nao atravessa a
+            # janela de 24h. Logar aqui e barato e resolve de uma vez.
+            if entry.get("id"):
+                print(f"[cloud] WABA_ID (entry.id) = {entry.get('id')}")
             for change in entry.get("changes", []):
                 if change.get("field") != "messages":
                     continue  # ignora template/quality/account updates
