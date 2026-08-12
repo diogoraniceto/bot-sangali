@@ -426,6 +426,10 @@ def _resolver_tamanho_alvo(tamanho_alvo):
 
 
 HANDOFF_SILENCIO_MIN = 120  # silencia o bot por 2h apos handoff
+# Template aprovado na Meta para o alerta da atendente. Vazio = so texto livre (que
+# fora da janela de 24h NAO chega). Env-tunavel para trocar o nome/idioma sem deploy.
+HANDOFF_TEMPLATE = os.getenv("HANDOFF_TEMPLATE", "handoff_atendente").strip()
+HANDOFF_TEMPLATE_LANG = os.getenv("HANDOFF_TEMPLATE_LANG", "pt_BR").strip()
 CONVERSA_GAP_HORAS = 24     # gap entre msgs que reseta o historico do contexto
 
 
@@ -1793,20 +1797,50 @@ def criar_tool_transferir(user_id):
             return {"status": "erro", "msg": "Número do atendente não configurado."}
 
         texto = _montar_mensagem_operador(user_id, motivo, resumo, produtos_interesse)
-        enviar_mensagem_whatsapp(operator_number, texto)
+        # Params do template, na ordem de {{1}}..{{4}}. O historico NAO vai (parametro de
+        # template nao aceita quebra de linha e o corpo tem teto de 1024 chars); a
+        # atendente tem o numero do cliente e abre a conversa com ele.
+        ok_alerta, wamid_alerta, via = enviar_alerta_operador(
+            operator_number, texto,
+            [user_id, _MOTIVO_LABEL.get(motivo, motivo), resumo or "-",
+             produtos_interesse or "nenhum produto citado"])
 
-        try:
-            supabase.table("conversation_handoffs").insert({
-                "user_id": user_id,
-                "motivo": motivo,
-                "resumo": resumo,
-                "produtos_interesse": produtos_interesse,
-                "operator_number": operator_number,
-            }).execute()
-        except Exception as e:
-            print(f"⚠️ Erro ao registrar handoff: {e}")
+        # A linha em conversation_handoffs e o que ATIVA o silencio de 2h
+        # (`_em_silencio_pos_handoff` le esta tabela). Entao ela SO entra se a atendente
+        # foi avisada: sem aviso nao existe humano para nao atropelar, e calar o bot
+        # abandonaria o cliente por 2h depois de dizer que a ajuda vinha.
+        # Preco assumido: handoff que falha nao deixa registro na tabela (fica no log e
+        # no e-mail de alerta) e pode ser retentado no turno seguinte — o que aqui e
+        # desejavel, porque a proxima tentativa pode dar certo.
+        if ok_alerta:
+            try:
+                supabase.table("conversation_handoffs").insert({
+                    "user_id": user_id,
+                    "motivo": motivo,
+                    "resumo": resumo,
+                    "produtos_interesse": produtos_interesse,
+                    "operator_number": operator_number,
+                }).execute()
+            except Exception as e:
+                print(f"⚠️ Erro ao registrar handoff: {e}")
 
-        print(f"🤝 Handoff disparado para {operator_number} | user={user_id} | motivo={motivo}")
+        print(f"🤝 Handoff disparado para {operator_number} | user={user_id} | "
+              f"motivo={motivo} | via={via} | wamid={wamid_alerta}")
+
+        if not ok_alerta:
+            # NUNCA devolver "ok" aqui. O modelo confia nisso, diz ao cliente "ja chamei
+            # uma atendente" e o silencio de 2h entra em vigor — cliente abandonado
+            # achando que a ajuda vem. Sem aviso entregue, o certo e a Luna dar o
+            # WhatsApp da loja e CONTINUAR atendendo.
+            _enviar_email_alerta(
+                "Handoff sem aviso na atendente",
+                f"Cliente {user_id} pediu atendimento humano (motivo {motivo}) e o aviso "
+                f"para {operator_number} NAO saiu. Resumo: {resumo}")
+            return {"status": "aviso_nao_entregue",
+                    "msg": "NAO consegui avisar a atendente. NAO diga que chamou alguem. "
+                           "Peca desculpa pela demora, passe o WhatsApp da Matriz "
+                           "(27) 99968-8088 para o cliente falar direto, e continue "
+                           "ajudando normalmente."}
         return {"status": "ok"}
 
     return transferir_para_atendente
@@ -2778,11 +2812,46 @@ def _cloud_send(payload):
         return None
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     resp = requests.post(_GRAPH_MSG_URL, json=payload, headers=headers, timeout=30)
+    # O CORPO do erro e a unica coisa que diz POR QUE a Meta recusou (code 131047 =
+    # fora da janela de 24h, 131026 = numero nao recebe, 132000 = template invalido...).
+    # `raise_for_status()` sozinho produz "400 Client Error" e joga o motivo no lixo —
+    # foi o que nos deixou horas sem saber por que o alerta do handoff nao chegava.
+    if not resp.ok:
+        try:
+            err = (resp.json().get("error") or {})
+            print(f"[cloud] ERRO {resp.status_code}: code={err.get('code')} "
+                  f"subcode={err.get('error_subcode')} msg={err.get('message')} "
+                  f"detalhe={(err.get('error_data') or {}).get('details')}")
+        except Exception:
+            print(f"[cloud] ERRO {resp.status_code}: {resp.text[:300]}")
     resp.raise_for_status()
     try:
         return (resp.json().get("messages") or [{}])[0].get("id")
     except Exception:
         return None
+
+
+def _cloud_send_template(numero, nome_template, params, lang="pt_BR"):
+    """Envia TEMPLATE aprovado. Unico envio que atravessa a janela de 24h.
+
+    Params sao substituidos em {{1}}, {{2}}... na ordem. A Meta REJEITA parametro com
+    \\n, \\t ou espaco duplo, entao cada um e achatado aqui — nao no chamador, senao
+    um resumo com quebra de linha derruba o alerta inteiro.
+    """
+    def _limpar(v):
+        return re.sub(r"\s+", " ", str(v or "")).strip() or "-"
+
+    return _cloud_send({
+        "messaging_product": "whatsapp", "to": numero, "type": "template",
+        "template": {
+            "name": nome_template,
+            "language": {"code": lang},
+            "components": [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": _limpar(p)} for p in params],
+            }],
+        },
+    })
 
 
 # ---- Midia RECEBIDA do cliente (audio/imagem): download + Gemini (multimodal) ----
@@ -2930,6 +2999,81 @@ def enviar_mensagem_whatsapp(numero, texto):
     except Exception as e:
         print(f"Erro de conexão Uazapi: {e}")
     return None
+
+def _janela_24h_aberta(numero):
+    """True se ESTE numero escreveu ao bot nas ultimas 24h (janela da Cloud API aberta).
+
+    Existe porque "a Meta aceitou com HTTP 200" NAO e "foi entregue": para quem esta fora
+    da janela, o texto livre e aceito e depois descartado, e o recibo de falha so chega
+    no webhook, tarde demais para o turno. O chat_history ja tem a resposta, entao damos
+    a resposta honesta AGORA em vez de adivinhar.
+
+    Em qualquer erro devolve False: pessimista de proposito — e melhor a Luna dar o
+    telefone da loja sem precisar do que prometer uma atendente que nao foi avisada.
+    """
+    if not numero:
+        return False
+    try:
+        corte = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        r = (supabase.table("chat_history")
+             .select("created_at")
+             .eq("user_id", str(numero))
+             .eq("role", "user")
+             .gte("created_at", corte)
+             .limit(1).execute())
+        return bool(r.data)
+    except Exception as e:
+        print(f"[handoff] nao consegui checar a janela de 24h de {numero}: {e}")
+        return False
+
+
+def enviar_alerta_operador(numero, texto_rico, params_template):
+    """Alerta PROATIVO para a atendente. Devolve (ok, wamid, via).
+
+    Por que nao e um `enviar_mensagem_whatsapp` comum: a atendente NUNCA escreve para o
+    bot, entao ela esta sempre fora da janela de 24h da Cloud API, e texto livre para
+    fora da janela nao chega. Medido em 12/08: a Meta aceitou com HTTP 200 e a mensagem
+    nunca foi entregue.
+
+    Ordem no cloud: TEMPLATE primeiro (unico que atravessa a janela); se ele falhar
+    (nao aprovado ainda, nome errado, idioma errado) cai para texto livre, que ainda
+    funciona nas raras vezes em que a janela esta aberta. Degradar e melhor que escurecer.
+    """
+    if WHATSAPP_PROVIDER != "cloud":
+        # UAZAPI ignora janela: manda o texto rico, que traz o historico junto.
+        enviar_mensagem_whatsapp(numero, texto_rico)
+        return True, None, "uazapi"
+
+    if HANDOFF_TEMPLATE:
+        try:
+            wamid = _cloud_send_template(numero, HANDOFF_TEMPLATE, params_template,
+                                        HANDOFF_TEMPLATE_LANG)
+            print(f"[handoff] template '{HANDOFF_TEMPLATE}' enviado a {numero} wamid={wamid}")
+            return True, wamid, "template"
+        except Exception as e:
+            print(f"[handoff] template '{HANDOFF_TEMPLATE}' FALHOU ({e}) — tentando texto livre")
+
+    # Fallback de texto livre. So conta como avisado se a janela estiver ABERTA: fora
+    # dela a Meta aceita com 200 e descarta, e devolver "ok" aqui reintroduz a mentira
+    # que este bloco todo existe para matar.
+    janela = _janela_24h_aberta(numero)
+    try:
+        wamid = _cloud_send({
+            "messaging_product": "whatsapp", "to": numero, "type": "text",
+            "text": {"body": texto_rico, "preview_url": False},
+        })
+    except Exception as e:
+        print(f"[handoff] FALHA TOTAL ao avisar a atendente {numero}: {e}")
+        return False, None, "falhou"
+
+    if janela:
+        print(f"[handoff] texto livre entregue a {numero} wamid={wamid} (janela ABERTA)")
+        return True, wamid, "texto"
+    print(f"[handoff] texto livre para {numero} foi ACEITO (wamid={wamid}) mas a janela de "
+          f"24h esta FECHADA — a Meta vai descartar. Tratando como NAO avisado. "
+          f"Aprove o template '{HANDOFF_TEMPLATE}' para resolver.")
+    return False, wamid, "texto_fora_da_janela"
+
 
 def _extract_message_text(msg_data):
     """Extrai texto do payload do webhook, com fallback para mensagens citadas (botão Responder).
@@ -3251,7 +3395,23 @@ def webhook(evento=None, tipo=None):
                 if change.get("field") != "messages":
                     continue  # ignora template/quality/account updates
                 value = change.get("value", {})
-                for m in value.get("messages", []):  # ignora value["statuses"] (recibos)
+                # `statuses` sao os recibos (sent/delivered/read/failed). Ignorar isto em
+                # silencio nos custou horas: a Cloud API aceita o envio com HTTP 200 e so
+                # reporta a falha AQUI, depois. Sem este log, "a Meta aceitou" e tudo o
+                # que se sabe, e uma mensagem nao entregue e indistinguivel de entregue.
+                for st in value.get("statuses", []):
+                    estado = st.get("status")
+                    if estado == "failed":
+                        errs = st.get("errors") or [{}]
+                        e0 = errs[0]
+                        print(f"[cloud][status] FALHOU wamid={st.get('id')} "
+                              f"para={st.get('recipient_id')} code={e0.get('code')} "
+                              f"titulo={e0.get('title')} detalhe="
+                              f"{(e0.get('error_data') or {}).get('details')}")
+                    elif estado in ("delivered", "read"):
+                        print(f"[cloud][status] {estado} wamid={st.get('id')} "
+                              f"para={st.get('recipient_id')}")
+                for m in value.get("messages", []):
                     _ingest_cloud_message(m, value)
         return jsonify({"status": "ok"}), 200
 
