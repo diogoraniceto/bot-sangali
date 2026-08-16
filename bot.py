@@ -138,6 +138,20 @@ UNICO_NAO_ATENDE = {t.strip().upper() for t in os.getenv(
 # Corte do numerico. 46 e ESTIMATIVA, nao medida: nao existe mapa numero->letra no
 # banco. Por isso e env — se a loja disser que 48 ainda serve, muda sem deploy.
 UNICO_NUMERICO_MAX = int(os.getenv("UNICO_NUMERICO_MAX", "46"))
+# Peca INFANTIL so aparece se o cliente pediu (decisao do dono, 16/08). Sem isto ela
+# vaza para busca de adulto: medido em 16 buscas comuns, 9 (56%) traziam infantil e
+# 6 itens infantis vinham marcados `destaque` — CAMPEAO de venda.
+#
+# O mecanismo e perverso e vale registrar: o ranking (0013) promove a campeao por
+# `grade`, que e profundidade de estoque. CALCINHA INFANTIL MALHA tem 108 pecas,
+# CUECA INFANTIL SRAMBOX tem 201. Ou seja, quanto MAIS infantil encalhado, mais o
+# bot empurrava infantil para quem pediu lingerie de adulto.
+INFANTIL_SO_SE_PEDIR = os.getenv("INFANTIL_SO_SE_PEDIR", "1") not in (
+    "0", "false", "False", "")
+# Ate que idade/tamanho numerico conta como crianca. O catalogo NAO tem tamanho
+# numerico abaixo de 33 (medido: 33,35,37,40,42..58), entao "tamanho 10" so pode
+# ser crianca — e um sinal seguro, nao um chute.
+INFANTIL_IDADE_MAX = int(os.getenv("INFANTIL_IDADE_MAX", "16"))
 # [BLOQUEADO §10.3 item 6] No ATACADO, o revendedor ve primeiro os campeoes de
 # venda ("campeao", default) ou os de grade mais funda ("grade")? Em "grade" a
 # profundidade reordena DENTRO de cada tier — o escopo de categoria (tier) e
@@ -436,6 +450,61 @@ def _tamanho_no_nome(nome):
     """
     m = _TAM_NO_NOME.search((nome or "").upper().strip())
     return m.group(1).upper() if m else None
+
+
+# ---- INFANTIL: so aparece se o cliente pediu -------------------------------
+# O NOME e o unico sinal confiavel. `nome_grupo` existe e tem categorias explicitas
+# ('CUECA INFANTIL', 'BABY DOLL INFANTIL'), mas esta VAZIO em 63% das linhas
+# (4.263 de 6.739) e nao acusa NENHUM produto que o nome ja nao acuse — e
+# subconjunto estrito, medido em 16/08. Por isso a regra le o nome.
+#
+# 'BABY' NAO entra: 'BABY DOLL' e camisola de ADULTO, e sao 30+ produtos. O
+# 'BABY DOLL INFANTIL' e pego pela palavra INFANTIL, como deve ser.
+_INFANTIL_PRODUTO = re.compile(
+    r"\bINFANT|\bINF\b|\bINF\.|\bJUVENIL\b|\bBEBE\b|\bKIDS?\b|\bCRIANC", re.I)
+
+# Sinais de que o CLIENTE quer infantil. Nao inclui 'filho/filha/neto/sobrinho'
+# sozinhos de proposito: em loja de lingerie "presente pra minha filha" e
+# ambiguo (filha adulta), e errar para o lado adulto e o comportamento normal da
+# loja. Esses casos chegam por outro caminho — o modelo entende "pijama pro meu
+# filho de 6 anos" e passa `termo_cliente="pijama infantil"`, que a regra abaixo
+# pega. O regex e a rede de seguranca sobre o texto cru, nao o cerebro.
+_INFANTIL_PEDIDO = re.compile(
+    r"\bINFANT|\bJUVEN|\bCRIANC|\bKIDS?\b|\bBEBE\b|\bMENIN[OA]|\bGAROT[OA]", re.I)
+_INFANTIL_IDADE = re.compile(r"\b(\d{1,2})\s*(?:ANOS?|ANINHOS?)\b", re.I)
+
+
+def _norm_txt(txt):
+    """Sem acento e em maiuscula, usando a MESMA tabela do tamanho ('Ç'->'C')."""
+    return str(txt or "").translate(_TRANS_TAMANHO).upper()
+
+
+def _produto_infantil(nome):
+    """True se o NOME do produto o identifica como infantil/juvenil."""
+    return bool(_INFANTIL_PRODUTO.search(_norm_txt(nome)))
+
+
+def _cliente_quer_infantil(termo_cliente, tokens_tamanho=None):
+    """True se o cliente pediu infantil neste turno.
+
+    Le DUAS fontes: o `termo_cliente` que o modelo montou (ele ja resolveu "pro
+    meu filho de 6 anos" -> "pijama infantil") e a mensagem crua do cliente, que
+    e a rede se o modelo nao resolver.
+
+    Tres gatilhos: palavra explicita; idade ate INFANTIL_IDADE_MAX ("de 6 anos");
+    e tamanho numerico ate o mesmo corte — este ultimo e seguro porque o catalogo
+    nao tem numerico abaixo de 33, entao "tamanho 10" so pode ser crianca.
+    """
+    alvo = f"{_norm_txt(termo_cliente)} {_norm_txt(getattr(_turn_ctx, 'msg_cliente', ''))}"
+    if _INFANTIL_PEDIDO.search(alvo):
+        return True
+    for n in _INFANTIL_IDADE.findall(alvo):
+        if int(n) <= INFANTIL_IDADE_MAX:
+            return True
+    for t in (tokens_tamanho or ()):
+        if str(t).isdigit() and int(t) <= INFANTIL_IDADE_MAX:
+            return True
+    return False
 
 
 def _inclui_unico(tokens_alvo):
@@ -1148,8 +1217,20 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     dropados = []                      # tamanhos crus descartados pelo overlap
     n_dropados_igualdade_legado = 0    # sobreviveram ao overlap, morreriam na igualdade
     unico_falso = []                   # 'ÚNICO' no ERP, tamanho real no nome
+    infantis_fora = []                 # infantil em busca que nao pediu infantil
+
+    # Pediu infantil? A pergunta e feita UMA vez por busca, nao por item.
+    quer_infantil = (not INFANTIL_SO_SE_PEDIR) or _cliente_quer_infantil(
+        termo_cliente, tokens_alvo)
 
     for p in produtos_candidatos:
+        # Corte de PUBLICO, antes do corte de tamanho: peca infantil so entra se o
+        # cliente pediu. Fica aqui, e nao no `excluir_ids` da RPC, porque aquele tem
+        # um fallback que abandona TODAS as exclusoes quando a lista fica curta —
+        # correto para "ja mostrei esse card", inaceitavel para uma politica.
+        if not quer_infantil and _produto_infantil(p.get('nome')):
+            infantis_fora.append((p.get('nome') or '?')[:34])
+            continue
         if tamanho_alvo:
             tokens_p = set(_tokens_tamanho(p.get('tamanho')))
             if (not tokens_alvo) or (tokens_alvo & tokens_p):
@@ -1179,6 +1260,11 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
               f"descartada(s) do pedido '{tamanho_alvo}': {unico_falso}")
     if dropados:
         print(f"[TAMANHO] descartados por tamanho: {dropados}")
+    if infantis_fora:
+        print(f"[INFANTIL] {len(infantis_fora)} peca(s) infantil fora (cliente nao "
+              f"pediu infantil): {infantis_fora}")
+    elif quer_infantil and INFANTIL_SO_SE_PEDIR:
+        print("[INFANTIL] cliente PEDIU infantil — nenhuma peca infantil filtrada")
 
     # 3.1. O retorno DECLARA o filtro aplicado. O modelo tratava a própria memória do
     # que pediu como verdade; agora a verdade vem no payload. `aviso` só existe quando
@@ -1279,9 +1365,16 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     # Peca de tamanho unico numa busca COM tamanho: sem avisar, o modelo tende a
     # descarta-la achando que e o tamanho errado (o §4 manda curar). Mesmo padrao
     # §3.9: instrucao dinamica, nomeando as pecas, so quando o caso ocorre.
+    # `_tamanho_no_nome(...) is None` e obrigatorio aqui, nao so no descarte acima.
+    # '10CR CAMISOLA DE URDA RENDA GG' e 'ÚNICO' no ERP mas GG de verdade; numa
+    # busca por GG ela FICA (o tamanho bate) — e sem esta condicao a instrucao ia
+    # junto jurando que a peca "TEM REGULAGEM". Foi exatamente o que fez a Luna
+    # dizer "e tamanho unico com regulagem e veste super bem no GG" para uma
+    # camisola GG comum: mentira que so aparece na troca. Pego no gate de 16/08.
     if unico_incluido:
         _unicos = [p for p in selecao
-                   if "UNICO" in _tokens_tamanho(p.get("tamanho"))]
+                   if "UNICO" in _tokens_tamanho(p.get("tamanho"))
+                   and _tamanho_no_nome(p.get("nome")) is None]
         if _unicos:
             _quais = "; ".join((p.get("nome") or "?")[:40] for p in _unicos[:3])
             filtro_aplicado["instrucao_tamanho_unico"] = (
@@ -1292,6 +1385,31 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
                 f"regulagem.")
             print(f"[TAMANHO] {len(_unicos)} item(ns) de tamanho UNICO na selecao para "
                   f"'{tamanho_alvo}' — instrucao dinamica enviada")
+
+    # Suprimir a instrucao acima nao basta: o §6 do prompt afirma "ÚNICO tem
+    # regulagem" e o modelo obedece a regra ESTATICA mesmo sem reforco no payload —
+    # medido no gate de 16/08, a Luna disse "e tamanho unico, mas tem regulagem e
+    # veste super bem no GG" sobre uma camisola GG comum COM a instrucao ja
+    # suprimida. O prompt ganhou a excecao, e aqui vai o par dinamico que o §3.9 diz
+    # ser o que realmente pega: NOMEIA as pecas e da o tamanho de verdade.
+    #
+    # FORA do `if unico_incluido`: numa busca SEM tamanho nao ha expansao, mas as
+    # pecas 'ÚNICO' aparecem do mesmo jeito (nao ha filtro de tamanho para barra-las)
+    # e o §6 mentiria igual. Este e o caso mais comum, nao um canto.
+    _falsos = [p for p in selecao
+               if "UNICO" in _tokens_tamanho(p.get("tamanho"))
+               and _tamanho_no_nome(p.get("nome")) is not None]
+    if _falsos:
+        _quais = "; ".join(f"{(p.get('nome') or '?')[:40]} = "
+                           f"{_tamanho_no_nome(p.get('nome'))}"
+                           for p in _falsos[:3])
+        filtro_aplicado["instrucao_tamanho_unico_falso"] = (
+            f"ATENCAO: {len(_falsos)} item(ns) desta lista aparece(m) com tamanho "
+            f"'UNICO' por ERRO DE CADASTRO — o tamanho de verdade esta no fim do "
+            f"nome ({_quais}). NAO diga que sao tamanho unico e NAO diga que tem "
+            f"regulagem. Trate cada um como peca do tamanho que esta no nome.")
+        print(f"[TAMANHO] {len(_falsos)} item(ns) 'UNICO' FALSO na selecao — "
+              f"instrucao de correcao enviada")
 
     compostos = [p for p in selecao if "/" in (p.get("tamanho") or "")]
     if compostos:

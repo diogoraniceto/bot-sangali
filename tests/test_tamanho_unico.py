@@ -204,6 +204,75 @@ except Exception as e:
 
 
 # =========================================================================
+# ACHADO NO GATE DE 16/08, depois do U10 ja estar pronto. O U10 descarta a peca de
+# 'ÚNICO' falso quando o nome diz OUTRO tamanho. Faltava o caso em que o nome diz
+# o MESMO tamanho: '10CR CAMISOLA DE URDA RENDA GG' numa busca por GG FICA na lista
+# — e certo, ela e GG de verdade. Mas a instrucao dinamica ia junto jurando que ela
+# "TEM REGULAGEM e veste do P ao GG".
+#
+# Resultado real no gate: a Luna disse "e tamanho unico com regulagem e veste super
+# bem no GG" sobre uma camisola GG comum. Mentira que so aparece na troca.
+print("\n### U11 — 'ÚNICO' falso que FICA na lista nao pode virar 'tem regulagem'")
+try:
+    r = bot.consultar_estoque_supabase("camisola", tamanho="GG", id_loja=LOJAS)
+    if r.get("status") != "sucesso":
+        skip("U11", f"busca devolveu {r.get('status')}")
+    else:
+        ps = r.get("produtos") or []
+        fa = r.get("filtro_aplicado") or {}
+        falsos = [p for p in ps if eh_unico(p.get("tamanho"))
+                  and bot._tamanho_no_nome(p.get("nome")) is not None]
+        instr = fa.get("instrucao_tamanho_unico") or ""
+        if not falsos:
+            skip("U11", "nenhum 'unico' falso nesta busca hoje (catalogo mudou)")
+        else:
+            # Ela FICA: o tamanho do nome bate com o pedido, entao e peca legitima.
+            ok(True, f"U11 o 'unico' falso segue na lista ({falsos[0].get('nome')[:34]})")
+            for p in falsos:
+                ok((p.get("nome") or "") not in instr,
+                   f"U11 ... mas NAO e citada como tendo regulagem",
+                   instr[:100])
+            # Suprimir nao basta: o §6 afirma "ÚNICO tem regulagem" e o modelo
+            # obedeceu a regra ESTATICA mesmo sem a instrucao — no gate de 16/08 a
+            # Luna disse "e tamanho unico, mas tem regulagem e veste super bem no
+            # GG" com a instrucao JA suprimida. Precisa de contra-instrucao ativa.
+            corr = fa.get("instrucao_tamanho_unico_falso") or ""
+            ok("ERRO DE CADASTRO" in corr,
+               "U11 vem a CONTRA-instrucao dizendo que o 'UNICO' e erro de cadastro",
+               corr[:90])
+            for p in falsos:
+                t_real = bot._tamanho_no_nome(p.get("nome"))
+                ok(t_real in corr,
+                   f"U11 ... e ela informa o tamanho REAL ({t_real})", corr[:90])
+            ok("regulagem" in corr.lower() and "NAO diga" in corr,
+               "U11 ... e proibe explicitamente falar em regulagem", corr[:90])
+except Exception as e:
+    skip("U11", f"{type(e).__name__}: {str(e)[:70]}")
+
+# Busca SEM tamanho nao tem expansao de UNICO, mas as pecas 'ÚNICO' aparecem do
+# mesmo jeito (nao ha filtro de tamanho para barra-las) e o §6 mentiria igual. Por
+# isso a contra-instrucao mora FORA do `if unico_incluido`. 'camisola de urda'
+# devolve 4 dessas de uma vez — nao e um canto raro.
+try:
+    r = bot.consultar_estoque_supabase("camisola de urda", tamanho=None, id_loja=LOJAS)
+    if r.get("status") != "sucesso":
+        skip("U12", f"busca devolveu {r.get('status')}")
+    else:
+        falsos = [p for p in (r.get("produtos") or []) if eh_unico(p.get("tamanho"))
+                  and bot._tamanho_no_nome(p.get("nome")) is not None]
+        corr = (r.get("filtro_aplicado") or {}).get("instrucao_tamanho_unico_falso") or ""
+        if not falsos:
+            skip("U12", "nenhum 'unico' falso nesta busca hoje")
+        else:
+            ok("ERRO DE CADASTRO" in corr,
+               f"U12 busca SEM tamanho tambem corrige os {len(falsos)} 'UNICO' falsos",
+               corr[:90])
+except Exception as e:
+    skip("U12", f"{type(e).__name__}: {str(e)[:70]}")
+
+
+
+# =========================================================================
 print("\n### U8 — knobs de env (ajuste sem deploy)")
 _orig = (bot.UNICO_ATENDE, bot.UNICO_NUMERICO_MAX, set(bot.UNICO_NAO_ATENDE))
 try:
@@ -232,6 +301,13 @@ ok("não descarte" in prompt.lower(),
    "U9 prompt manda NAO descartar a peca de tamanho unico")
 ok("de propósito" in prompt or "de proposito" in prompt,
    "U9 prompt explica que a peca aparece DE PROPOSITO na busca com tamanho")
+# A regra ESTATICA que afirmava "todo ÚNICO tem regulagem" foi o que produziu a
+# mentira no gate de 16/08, mesmo com o payload ja corrigido. Ela precisa da
+# excecao, senao o modelo obedece o prompt e ignora a ausencia da instrucao.
+ok("EXCEÇÃO" in prompt and "erro de cadastro" in prompt.lower(),
+   "U9 §6 tem a excecao: o NOME manda no campo `tamanho`")
+ok("em geral a peça tem REGULAGEM" in prompt,
+   "U9 ... e a afirmacao virou 'EM GERAL', nao mais absoluta")
 
 
 print("\n" + ("=" * 60))
