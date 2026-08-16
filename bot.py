@@ -845,8 +845,9 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
                  (ex: produtos sexshop, cosméticos), OMITA este parâmetro — não envie
                  o campo. Nunca escreva a palavra "None"/"null" como valor: ela seria
                  usada como se fosse um tamanho e a busca voltaria vazia.
-        id_loja: id da loja a filtrar (string). Use o id_loja informado nas instruções
-                 do prompt para restringir a busca a uma filial específica.
+        id_loja: id(s) da loja a filtrar (string). Aceita VÁRIAS lojas separadas por
+                 vírgula — copie exatamente o valor informado no prompt (§4b), que
+                 hoje é "244033,94134" (MATRIZ + FILIAL 01, ambas entregam).
                  Use None para buscar em todas as lojas.
 
     Returns:
@@ -898,7 +899,12 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     tokens_alvo = set(_tokens_tamanho(tamanho_alvo)) if tamanho_alvo else set()
     # hoistado: id_loja_alvo entra no retorno/log dos 4 caminhos, inclusive o
     # early-return de embedding abaixo.
-    id_loja_alvo = str(id_loja).strip() if id_loja not in (None, "") else None
+    # Multi-loja (0014): aceita "244033,94134". Tira TODO espaco em branco, nao so as
+    # bordas — o SQL tambem tolera, mas normalizar aqui mantem `filtro_aplicado` e o
+    # log de tool_filtro_eventos com um valor canonico, senao "244033, 94134" e
+    # "244033,94134" viram duas chaves diferentes na telemetria.
+    id_loja_alvo = re.sub(r"\s+", "", str(id_loja)) if id_loja not in (None, "") else None
+    id_loja_alvo = id_loja_alvo or None      # string vazia apos limpar = sem filtro
 
     # Base do evento de observabilidade — o mesmo dict alimenta os 4 returns, para
     # que count(*) seja de fato "chamadas da tool" e nenhum denominador saia errado.
