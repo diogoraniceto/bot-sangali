@@ -413,6 +413,31 @@ def _tokens_tamanho(txt):
     return [t for t in (tok.strip() for tok in _SEP_TAMANHO.split(norm)) if t]
 
 
+# Tamanho REAL escondido no FIM do nome, em peca cadastrada como 'ÚNICO'.
+# So ancorado no fim ($) de proposito: no meio do nome isto casaria com 'PONTO G',
+# 'PLUG ANAL M' e '15 ML' do sexshop, que sao outra coisa. O '(\d+)' opcional cobre
+# a numeracao infantil — 'PIJAMA JUVENIL REGATA LISTRADO GG(16)'.
+_TAM_NO_NOME = re.compile(
+    r"[\s\-/](PP|P|M|G|GG|XG|XGG|G1|G2|G3|EG)(\s*\(\d+\))?\s*$", re.I)
+
+
+def _tamanho_no_nome(nome):
+    """Tamanho real no fim do nome do produto, ou None.
+
+    27 produtos de vestuario tem `tamanho='ÚNICO'` no ERP mas o tamanho de verdade
+    escrito no fim do nome: 'CAMISOLA DE URDA XGG', 'TOP COTTON INFANTIL P',
+    'PIJAMA JUVENIL REGATA LISTRADO M (12)'. E erro de cadastro no GestaoClick, nao
+    peca com regulagem.
+
+    Sem isto a expansao de UNICO (ver `_inclui_unico`) oferece uma XGG a quem pediu
+    M — e pior, a instrucao dinamica vai junto jurando que a peca "TEM REGULAGEM e
+    veste do P ao GG". Metade desses 27 e GG/XGG, acima do que a propria politica
+    diz que a regulagem alcanca. Medido em 16/08 sobre as 6.739 linhas do catalogo.
+    """
+    m = _TAM_NO_NOME.search((nome or "").upper().strip())
+    return m.group(1).upper() if m else None
+
+
 def _inclui_unico(tokens_alvo):
     """True se a busca por `tokens_alvo` deve trazer TAMBEM as pecas de tamanho unico.
 
@@ -1122,11 +1147,21 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     validados = []
     dropados = []                      # tamanhos crus descartados pelo overlap
     n_dropados_igualdade_legado = 0    # sobreviveram ao overlap, morreriam na igualdade
+    unico_falso = []                   # 'ÚNICO' no ERP, tamanho real no nome
 
     for p in produtos_candidatos:
         if tamanho_alvo:
             tokens_p = set(_tokens_tamanho(p.get('tamanho')))
             if (not tokens_alvo) or (tokens_alvo & tokens_p):
+                # Entrou SO pela expansao de UNICO? Entao o nome tem a ultima
+                # palavra. 'CAMISOLA DE URDA XGG' e XGG, nao peca com regulagem —
+                # deixar passar faria a instrucao dinamica mentir o tamanho para o
+                # cliente, que e pior do que a peca nao aparecer.
+                if unico_incluido and (tokens_alvo & tokens_p) == {"UNICO"}:
+                    t_nome = _tamanho_no_nome(p.get('nome'))
+                    if t_nome and t_nome not in tokens_alvo:
+                        unico_falso.append(f"{(p.get('nome') or '?')[:34]}={t_nome}")
+                        continue
                 validados.append(p)
                 if (p.get('tamanho') or '').upper() != tamanho_alvo:
                     n_dropados_igualdade_legado += 1
@@ -1139,6 +1174,9 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     if n_dropados_igualdade_legado:
         print(f"[TAMANHO] overlap salvou {n_dropados_igualdade_legado} linha(s) que a "
               f"igualdade exata derrubaria (alvo={tamanho_alvo})")
+    if unico_falso:
+        print(f"[TAMANHO] {len(unico_falso)} peca(s) 'UNICO' com tamanho real no nome "
+              f"descartada(s) do pedido '{tamanho_alvo}': {unico_falso}")
     if dropados:
         print(f"[TAMANHO] descartados por tamanho: {dropados}")
 

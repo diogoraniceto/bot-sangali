@@ -21,6 +21,7 @@ U6  filtro_aplicado.tamanho continua sendo o que o CLIENTE pediu (nao "M/UNICO")
 U7  instrucao dinamica avisa o modelo para nao descartar a peca
 U8  os knobs de env desligam/ajustam sem deploy
 U9  o prompt explica a regulagem
+U10 'ÚNICO' FALSO: 27 pecas tem o tamanho real no fim do nome e sao descartadas
 
     python tests/test_tamanho_unico.py
 
@@ -101,8 +102,13 @@ ok(set(bot._tokens_tamanho("GG/UNICO")) == {"GG", "UNICO"},
 
 # =========================================================================
 print("\n### U5/U6/U7 — contra o banco de verdade")
+# A sonda e 'fantasia', nao 'camisola'. Motivo achado em 16/08: TODA camisola
+# cadastrada como 'ÚNICO' na verdade tem o tamanho no nome ('...RENDA GG'), entao
+# depois do descarte do U10 nao sobra unico legitimo naquela categoria — a busca
+# por camisola M passou a ser uma sonda que nao prova nada. Em fantasia/sexshop o
+# 'ÚNICO' e de verdade.
 try:
-    r = bot.consultar_estoque_supabase("camisola", tamanho="M", id_loja=LOJAS)
+    r = bot.consultar_estoque_supabase("fantasia", tamanho="M", id_loja=LOJAS)
     if r.get("status") != "sucesso":
         skip("U5/U6/U7", f"busca devolveu {r.get('status')}")
     else:
@@ -136,6 +142,65 @@ try:
         skip("U5 (56)", f"busca devolveu {r56.get('status')}")
 except Exception as e:
     skip("U5/U6/U7", f"{type(e).__name__}: {str(e)[:70]}")
+
+
+# =========================================================================
+# ACHADO EM 16/08, depois de a expansao ja estar escrita: nem todo 'ÚNICO' do ERP
+# e peca com regulagem. 27 produtos de vestuario tem tamanho='ÚNICO' e o tamanho
+# REAL escrito no fim do nome ('CAMISOLA DE URDA XGG', 'TOP COTTON INFANTIL P').
+# Metade e GG/XGG — acima do que a propria politica diz que a regulagem alcanca.
+#
+# Sem o descarte, a busca por M devolvia a XGG *com a instrucao dinamica jurando
+# que ela veste do P ao GG*. Mentir o tamanho para o cliente e pior do que a peca
+# nao aparecer, entao aqui a peca sai.
+print("\n### U10 — 'ÚNICO' falso: tamanho real escondido no nome do produto")
+
+for nome, esperado in (
+    ("CAMISOLA DE URDA XGG", "XGG"),
+    ("BABY DOOL RENDA GG", "GG"),
+    ("TOP COTTON INFANTIL P", "P"),
+    ("PIJAMA JUVENIL REGATA LISTRADO GG(16)", "GG"),     # numeracao infantil junto
+    ("PIJAMA JUVENIL REGATA LISTRADO M (12)", "M"),      # ... e com espaco
+):
+    got = bot._tamanho_no_nome(nome)
+    ok(got == esperado, f"U10 '{nome[:38]}' -> tamanho real {esperado}", got)
+
+# O ancora no FIM da string e o que separa isto de destruir o sexshop: 'PONTO G' e
+# 'PLUG ANAL M' tem letra de tamanho no MEIO do nome e sao produto de verdade.
+for nome in ("VIBRADOR PONTO G GOLFINHO", "PLUG ANAL M ACO BRILHANTE SEXY IMPORT",
+             "ICE GEL CORPORAL 15 ML SABORES FOR SEXY", "FANTASIA LUXO DIVERSAS",
+             "TANGA CAROLZINHA", "PETALAS PERFUMADAS 60 UNIDADES SEXY FANTASY"):
+    ok(bot._tamanho_no_nome(nome) is None,
+       f"U10 '{nome[:38]}' NAO e falso positivo (tamanho no meio, ou nenhum)",
+       bot._tamanho_no_nome(nome))
+
+try:
+    r = bot.consultar_estoque_supabase("camisola", tamanho="M", id_loja=LOJAS)
+    if r.get("status") != "sucesso":
+        skip("U10 (banco)", f"busca devolveu {r.get('status')}")
+    else:
+        ps = r.get("produtos") or []
+        mentirosos = [(p.get("nome"), p.get("tamanho")) for p in ps
+                      if eh_unico(p.get("tamanho"))
+                      and (bot._tamanho_no_nome(p.get("nome")) or "M") != "M"]
+        ok(not mentirosos,
+           "U10 busca por M nao devolve peca 'UNICO' cujo nome diz outro tamanho",
+           mentirosos)
+        # E o inverso continua valendo: unico LEGITIMO nao pode ter sido levado junto
+        # pelo descarte. Se o catalogo mudar e nao houver nenhum, isto vira skip.
+        r_f = bot.consultar_estoque_supabase("fantasia", tamanho="M", id_loja=LOJAS)
+        if r_f.get("status") == "sucesso":
+            legitimos = [p.get("nome") for p in (r_f.get("produtos") or [])
+                         if eh_unico(p.get("tamanho"))
+                         and bot._tamanho_no_nome(p.get("nome")) is None]
+            if legitimos:
+                ok(True, f"U10 unico LEGITIMO sobrevive ({legitimos[0][:34]})")
+            else:
+                skip("U10 (legitimo)", "nenhum unico legitimo nesta busca hoje")
+        else:
+            skip("U10 (legitimo)", f"busca devolveu {r_f.get('status')}")
+except Exception as e:
+    skip("U10 (banco)", f"{type(e).__name__}: {str(e)[:70]}")
 
 
 # =========================================================================

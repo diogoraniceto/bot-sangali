@@ -343,10 +343,29 @@ try:
            "C1 'fantasia' (1 item na lista) -> instrucao NOMEIA o id do unico item",
            (ins or "")[:110])
 
+    # MUDOU EM 16/08 (tamanho UNICO passou a entrar em busca com tamanho — opcao A).
+    # ANTES: a unica fantasia da Matriz e tamanho UNICO, era filtrada fora, sobrava
+    # ZERO fantasia, e a instrucao mandava `produtos_recomendados = []`. Ou seja:
+    # quem pedia "fantasia M" nao recebia NADA, tendo a peca em estoque.
+    # AGORA: ela sobrevive ao filtro e a instrucao cai no ramo "recomende SOMENTE
+    # esse id". O invariante que importa NAO mudou e continua sendo o assert — a
+    # Luna nao pode completar a lista com vizinhos de outra categoria.
     ins, n = _instr_curadoria("fantasia de enfermeira", "M")
-    ok(ins is not None and "NENHUM" in ins and "[]" in ins,
-       "C2 'fantasia M' (o unico e UNICO, filtrado) -> manda lista VAZIA, nao vizinhos",
+    ok(ins is not None and "40214981" in ins and "SOMENTE" in ins,
+       "C2 'fantasia M' -> a fantasia UNICO sobrevive e a instrucao NOMEIA o id",
        (ins or "")[:110])
+    ok(ins is not None and "OUTRA categoria" in ins and "NAO complete a lista" in ins,
+       "C2 ... e continua proibindo completar com vizinhos (o invariante nao mudou)",
+       (ins or "")[:110])
+
+    # O par de instrucoes tem de chegar junto: sem a de tamanho, o modelo ve uma
+    # peca 'UNICO' respondendo a um pedido 'M' e a descarta ou mente o tamanho.
+    r_c2 = bot.consultar_estoque_supabase("fantasia de enfermeira", tamanho="M",
+                                          id_loja="244033")
+    fa_c2 = (r_c2.get("filtro_aplicado") or {})
+    ok("regulagem" in (fa_c2.get("instrucao_tamanho_unico") or "").lower(),
+       "C2 ... acompanhada da instrucao de regulagem (senao o modelo curaria fora)",
+       (fa_c2.get("instrucao_tamanho_unico") or "")[:90])
 
     # Categoria bem estocada: o alerta seria ruido, e pior — faria a Luna deixar
     # venda na mesa. Silencio aqui e requisito, nao acidente.
