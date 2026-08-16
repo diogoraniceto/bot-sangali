@@ -206,13 +206,22 @@ try:
     r = bot.consultar_estoque_supabase("boxer sem costura", "M", "220540")
     fa = r.get("filtro_aplicado") or {}
     ok(r.get("status") == "sucesso", "E1 status sucesso", r.get("status"))
-    ok(fa.get("tamanho") == "M" and fa.get("tamanho_tokens") == ["M"]
+    # tokens_alvo passou a incluir UNICO por DECISAO DO DONO (16/08): peca de tamanho
+    # unico tem regulagem e veste P..GG, entao deve aparecer para quem pediu M. Nao e
+    # assert relaxado — e a expectativa nova. O `tamanho` segue sendo o que o CLIENTE
+    # pediu; quem revela a expansao e `tamanho_tokens`.
+    ok(fa.get("tamanho") == "M" and fa.get("tamanho_tokens") == ["M", "UNICO"]
        and fa.get("id_loja") == "220540", "E1 filtro_aplicado declara tamanho/tokens/loja", fa)
     ok("observacao_tamanho" in fa and "COMPOSTO" in fa["observacao_tamanho"],
        "E1 filtro_aplicado carrega a observacao sobre tamanho composto")
     ok("aviso" not in r, "E1 sem aviso quando o guard nao corrigiu", list(r))
     tams = sorted(p["tamanho"] for p in r["produtos"])
-    ok(tams == ["M", "P/M"], "E1 overlap liberou 'P/M' e nao vazou GG/UNICO", tams)
+    # 'P/M' entra pelo overlap e UNICO entra pela regulagem (decisao de 16/08).
+    # A metade que NAO mudou, e que continua sendo o ponto deste assert: 'GG' NAO
+    # pode vazar numa busca por 'M'. G != GG e a expansao que o prompt proibe.
+    ok(tams == ["M", "P/M", UNICO_ACENTO], "E1 overlap liberou 'P/M' e o UNICO", tams)
+    ok("GG" not in tams, "E1 'GG' NAO vazou numa busca por 'M' (G != GG segue valendo)",
+       tams)
     ok(bot._tokens_tamanho(r["produtos"][0]["tamanho"]), "E1 item mantem o campo tamanho")
     ok(set(r["produtos"][0]) >= {"id_produto", "id_unico", "nome", "tamanho", "preco", "tem_foto"},
        "E1 shape do item de produtos preservado", sorted(r["produtos"][0]))
@@ -236,16 +245,33 @@ try:
        "E3 busca em GG (nao em '49', a parte inteira do preco da legenda)",
        r3["filtro_aplicado"])
     ok("aviso" not in r3, "E3 sem aviso: o guard nao teve o que corrigir", list(r3))
-    ok([p["tamanho"] for p in r3["produtos"]] == ["GG"], "E3 devolve a grade certa",
+    # GG + UNICO: o unico entra pela regulagem (16/08). O que este assert protege
+    # continua igual — nenhuma linha de 'M'/'P/M' aparece, ou seja o filtro casou o
+    # tamanho pedido e nao a parte inteira do preco da legenda.
+    ok(sorted(p["tamanho"] for p in r3["produtos"]) == ["GG", UNICO_ACENTO],
+       "E3 devolve a grade certa",
        [p["tamanho"] for p in r3["produtos"]])
 
-    # E4 — vazio simetrico
-    bot._set_turn_ctx("u_test", "tem no 42?")
-    r4 = bot.consultar_estoque_supabase("camisola", "42", "220540")
+    # E4 — vazio simetrico.
+    # Era "42" e virou "56" por causa da decisao de 16/08: ate 46 a busca passou a
+    # trazer TAMBEM as pecas de tamanho unico (regulagem P..GG), entao "42" acha a
+    # ALGEMA RENDADA do fixture e deixa de ser um caminho vazio. Isso e o GANHO, nao
+    # um bug — mas o caminho vazio precisa continuar coberto, e acima de GG o unico
+    # nao entra. Se um dia UNICO_NUMERICO_MAX subir de 46, este 56 tem de subir junto.
+    bot._set_turn_ctx("u_test", "tem no 56?")
+    r4 = bot.consultar_estoque_supabase("camisola", "56", "220540")
     ok(r4["status"] == "vazio" and "filtro_aplicado" in r4,
        "E4 caminho vazio tambem declara filtro_aplicado", list(r4))
-    ok("42" in r4["msg"] and "220540" in r4["msg"],
+    ok("56" in r4["msg"] and "220540" in r4["msg"],
        "E4 msg do vazio cita tamanho e loja aplicados", r4["msg"])
+
+    # E4b — a prova do ganho: o MESMO 42 que antes voltava vazio agora acha o unico.
+    bot._set_turn_ctx("u_test", "tem no 42?")
+    r4b = bot.consultar_estoque_supabase("camisola", "42", "220540")
+    ok(r4b["status"] == "sucesso"
+       and [p["tamanho"] for p in r4b["produtos"]] == [UNICO_ACENTO],
+       "E4b '42' deixou de ser vazio: acha a peca de tamanho unico (regulagem)",
+       (r4b["status"], [p.get("tamanho") for p in r4b.get("produtos", [])]))
 
     # E5 — sem tamanho: nada e filtrado e filtro_aplicado diz isso
     bot._set_turn_ctx("u_test", "me mostra algemas")
@@ -263,9 +289,11 @@ try:
 
     print("\n### F. tool_filtro_eventos: 1 linha por chamada, nos 4 caminhos")
     status_vistos = [e.get("status_retornado") for e in EVENTOS]
-    ok(len(EVENTOS) == 6, "F1 uma linha por chamada da tool (6 chamadas em E1-E6)",
+    # 7 e nao 6 desde 16/08: o E4b entrou para provar que "42" deixou de voltar vazio.
+    ok(len(EVENTOS) == 7, "F1 uma linha por chamada da tool (7 chamadas em E1-E6)",
        (len(EVENTOS), status_vistos))
-    ok(status_vistos == ["sucesso", "sucesso", "sucesso", "vazio", "sucesso", "erro_embedding"],
+    ok(status_vistos == ["sucesso", "sucesso", "sucesso", "vazio", "sucesso", "sucesso",
+                         "erro_embedding"],
        "F2 status_retornado cobre sucesso/vazio/erro", status_vistos)
     ok(all(e.get("user_id") == "u_test" and e.get("tool") == "consultar_estoque_supabase"
            for e in EVENTOS), "F3 user_id vem do contexto da THREAD",
@@ -275,9 +303,14 @@ try:
        and e_guard["tamanho_aplicado"] == "M" and e_guard["tamanho_user_tokens"] == ["M"],
        "F4 evento do guard registra LLM x cliente x aplicado", e_guard)
     e_ok = EVENTOS[0]
-    ok(e_ok["n_candidatos"] == 4 and e_ok["n_validados"] == 2
-       and e_ok["n_dropados_overlap"] == 2 and e_ok["n_dropados_igualdade_legado"] == 1
-       and sorted(e_ok["tamanhos_dropados"]) == ["GG", UNICO_ACENTO],
+    # Contadores mudaram com a decisao de 16/08 (unico entra em busca por M):
+    #   validados 2 -> 3  (M, P/M e agora o UNICO)
+    #   dropados  2 -> 1  (so o GG; o UNICO deixou de ser descartado)
+    #   igualdade_legado 1 -> 2 (P/M e UNICO sobrevivem ao overlap e morreriam na
+    #   igualdade exata — e justamente o que esse contador existe para medir)
+    ok(e_ok["n_candidatos"] == 4 and e_ok["n_validados"] == 3
+       and e_ok["n_dropados_overlap"] == 1 and e_ok["n_dropados_igualdade_legado"] == 2
+       and sorted(e_ok["tamanhos_dropados"]) == ["GG"],
        "F5 contadores do overlap corretos (1 salva pelo overlap, 2 dropadas)", e_ok)
     e_emb = EVENTOS[-1]
     ok(e_emb["id_loja_aplicado"] == "220540" and e_emb["tamanho_aplicado"] == "M",
@@ -314,7 +347,7 @@ try:
        "G2 o log preserva o valor CRU do LLM (a metrica precisa ver a palavra)", EVENTOS[0])
     bot._set_turn_ctx("u_test", "tem no M?")
     rg = bot.consultar_estoque_supabase("boxer", "M", "220540")
-    ok(sorted(p["tamanho"] for p in rg["produtos"]) == ["M", "P/M"],
+    ok(sorted(p["tamanho"] for p in rg["produtos"]) == ["M", "P/M", UNICO_ACENTO],
        "G3 tamanho real continua filtrando (sentinela nao virou passe livre)",
        [p["tamanho"] for p in rg["produtos"]])
 finally:

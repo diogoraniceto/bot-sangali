@@ -283,7 +283,24 @@ O número antigo era o do próprio desenvolvedor, com 57 mensagens ao bot — es
 - `_janela_24h_aberta(numero)`: consulta `chat_history` para responder **agora** se o texto livre vai chegar, em vez de esperar o recibo. Fora da janela, "aceito" é reportado como **não avisado**.
 - Handoff **não mente mais**: sem aviso entregue devolve `aviso_nao_entregue`, dispara e-mail, e **não grava** `conversation_handoffs` — porque é essa linha que ativa o silêncio de 2h. Antes, o cliente ouvia "já chamei uma atendente", ninguém era chamado, e a Luna ficava muda por 2 h. Era o pior defeito comercial em aberto.
 
-**Falta (lado Meta, precisa de humano):** criar e aprovar o template. Script pronto:
+### 5.2 IDs da conta (não são segredos — são identificadores de objeto)
+
+Guardados aqui porque descobri-los custou uma investigação inteira e o token do bot **não** consegue redescobri-los:
+
+| O quê | Valor |
+|---|---|
+| App | `1579315293582101` ("Sangali Bot") |
+| Portfólio empresarial | `1489598346272137` ("Cyber Suite") |
+| Phone Number ID | `1188430681025942` (+55 27 98816-2802, "Sangali", GREEN, LIVE) |
+| **WABA ID** | **`1523625905911728`** |
+| System User do token | `122104146435395122` ("sangali") |
+| Template do handoff | `1793024548719200` (`handoff_atendente`, UTILITY, pt_BR) |
+
+**Como o WABA foi obtido:** pelo `entry.id` do webhook — logado de propósito em `bot.py`. Todos os caminhos de API falham porque o token tem `whatsapp_business_management` mas **não** `business_management`. Se precisar de novo, é o log `[cloud] WABA_ID (entry.id) = ...` na primeira mensagem recebida.
+
+**Vale setar `WHATSAPP_WABA_ID=1523625905911728` no Railway** para que `criar_template_handoff.py --check` rode sem investigação.
+
+**Status:** criado em 12/08 como `PENDING`, **`APPROVED` em 16/08**. Script pronto para recriar/auditar:
 
 ```bash
 export WHATSAPP_WABA_ID=...   # WhatsApp Business Account ID, NÃO o phone_number_id
@@ -293,6 +310,8 @@ python criar_template_handoff.py            # cria o handoff_atendente (utility,
 ```
 
 Enquanto o status não for `APPROVED`, o código degrada sozinho para texto livre e **avisa no log** que o template resolveria. Nada quebra; só continua não entregando fora da janela.
+
+**O que ainda NÃO foi confirmado:** que a mensagem do template *chegou* ao aparelho do atendente. A Meta aceitou (HTTP 200 + `wamid`), mas nenhum recibo `delivered` foi observado — e aceitação não é entrega (§5.1). O webhook hoje loga `failed`/`delivered`/`read`, mas **não** loga `sent`, então falta um degrau da trilha. Confirmar com o atendente, ou fechar a instrumentação, antes de tratar o handoff como resolvido.
 
 ---
 

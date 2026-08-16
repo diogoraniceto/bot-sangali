@@ -126,6 +126,18 @@ JANELA_SIMILARIDADE = float(os.getenv("JANELA_SIMILARIDADE", "0.05"))
 # Grade minima (soma de estoque do produto na loja) para promover um campeao.
 # [BLOQUEADO §10.3 item 5] 3 e escolha, nao medida — por isso e env, nao codigo.
 RANKING_MINIMO_GRADE = float(os.getenv("RANKING_MINIMO_GRADE", "3"))
+# TAMANHO UNICO em busca COM tamanho (decisao do dono, 16/08). Peca de tamanho unico
+# tem regulagem e veste do P ao GG, entao deve aparecer para quem pediu P/M/G/GG.
+# Sem isto ela some de TODA busca com tamanho — 229 produtos (8 campeoes) invisiveis
+# em 76% das buscas, que e a fatia que informa tamanho (medido em tool_filtro_eventos).
+UNICO_ATENDE = os.getenv("UNICO_ATENDE", "1") not in ("0", "false", "False", "")
+# Acima de GG a regulagem nao alcanca: oferecer ali gastaria os 3 slots de recomendacao
+# com peca que nao serve. So 4,7% das buscas reais pedem esses tamanhos.
+UNICO_NAO_ATENDE = {t.strip().upper() for t in os.getenv(
+    "UNICO_NAO_ATENDE", "G1,G2,G3,XG,XGG,EG,2EG").split(",") if t.strip()}
+# Corte do numerico. 46 e ESTIMATIVA, nao medida: nao existe mapa numero->letra no
+# banco. Por isso e env — se a loja disser que 48 ainda serve, muda sem deploy.
+UNICO_NUMERICO_MAX = int(os.getenv("UNICO_NUMERICO_MAX", "46"))
 # [BLOQUEADO §10.3 item 6] No ATACADO, o revendedor ve primeiro os campeoes de
 # venda ("campeao", default) ou os de grade mais funda ("grade")? Em "grade" a
 # profundidade reordena DENTRO de cada tier — o escopo de categoria (tier) e
@@ -399,6 +411,29 @@ def _tokens_tamanho(txt):
         return []
     norm = str(txt).translate(_TRANS_TAMANHO).upper()
     return [t for t in (tok.strip() for tok in _SEP_TAMANHO.split(norm)) if t]
+
+
+def _inclui_unico(tokens_alvo):
+    """True se a busca por `tokens_alvo` deve trazer TAMBEM as pecas de tamanho unico.
+
+    Peca de tamanho unico tem regulagem e veste do P ao GG (informacao do dono da
+    loja). Ate GG ela atende de verdade; acima disso a regulagem nao alcanca e
+    oferecer seria gastar slot de recomendacao com o que nao serve.
+
+    Falso quando: desligado por env; busca sem tamanho (ja traz tudo); a busca JA e
+    por unico; ou o tamanho pedido esta acima de GG (letra na blocklist ou numero
+    maior que UNICO_NUMERICO_MAX).
+    """
+    if not UNICO_ATENDE or not tokens_alvo:
+        return False
+    if "UNICO" in tokens_alvo:
+        return False                      # ja e a busca por unico; nao expande nada
+    for t in tokens_alvo:
+        if t in UNICO_NAO_ATENDE:
+            return False
+        if t.isdigit() and int(t) > UNICO_NUMERICO_MAX:
+            return False
+    return True
 
 
 def _tokens_tamanho_do_cliente():
@@ -897,6 +932,26 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     tokens_user_log = _tokens_tamanho_do_cliente()
     llm_omitiu_tamanho = bool(tokens_user_log) and not tamanho_alvo
     tokens_alvo = set(_tokens_tamanho(tamanho_alvo)) if tamanho_alvo else set()
+
+    # 0.3. TAMANHO UNICO entra junto (decisao do dono, 16/08 — tem regulagem, veste
+    # P..GG). O truque: NAO precisa tocar no SQL. A RPC ja passa `filtro_tamanho` por
+    # normalize_tamanho_tokens, que quebra em '/', entao mandar "M/UNICO" produz os
+    # tokens {M, UNICO} e o overlap casa os dois. Verificado contra o banco.
+    #
+    # Por que isto e melhor que mudar o predicado da RPC: o re-filtro em Python deriva
+    # os tokens da MESMA string, entao os dois filtros ficam espelhados POR
+    # CONSTRUCAO. Foi a divergencia entre eles que produziu o bug dos 623 acentuados;
+    # aqui ela deixa de ser possivel em vez de depender de alguem lembrar dos 2 lados.
+    #
+    # `tamanho_alvo` NAO muda: ele e o que o cliente pediu e o que vai em
+    # filtro_aplicado. Quem carrega a expansao e `tamanho_consulta`.
+    tamanho_consulta = tamanho_alvo
+    unico_incluido = _inclui_unico(tokens_alvo)
+    if unico_incluido:
+        tamanho_consulta = f"{tamanho_alvo}/UNICO"
+        tokens_alvo = tokens_alvo | {"UNICO"}      # espelha no re-filtro do Python
+        print(f"[TAMANHO] '{tamanho_alvo}' vai buscar tambem TAMANHO UNICO (regulagem P..GG)")
+
     # hoistado: id_loja_alvo entra no retorno/log dos 4 caminhos, inclusive o
     # early-return de embedding abaixo.
     # Multi-loja (0014): aceita "244033,94134". Tira TODO espaco em branco, nao so as
@@ -954,7 +1009,11 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
             # Quem corta o pool e o `match_count` + a ordenacao por distancia.
             'match_threshold': 0.5,
             'match_count': POOL_CANDIDATOS,
-            'filtro_tamanho': tamanho_alvo,
+            # `tamanho_consulta`, nao `tamanho_alvo`: e o valor JA expandido com
+            # /UNICO quando aplicavel (ver 0.3). Trocar por tamanho_alvo aqui faria
+            # a RPC devolver sem os unicos e o re-filtro do Python aceita-los —
+            # divergencia silenciosa entre os dois filtros.
+            'filtro_tamanho': tamanho_consulta,
             'filtro_id_loja': id_loja_alvo,
             'limite_produtos': LIMITE_PRODUTOS,
             'ancora_semantica': ANCORA_SEMANTICA,
@@ -1179,6 +1238,23 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
     # DINAMICA e a NOMEAR as pecas, e so aparece quando ha item composto na selecao
     # (38 linhas do catalogo) — custo de token zero no resto das buscas.
     # Fica DEPOIS do strip: le `selecao` ja no formato final que o modelo recebe.
+    # Peca de tamanho unico numa busca COM tamanho: sem avisar, o modelo tende a
+    # descarta-la achando que e o tamanho errado (o §4 manda curar). Mesmo padrao
+    # §3.9: instrucao dinamica, nomeando as pecas, so quando o caso ocorre.
+    if unico_incluido:
+        _unicos = [p for p in selecao
+                   if "UNICO" in _tokens_tamanho(p.get("tamanho"))]
+        if _unicos:
+            _quais = "; ".join((p.get("nome") or "?")[:40] for p in _unicos[:3])
+            filtro_aplicado["instrucao_tamanho_unico"] = (
+                f"{len(_unicos)} item(ns) desta lista tem tamanho UNICO ({_quais}). "
+                f"Eles TEM REGULAGEM e vestem do P ao GG, entao atendem o tamanho "
+                f"{tamanho_alvo} que o cliente pediu — NAO descarte por causa do "
+                f"tamanho. Ao recomendar, diga que a peca e tamanho unico com "
+                f"regulagem.")
+            print(f"[TAMANHO] {len(_unicos)} item(ns) de tamanho UNICO na selecao para "
+                  f"'{tamanho_alvo}' — instrucao dinamica enviada")
+
     compostos = [p for p in selecao if "/" in (p.get("tamanho") or "")]
     if compostos:
         quais = "; ".join(f"{(p.get('nome') or '?')[:40]} = {p.get('tamanho')}"
