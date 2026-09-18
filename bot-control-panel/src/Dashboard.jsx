@@ -165,6 +165,15 @@ export default function Dashboard() {
     const [activeSidebarItem, setActiveSidebarItem] = useState('dashboard') // 'dashboard', 'inbox', 'comandos', 'estoque', 'integracoes', 'sincronizacao'
     const [selectedConversation, setSelectedConversation] = useState(null)
     const messagesEndRef = useRef(null)
+    // Inbox: janela por PERIODO em vez de teto de linhas. O .limit(50) antigo trazia
+    // as 50 ultimas LINHAS (nao conversas) — como uma conversa tem 15-20 linhas, so
+    // apareciam ~3 contatos, e o historico parecia perdido quando na verdade estava
+    // todo no banco.
+    const [inboxDias, setInboxDias] = useState(7)
+    const [inboxBusca, setInboxBusca] = useState('')
+    const [inboxFiltro, setInboxFiltro] = useState('todas') // todas | handoff | erro | anuncio
+    const [handoffs, setHandoffs] = useState([])
+    const [carregandoInbox, setCarregandoInbox] = useState(false)
 
     // Estoque State
     const ESTOQUE_PAGE_SIZE = 50
@@ -200,7 +209,7 @@ export default function Dashboard() {
         const channel = supabase
             .channel('public:chat_history')
             .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_history' }, payload => {
-                setLogs(current => [payload.new, ...current].slice(0, 50))
+                setLogs(current => [payload.new, ...current])
             })
             .subscribe()
 
@@ -296,13 +305,37 @@ export default function Dashboard() {
         }
     }
 
-    async function fetchLogs() {
-        const { data } = await supabase
-            .from('chat_history')
-            .select('id, user_id, role, content, created_at')
-            .order('created_at', { ascending: false })
-            .limit(50)
-        if (data) setLogs(data)
+    // Busca por JANELA DE TEMPO, paginada. O PostgREST corta em 1000 linhas por
+    // resposta, entao paginamos ate acabar — senao um periodo movimentado volta
+    // truncado em silencio e a conversa mais antiga do periodo some da lista.
+    async function fetchLogs(dias = inboxDias) {
+        setCarregandoInbox(true)
+        try {
+            const desde = new Date(Date.now() - dias * 24 * 60 * 60 * 1000).toISOString()
+            const PAGINA = 1000
+            const MAX = 20000            // teto de seguranca do navegador
+            let todos = []
+            for (let de = 0; de < MAX; de += PAGINA) {
+                const { data, error } = await supabase
+                    .from('chat_history')
+                    .select('id, user_id, role, content, created_at')
+                    .gte('created_at', desde)
+                    .order('created_at', { ascending: false })
+                    .range(de, de + PAGINA - 1)
+                if (error) { console.error('fetchLogs:', error); break }
+                todos = todos.concat(data || [])
+                if (!data || data.length < PAGINA) break
+            }
+            setLogs(todos)
+
+            const { data: hs } = await supabase
+                .from('conversation_handoffs')
+                .select('user_id, motivo, created_at')
+                .gte('created_at', desde)
+            setHandoffs(hs || [])
+        } finally {
+            setCarregandoInbox(false)
+        }
     }
 
     // ============ CACHE (sessionStorage, TTL 5min) ============
@@ -529,7 +562,22 @@ export default function Dashboard() {
         }
     }
 
-    function groupLogsToConversations(logs) {
+    // Texto que a Luna manda quando o turno falha. Achar isso numa conversa e achar
+    // um cliente que viu erro — e, com anuncio rodando, um clique pago perdido.
+    const TXT_ERRO = 'probleminha tecnico'
+    // Mensagens PRE-PREENCHIDAS do anuncio clique-para-WhatsApp: quem abre com uma
+    // delas veio da campanha, nao organicamente. Sao os leads que custaram dinheiro.
+    const ABERTURAS_ANUNCIO = [
+        'vocês vendem atacado?',
+        'gostaria de ver baby dolls',
+        'é verdade que tem camisolas de liganete',
+    ]
+
+    function groupLogsToConversations(logs, handoffs) {
+        const porUser = {}
+        for (const h of (handoffs || [])) {
+            if (!porUser[h.user_id]) porUser[h.user_id] = h.motivo
+        }
         const grouped = {}
         for (const log of logs) {
             const uid = log.user_id || 'desconhecido'
@@ -537,16 +585,34 @@ export default function Dashboard() {
             grouped[uid].push(log)
         }
         return Object.entries(grouped)
-            .map(([userId, messages]) => ({
-                userId,
-                messages: messages.sort((a, b) => new Date(a.created_at) - new Date(b.created_at)),
-                lastMessage: messages[0],
-                messageCount: messages.length
-            }))
+            .map(([userId, messages]) => {
+                const ordenadas = messages.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+                const doCliente = ordenadas.filter(m => m.role === 'user')
+                const primeira = (doCliente[0]?.content || '').toLowerCase()
+                return {
+                    userId,
+                    messages: ordenadas,
+                    lastMessage: ordenadas[ordenadas.length - 1],
+                    messageCount: ordenadas.length,
+                    msgsCliente: doCliente.length,
+                    teveErro: ordenadas.some(m => (m.content || '').includes(TXT_ERRO)),
+                    motivoHandoff: porUser[userId] || null,
+                    doAnuncio: ABERTURAS_ANUNCIO.some(a => primeira.startsWith(a)),
+                }
+            })
             .sort((a, b) => new Date(b.lastMessage.created_at) - new Date(a.lastMessage.created_at))
     }
 
-    const conversations = groupLogsToConversations(logs)
+    const todasConversas = groupLogsToConversations(logs, handoffs)
+    const conversations = todasConversas.filter(c => {
+        if (inboxFiltro === 'handoff' && !c.motivoHandoff) return false
+        if (inboxFiltro === 'erro' && !c.teveErro) return false
+        if (inboxFiltro === 'anuncio' && !c.doAnuncio) return false
+        if (!inboxBusca.trim()) return true
+        const alvo = inboxBusca.trim().toLowerCase()
+        return c.userId.includes(alvo) ||
+            c.messages.some(m => (m.content || '').toLowerCase().includes(alvo))
+    })
     const activeConvo = conversations.find(c => c.userId === selectedConversation)
 
     function formatPhone(userId) {
@@ -838,9 +904,57 @@ export default function Dashboard() {
                             {/* Coluna 1 (Lista) */}
                             <div className="w-[340px] border-r border-slate-200 dark:border-[#1E1E1E] bg-slate-50 dark:bg-[#0A0A0A] flex flex-col shrink-0 transition-colors">
                                 <div className="p-4 border-b border-slate-200 dark:border-[#1E1E1E] flex flex-col gap-3 transition-colors">
-                                    <h2 className="text-[11px] font-bold text-slate-500 dark:text-[#71717A] tracking-widest mt-1 transition-colors">
-                                        CONVERSAS
-                                    </h2>
+                                    <div className="flex items-center justify-between mt-1">
+                                        <h2 className="text-[11px] font-bold text-slate-500 dark:text-[#71717A] tracking-widest transition-colors">
+                                            CONVERSAS
+                                        </h2>
+                                        <span className="text-[10px] text-slate-400 dark:text-[#52525B] tabular-nums">
+                                            {carregandoInbox ? 'carregando...' : `${conversations.length} de ${todasConversas.length}`}
+                                        </span>
+                                    </div>
+
+                                    <div className="flex gap-1">
+                                        {[1, 7, 30, 90].map(d => (
+                                            <button
+                                                key={d}
+                                                onClick={() => { setInboxDias(d); fetchLogs(d) }}
+                                                className={`flex-1 text-[11px] py-1 rounded-md border transition-colors ${inboxDias === d
+                                                    ? 'bg-purple-100 dark:bg-[#1E1430] text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-500/30 font-semibold'
+                                                    : 'bg-white dark:bg-[#111] text-slate-500 dark:text-[#71717A] border-slate-200 dark:border-[#222] hover:bg-slate-50 dark:hover:bg-[#161616]'}`}
+                                            >
+                                                {d === 1 ? '24h' : `${d}d`}
+                                            </button>
+                                        ))}
+                                    </div>
+
+                                    <div className="relative">
+                                        <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 dark:text-[#52525B]" />
+                                        <input
+                                            value={inboxBusca}
+                                            onChange={e => setInboxBusca(e.target.value)}
+                                            placeholder="numero ou texto da conversa"
+                                            className="w-full pl-8 pr-2 py-1.5 text-[12px] rounded-md bg-white dark:bg-[#111] border border-slate-200 dark:border-[#222] text-slate-700 dark:text-slate-300 placeholder:text-slate-400 dark:placeholder:text-[#52525B] focus:outline-none focus:border-purple-300 dark:focus:border-purple-500/40 transition-colors"
+                                        />
+                                    </div>
+
+                                    <div className="flex gap-1 flex-wrap">
+                                        {[
+                                            { id: 'todas', label: 'Todas' },
+                                            { id: 'anuncio', label: 'Anuncio' },
+                                            { id: 'handoff', label: 'Handoff' },
+                                            { id: 'erro', label: 'Com erro' },
+                                        ].map(f => (
+                                            <button
+                                                key={f.id}
+                                                onClick={() => setInboxFiltro(f.id)}
+                                                className={`text-[11px] px-2 py-1 rounded-md border transition-colors ${inboxFiltro === f.id
+                                                    ? 'bg-slate-200 dark:bg-[#1E1E1E] text-slate-800 dark:text-slate-200 border-slate-300 dark:border-[#333] font-semibold'
+                                                    : 'bg-white dark:bg-[#111] text-slate-500 dark:text-[#71717A] border-slate-200 dark:border-[#222] hover:bg-slate-50 dark:hover:bg-[#161616]'}`}
+                                            >
+                                                {f.label}
+                                            </button>
+                                        ))}
+                                    </div>
                                 </div>
                                 <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-0.5">
                                     {conversations.length === 0 ? (
@@ -864,6 +978,25 @@ export default function Dashboard() {
                                                             {timeAgo(convo.lastMessage.created_at)}
                                                         </span>
                                                     </div>
+                                                    {(convo.teveErro || convo.motivoHandoff || convo.doAnuncio) && (
+                                                        <div className="flex gap-1 flex-wrap mb-0.5">
+                                                            {convo.teveErro && (
+                                                                <span title="O cliente recebeu mensagem de erro" className="text-[9px] px-1.5 py-[1px] rounded bg-red-100 dark:bg-red-500/15 text-red-700 dark:text-red-400 font-semibold">
+                                                                    erro
+                                                                </span>
+                                                            )}
+                                                            {convo.motivoHandoff && (
+                                                                <span title={`Handoff: ${convo.motivoHandoff}`} className="text-[9px] px-1.5 py-[1px] rounded bg-amber-100 dark:bg-amber-500/15 text-amber-700 dark:text-amber-400 font-semibold">
+                                                                    {convo.motivoHandoff}
+                                                                </span>
+                                                            )}
+                                                            {convo.doAnuncio && (
+                                                                <span title="Chegou por mensagem pre-preenchida do anuncio" className="text-[9px] px-1.5 py-[1px] rounded bg-purple-100 dark:bg-purple-500/15 text-purple-700 dark:text-purple-400 font-semibold">
+                                                                    anuncio
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    )}
                                                     <p className={`text-[12px] truncate transition-colors ${selectedConversation === convo.userId ? 'text-slate-600 dark:text-[#A1A1AA]' : 'text-slate-500 dark:text-[#71717A]'}`}>
                                                         {convo.lastMessage.content}
                                                     </p>
