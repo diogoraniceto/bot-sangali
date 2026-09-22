@@ -28,7 +28,10 @@ import os
 import sys
 
 _AQUI = os.path.dirname(os.path.abspath(__file__))
-ARQ_CACHE = os.path.join(_AQUI, "vetores_ranking.json")
+# Override por env para validar OUTRO modelo de embedding (ex.: vetores_ranking_emb2.json
+# depois da virada para gemini-embedding-2). O vetor de consulta do teste TEM de ser do
+# mesmo modelo que gravou a coluna, senao o teste mede ruido. Default inalterado.
+ARQ_CACHE = os.environ.get("VETORES_RANKING_ARQ") or os.path.join(_AQUI, "vetores_ranking.json")
 
 # 7 termos x 2 lojas = os 14 pares que o plano mede.
 TERMOS = [
