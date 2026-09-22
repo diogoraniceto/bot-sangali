@@ -62,13 +62,19 @@ def coletar(horas):
     ch = (bot.supabase.table("chat_history")
           .select("created_at,user_id,role,content")
           .gte("created_at", desde).order("created_at").limit(2000).execute()).data or []
+    # Trafego de TESTE nunca e lead. O gate cria users `eval_*` e a suite antiga
+    # `test_*`; se um gate for morto antes do cleanup as linhas ficam orfas e o
+    # monitor contava "3 clientes viram erro" que eram cenarios meus (22/09).
+    ch = [x for x in ch if not str(x.get("user_id", "")).startswith(("eval_", "test_"))]
     turns = (bot.supabase.table("bot_turns")
              .select("created_at,user_id,latency_ms,fallback_used,error,output_format,tool_calls")
              .gte("created_at", desde).order("created_at").limit(2000).execute()).data or []
+    turns = [t for t in turns if not str(t.get("user_id", "")).startswith(("eval_", "test_"))]
     try:
         hand = (bot.supabase.table("conversation_handoffs")
                 .select("created_at,user_id,motivo")
                 .gte("created_at", desde).limit(200).execute()).data or []
+        hand = [h for h in hand if not str(h.get("user_id", "")).startswith(("eval_", "test_"))]
     except Exception:
         hand = []
     return ch, turns, hand
