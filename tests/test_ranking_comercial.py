@@ -122,7 +122,14 @@ def main():
             'minimo_grade': bot.RANKING_MINIMO_GRADE,
             'termo_tokens': None, 'excluir_ids': None})
         linhas = resp.data or []
-        top_sim = max(linhas, key=lambda x: x.get('similarity') or 0)['id_produto'] if linhas else None
+        # MUDOU EM 22/09: a ancora e o #1 por similaridade ENTRE OS QUE A TOOL PODE
+        # DEVOLVER. Desde 16/09 (INFANTIL_SO_SE_PEDIR) a tool remove peca infantil
+        # quando o cliente nao pediu — e o #1 cru de 'baby doll' nas 2 lojas e o
+        # BABY DOLL INFANTIL (91712048). Exigir que ele apareca seria exigir que o
+        # filtro nao existisse. O invariante continua: a ancora nao pode sumir do topo.
+        elegiveis = [x for x in linhas if not bot._produto_infantil(x.get('nome'))]
+        top_sim = (max(elegiveis, key=lambda x: x.get('similarity') or 0)['id_produto']
+                   if elegiveis else None)
         primeiros = [p['id_produto'] for p in prods[:bot.ANCORA_SEMANTICA]]
         check(f"A4 {termo}/{ln}", top_sim in primeiros,
               f"top_sim={top_sim} primeiros={primeiros}")
@@ -197,8 +204,25 @@ def main():
         # aplicados == 0 => o fallback abandonou as exclusoes (pool esgotado); ai
         # repetir e o comportamento CORRETO — o errado seria devolver vazio.
         if aplicados:
-            check(f"A7 {termo}/{ln}", not repetidos and len(segundos) >= 5,
-                  f"{len(segundos)} ineditos, repetidos={repetidos}")
+            # MUDOU EM 22/09: ">= 5" pressupunha o pool cheio. Com INFANTIL_SO_SE_PEDIR
+            # (16/09) a tool tira infantil da 2a pagina — medido: 'pijama masculino'/
+            # FILIAL01 tinha 8 na 2a pagina, 4 eram PIJAMA INF*, sobraram 4. A regra
+            # passa a ser "devolve >= 5 QUANDO existem >= 5 nao-infantis disponiveis";
+            # se o catalogo so tem N, devolver N e o comportamento certo.
+            pool2 = bot._rpc_busca({
+                'query_embedding': VETORES[termo], 'match_threshold': 0.5,
+                'match_count': bot.POOL_CANDIDATOS, 'filtro_tamanho': None,
+                'filtro_id_loja': lid, 'limite_produtos': bot.LIMITE_PRODUTOS,
+                'ancora_semantica': bot.ANCORA_SEMANTICA,
+                'janela_similaridade': bot.JANELA_SIMILARIDADE,
+                'minimo_grade': bot.RANKING_MINIMO_GRADE, 'termo_tokens': None,
+                'excluir_ids': primeiros}).data or []
+            disponiveis = len({x['id_produto'] for x in pool2
+                               if not bot._produto_infantil(x.get('nome'))
+                               and x['id_produto'] not in primeiros})
+            alvo = min(5, disponiveis)
+            check(f"A7 {termo}/{ln}", not repetidos and len(segundos) >= alvo,
+                  f"{len(segundos)} ineditos (>= {alvo}: {disponiveis} nao-infantis disponiveis), repetidos={repetidos}")
         else:
             check(f"A7 {termo}/{ln} (fallback)", len(segundos) >= 1,
                   f"fallback sem exclusoes, {len(segundos)} itens")

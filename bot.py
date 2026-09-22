@@ -207,6 +207,27 @@ def _registrar_mostrados(user_id, ids):
         print(f"[EXCLUIR] falha ao registrar mostrados: {e}")
 
 
+_RX_ATACADO = re.compile(r"\batacad|\brevend", re.I)
+_DICA_ABERTURA_ATACADO = (
+    "[ABERTURA DE ATACADO: o cliente fala de atacado/revenda e ainda NAO viu nenhum "
+    "produto. Aplique o §9.0 OBRIGATORIAMENTE: busque a categoria que ele pediu (ou "
+    "'conjunto' se nao pediu nenhuma) SEM tamanho, mostre ate 3 campeas com "
+    "modo_preco atacado_avista, e cite o minimo em UMA frase DEPOIS dos cards. Nao "
+    "liste condicoes de pagamento nem parcelas.] ")
+
+
+def _dica_abertura_atacado(texto, ja_vistos):
+    """True se este turno deve carregar a dica do §9.0.
+
+    Dispara quando a mensagem fala de atacado/revenda E o cliente ainda nao viu
+    nenhum card. Depois do primeiro card a dica some sozinha — nao e preciso
+    lembrar de desligar, `_ids_ja_mostrados` faz isso.
+    """
+    if ja_vistos:
+        return False
+    return bool(_RX_ATACADO.search(texto or ""))
+
+
 def _ids_ja_mostrados(user_id):
     """list[str] de id_produto mostrados a ESTE cliente na conversa recente.
 
@@ -1964,7 +1985,17 @@ _MOTIVO_LABEL = {
     "confusao_repetida": "Cliente confuso ou irritado",
     "medo_fraude": "Desconfiança / quer videochamada",
     "pedido_foto": "Cliente QUER MAIS FOTOS da peça (já recebeu todas as que temos)",
+    "encerrado_abuso": "Encerrado por assédio/lixo — REGISTRO APENAS, ninguém foi avisado",
 }
+
+# Motivos que gravam o handoff mas NAO acordam a atendente. A linha em
+# conversation_handoffs e o que ativa o silencio de 2h — e isso queremos para o
+# abusador: o bot para de alimentar a conversa. O que sai e o alerta e o e-mail.
+# Medido na 1a campanha (15-22/09): 13 dos 21 handoffs eram assedio ou lixo, 7 de
+# madrugada; a atendente foi paga as 3h para ver foto de genital. Env para poder
+# desligar sem deploy se algum caso legitimo cair aqui.
+MOTIVOS_SILENCIOSOS = {m.strip() for m in os.getenv(
+    "HANDOFF_MOTIVOS_SILENCIOSOS", "encerrado_abuso").split(",") if m.strip()}
 
 
 def _montar_mensagem_operador(user_id, motivo, resumo, produtos_interesse):
@@ -2006,11 +2037,16 @@ def criar_tool_transferir(user_id):
             (2 ou mais mal-entendidos seguidos);
         (4) o cliente desconfiar que a loja é fraude ou pedir videochamada;
         (5) o cliente já recebeu TODAS as fotos que existem da peça
-            (`mostrar_fotos_produto` devolveu `sem_novas`) e ainda quer ver mais.
+            (`mostrar_fotos_produto` devolveu `sem_novas`) e ainda quer ver mais;
+        (6) conteúdo sexual dirigido a você (cantada, pedido de foto sua, descrição
+            do seu corpo) ou teste/lixo repetido — motivo "encerrado_abuso". Este
+            motivo NÃO acorda a atendente: só encerra a conversa do seu lado.
+            NUNCA classifique isso como fechamento_venda ou confusao_repetida.
 
         Args:
             motivo: curto e categórico. Ex: "fechamento_venda", "pedido_humano",
-                    "confusao_repetida", "medo_fraude", "pedido_foto".
+                    "confusao_repetida", "medo_fraude", "pedido_foto",
+                    "encerrado_abuso".
             resumo: 2 a 4 frases descrevendo o que aconteceu na conversa e o que
                     o atendente precisa saber para continuar.
             produtos_interesse: nomes/códigos dos produtos mencionados, separados
@@ -2033,6 +2069,26 @@ def criar_tool_transferir(user_id):
         if not operator_number:
             print("⚠️ operator_number não configurado em bot_settings.")
             return {"status": "erro", "msg": "Número do atendente não configurado."}
+
+        if motivo in MOTIVOS_SILENCIOSOS:
+            # Grava (ativa o silencio de 2h) e devolve ok SEM avisar ninguem. O status
+            # e "ok" de proposito: o modelo precisa mandar a mensagem-padrao do caso 6
+            # e parar — se recebesse "aviso_nao_entregue" passaria o WhatsApp da loja
+            # para um abusador, que e o contrario do que queremos.
+            try:
+                supabase.table("conversation_handoffs").insert({
+                    "user_id": user_id,
+                    "motivo": motivo,
+                    "resumo": resumo,
+                    "produtos_interesse": produtos_interesse,
+                    "operator_number": operator_number,
+                }).execute()
+            except Exception as e:
+                print(f"⚠️ Erro ao registrar handoff silencioso: {e}")
+            print(f"🔇 Handoff SILENCIOSO ({motivo}) | user={user_id} — atendente NAO avisada")
+            return {"status": "ok",
+                    "msg": "Encerrado. Mande a mensagem-padrao do caso 6 e nao chame "
+                           "mais ninguem nesta conversa."}
 
         texto = _montar_mensagem_operador(user_id, motivo, resumo, produtos_interesse)
         # Params do template, na ordem de {{1}}..{{4}}. O historico NAO vai (parametro de
@@ -2915,6 +2971,15 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
             _turn_ctx.excluir_ids = list(_ja_vistos)
         if _ja_vistos:
             print(f"[EXCLUIR] {len(_ja_vistos)} produto(s) ja mostrado(s) sairao da busca: {_ja_vistos}")
+
+        # A1 (PLANO_CAMPANHA_2): lead que fala de atacado e ainda NAO viu card recebe a
+        # dica que forca o §9.0. Regra estatica sozinha nao pega (POLITICA_DE_GATE §3.9);
+        # na 1a campanha 41 leads abriram assim, todos levaram o paragrafo de regras e
+        # 56% sumiram. Mesmo mecanismo do preambulo de reply-to-card. `_ja_vistos` vazio
+        # = nenhum produto mostrado a este cliente na janela recente.
+        if _dica_abertura_atacado(texto_completo, _ja_vistos):
+            texto_completo = _DICA_ABERTURA_ATACADO + texto_completo
+            print("[A1] dica de abertura de atacado injetada no turno")
 
         t_inicio = time.perf_counter()
         # Gemini as vezes trava/estoura o deadline (504), sobretudo em turns com cadeia

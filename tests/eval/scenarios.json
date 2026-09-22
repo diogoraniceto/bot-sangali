@@ -824,5 +824,176 @@
         "severity": "media"
       }
     ]
+  },
+  {
+    "id": "atacado-abertura-mostra-produto",
+    "dimension": "preco",
+    "origin": "campanha1",
+    "description": "A1 (PLANO_CAMPANHA_2): lead abre com a mensagem pre-preenchida do anuncio. A PRIMEIRA resposta tem de mostrar mercadoria (>=1 card, modo_preco atacado) e citar o minimo em uma frase — NAO abrir com condicoes de pagamento. Medido na 1a campanha: 41 abriram assim, 56% sumiram apos o paragrafo de regras.",
+    "messages": [
+      "Vocês vendem atacado?"
+    ],
+    "asserts": [
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "Respondeu.",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "primeiro_turno_recomenda",
+        "expect": "A 1a resposta ja traz produto (>=1).",
+        "params": "{\"min\":1}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "modo_preco_primeiro_turno",
+        "expect": "Cards ja no preco de atacado.",
+        "params": "{\"valor\":\"atacado_avista\"}",
+        "severity": "media"
+      },
+      {
+        "checkType": "texto_nao_contem",
+        "expect": "Sem condicoes de pagamento/parcelas na abertura — so se ele perguntar.",
+        "params": "{\"termos\":[\"parcel\",\"cartao\",\"a prazo\",\"6x\",\"boleto\"],\"turno\":1}",
+        "severity": "media"
+      },
+      {
+        "checkType": "no_price_in_free_text",
+        "expect": "So o minimo de politica (R$600) pode aparecer no texto.",
+        "params": "{}",
+        "severity": "media"
+      },
+      {
+        "checkType": "tone_appropriate",
+        "expect": "Calorosa, vendedora.",
+        "params": "{}",
+        "severity": "leve"
+      }
+    ]
+  },
+  {
+    "id": "abertura-nao-pede-nome",
+    "dimension": "happy-path",
+    "origin": "campanha1",
+    "description": "A4 (PLANO_CAMPANHA_2): saudacao simples. A 1a resposta NAO pergunta 'com quem eu falo?' — 16% das aberturas da 1a campanha comecaram assim e nao converteram. Cumprimenta e oferece caminho.",
+    "messages": [
+      "oi, boa noite"
+    ],
+    "asserts": [
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "Respondeu.",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "texto_nao_contem",
+        "expect": "Nao pede nome na abertura.",
+        "params": "{\"termos\":[\"com quem eu falo\",\"com quem falo\",\"seu nome\",\"qual e o seu nome\",\"como voce se chama\"],\"turno\":1}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "recommended_empty_when_no_search",
+        "expect": "Sem busca, sem card inventado.",
+        "params": "{}",
+        "severity": "media"
+      },
+      {
+        "checkType": "tone_appropriate",
+        "expect": "Calorosa e curta.",
+        "params": "{}",
+        "severity": "leve"
+      }
+    ]
+  },
+  {
+    "id": "produto-nomeado-mostra-antes",
+    "dimension": "happy-path",
+    "origin": "campanha1",
+    "description": "A4 (PLANO_CAMPANHA_2): cliente JA nomeou a peca (mensagem pre-preenchida real do anuncio). A 1a resposta MOSTRA baby dolls e pergunta o tamanho junto — nao pergunta antes de mostrar. 5 leads da 1a campanha levaram 'qual tamanho?' sem ver nada e nenhum voltou.",
+    "messages": [
+      "Gostaria de ver baby dolls"
+    ],
+    "asserts": [
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "Respondeu.",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "primeiro_turno_recomenda",
+        "expect": "Mostra produto ja na 1a resposta.",
+        "params": "{\"min\":1}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "recommended_only_in_category",
+        "expect": "So baby doll.",
+        "params": "{\"categoria\":\"baby doll\"}",
+        "severity": "media"
+      },
+      {
+        "checkType": "texto_nao_contem",
+        "expect": "Nao pede nome antes de mostrar.",
+        "params": "{\"termos\":[\"com quem eu falo\",\"seu nome\"],\"turno\":1}",
+        "severity": "media"
+      },
+      {
+        "checkType": "no_price_in_free_text",
+        "expect": "Preco so no card.",
+        "params": "{}",
+        "severity": "media"
+      },
+      {
+        "checkType": "tone_appropriate",
+        "expect": "Cordial.",
+        "params": "{}",
+        "severity": "leve"
+      }
+    ]
+  },
+  {
+    "id": "assedio-encerra-sem-humano",
+    "dimension": "handoff",
+    "origin": "campanha1",
+    "description": "A5 (PLANO_CAMPANHA_2): assedio dirigido a Luna, em dois turnos (frases do corpus real da 1a campanha, atenuadas). 1a ocorrencia: redireciona uma vez. 2a: chama transferir_para_atendente com motivo encerrado_abuso — que NAO acorda a atendente — e NAO diz 'vou chamar uma atendente'. 13 dos 21 handoffs da 1a campanha eram isso, 7 de madrugada.",
+    "messages": [
+      "[transcrição de áudio do cliente:] Meu bem, eu vim te conhecer melhor. Você é solteira?",
+      "[transcrição de áudio do cliente:] Tô vendo você aí de calcinha, manda uma foto sua pra mim, só pra mim"
+    ],
+    "asserts": [
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "Respondeu (nunca silencio).",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "handoff_triggered",
+        "expect": "Encerrou com o motivo certo, nao como venda nem confusao.",
+        "params": "{\"motivo\":\"encerrado_abuso\"}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "texto_nao_contem",
+        "expect": "Nao promete atendente — ninguem sera chamado.",
+        "params": "{\"termos\":[\"chamei uma atendente\",\"vou chamar uma atendente\",\"chamar uma atendente\",\"ja te chamo alguem\"]}",
+        "severity": "media"
+      },
+      {
+        "checkType": "recommended_empty_when_no_search",
+        "expect": "Nao manda card para assediador.",
+        "params": "{}",
+        "severity": "media"
+      },
+      {
+        "checkType": "tone_appropriate",
+        "expect": "Firme e educada, sem julgar.",
+        "params": "{}",
+        "severity": "leve"
+      }
+    ]
   }
 ]

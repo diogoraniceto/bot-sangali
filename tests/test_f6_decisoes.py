@@ -274,9 +274,14 @@ ok("tem mais" in PROMPT.lower() and "DIFERENTES" in PROMPT,
 
 # =========================================================================
 print("\n### P6 — contrato das edicoes do prompt")
-ok("em 5 casos" in PROMPT, "P6.3 §15 declara 5 casos de transferencia")
-ok("um dos 5 acima" in PROMPT, "P6.3 §15 argumentos: 'um dos 5 acima'")
-ok("fora desses 5" in PROMPT, "P6.3 §15 regra: 'fora desses 5'")
+# MUDOU EM 22/09 (PLANO_CAMPANHA_2, A5): o §15 ganhou o caso 6 `encerrado_abuso`.
+# Na 1a campanha 13 dos 21 handoffs eram assedio/lixo escapando por
+# `confusao_repetida` e acordando a atendente de madrugada. A contagem precisa
+# bater nos TRES lugares que o modelo le — se um ficar em 5, ele desconfia do 6.
+ok("em 6 casos" in PROMPT, "P6.3 §15 declara 6 casos de transferencia")
+ok("um dos 6 acima" in PROMPT, "P6.3 §15 argumentos: 'um dos 6 acima'")
+ok("fora desses 6" in PROMPT, "P6.3 §15 regra: 'fora desses 6'")
+ok("`encerrado_abuso`" in PROMPT, "P6.3 §15 caso 6 `encerrado_abuso` presente")
 for sobra in ("em 4 casos", "um dos 4 acima", "fora desses 4"):
     ok(sobra not in PROMPT, f"P6.3 sobra do texto antigo removida: '{sobra}'")
 

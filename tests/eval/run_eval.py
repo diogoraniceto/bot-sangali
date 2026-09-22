@@ -390,6 +390,69 @@ def check_recommended_only_in_category(tc, params):
     return "pass", f"{resolved} ids todos em '{cat}'"
 
 
+def _turno(tc, n):
+    """Turno n (1-based) do cenario, ou None. `tc["turnos"]` existe desde a Rodada 1."""
+    ts = tc.get("turnos") or []
+    return ts[n - 1] if 0 < n <= len(ts) else None
+
+
+def check_primeiro_turno_recomenda(tc, params):
+    """A PRIMEIRA resposta ja traz >= `min` produtos (default 1).
+
+    E o check do A1 (abertura de atacado mostra mercadoria) e do A4 (produto
+    nomeado aparece antes da pergunta de tamanho). Medido na 1a campanha: so 8%
+    das primeiras respostas traziam produto; 56% dos leads de atacado sumiram
+    depois de receber regra em vez de peca.
+    """
+    t = _turno(tc, 1)
+    if t is None:
+        return "skipped", "sem turno 1 capturado"
+    minimo = int((params or {}).get("min", 1))
+    n = len(t.get("produtos_recomendados") or [])
+    if n >= minimo:
+        return "pass", f"turno 1 recomendou {n} (>= {minimo})"
+    return "fail", f"turno 1 recomendou {n} (< {minimo}); tools={[c['name'] for c in t.get('calls', [])]}"
+
+
+def check_texto_nao_contem(tc, params):
+    """Nenhum texto enviado pelo bot contem os `termos` (case/acento-insensivel).
+
+    `turno`: 1..n restringe a um turno; ausente = todos. Serve para "com quem eu
+    falo?" na abertura (A4), condicoes de pagamento na abertura de atacado (A1)
+    e "vou chamar uma atendente" no encerramento por abuso (A5).
+    """
+    termos = [(_norm(x)) for x in ((params or {}).get("termos") or []) if x]
+    if not termos:
+        return "skipped", "sem termos"
+    turno = (params or {}).get("turno")
+    if turno:
+        t = _turno(tc, int(turno))
+        if t is None:
+            return "skipped", f"sem turno {turno}"
+        textos = [m.get("text") or "" for m in t.get("messages_sent") or []]
+    else:
+        textos = [m.get("text") or "" for m in tc.get("messages_sent") or []]
+    corpo = _norm(" ".join(textos))
+    achados = [x for x in termos if x in corpo]
+    if achados:
+        return "fail", f"texto contem {achados}: {corpo[:120]!r}"
+    return "pass", f"nenhum de {termos} em {len(textos)} msg(s)"
+
+
+def check_modo_preco_primeiro_turno(tc, params):
+    """`modo_preco` da PRIMEIRA resposta e o esperado (A1: atacado_avista)."""
+    t = _turno(tc, 1)
+    if t is None:
+        return "skipped", "sem turno 1 capturado"
+    esperado = (params or {}).get("valor")
+    if not esperado:
+        return "skipped", "sem params.valor"
+    got = t.get("modo_preco")
+    if got == esperado:
+        return "pass", f"modo_preco={got}"
+    return "fail", f"modo_preco={got!r}, esperado {esperado!r}"
+
+
 def check_recommended_empty_when_no_search(tc, params):
     if tc["searched"]:
         return "pass", "houve busca no cenario (criterio nao se aplica)"
@@ -701,6 +764,10 @@ CHECKS = {
     "extra_photos_sent": check_extra_photos_sent,
     "photo_language_neutral": check_photo_language_neutral,
     "destaque_preferido": check_destaque_preferido,
+    # PLANO_CAMPANHA_2 / Rodada 1
+    "primeiro_turno_recomenda": check_primeiro_turno_recomenda,
+    "texto_nao_contem": check_texto_nao_contem,
+    "modo_preco_primeiro_turno": check_modo_preco_primeiro_turno,
 }
 
 JUDGE_CHECKS = {
@@ -727,6 +794,11 @@ SEVERITY = {
     # a mandar, entao o check agora mede o que diz medir.
     "destaque_preferido": "media",
     "tone_appropriate": "leve",
+    # Rodada 1: mostrar produto na 1a resposta E o objetivo — grave. Texto proibido
+    # e modo_preco sao forma — media.
+    "primeiro_turno_recomenda": "grave",
+    "texto_nao_contem": "media",
+    "modo_preco_primeiro_turno": "media",
     # F2: os dois sao GRAVES — falso "nao tenho" e afirmacao sobre tamanho sem base
     # sao exatamente o defeito P3 (cliente desiste da compra).
     "tool_nao_retornou_vazio": "grave",
@@ -799,8 +871,9 @@ def run_turn(uid, msg, cliente_hist):
 
     calls, responses = _extract_calls(fresh)
     prod_ids = []
+    modo_preco = None
     if fresh:
-        _, ids_int, _, _ = bot.parsear_resposta_json(fresh.get("final_output") or "")
+        _, ids_int, _, modo_preco = bot.parsear_resposta_json(fresh.get("final_output") or "")
         prod_ids = ids_int
     searched = any(c["name"] in SEARCH_TOOLS for c in calls)
 
@@ -812,6 +885,7 @@ def run_turn(uid, msg, cliente_hist):
         "calls": calls,
         "responses": responses,
         "produtos_recomendados": prod_ids,
+        "modo_preco": modo_preco,
         "searched": searched,
         "turn_error": turn_error,
         "elapsed": elapsed,
@@ -834,12 +908,16 @@ def run_scenario(scn):
         "messages_sent": [], "media_sent": [], "calls": [], "responses": [],
         "produtos_recomendados": [], "searched": False, "turn_error": None,
         "cliente_hist": "",
+        # PLANO_CAMPANHA_2: os checks da Rodada 1 medem a PRIMEIRA resposta (o que o
+        # lead ve antes de decidir ficar). O agregado nao distingue turno 1 de turno 3.
+        "turnos": [],
     }
 
     for ti, raw_msg in enumerate(scn["messages"], 1):
         msg = _subst(raw_msg, captured)
         cliente_msgs.append(msg)
         tc = run_turn(uid, msg, "\n".join(cliente_msgs))
+        ctx["turnos"].append(tc)
 
         ctx["messages_sent"].extend(tc["messages_sent"])
         ctx["media_sent"].extend(tc["media_sent"])
