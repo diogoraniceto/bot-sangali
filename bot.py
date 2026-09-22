@@ -582,6 +582,39 @@ def _dica_preco(texto):
     return bool(_RX_PRECO.search(texto or ""))
 
 
+# ---- A5-codigo: assedio dirigido a Luna ---------------------------------------
+# Duas camadas, medidas no corpus da 1a campanha (13 dos 21 handoffs eram isto):
+# EXPLICITO dispara sozinho; ROMANTICO/CORPORAL so dispara com pronome DIRIGIDO a
+# atendente ("voce", "vc", "tu", "te", "tua", "sua"), para "calcinha gostosa de usar"
+# ou "quero um gel excitante" (sexshop legitimo) NAO disparar.
+_RX_ABUSO_EXPLICITO = re.compile(
+    r"\bbucet|\bxota\b|\bxoxota|\bpiroca|\brola\b|\bpau\b.{0,12}\b(duro|grande)|\bme fode|\bfoder\b|"
+    r"\bme come\b|\bcomer voc[eê]|\bgozar|\bgoza\b|\bpelad|\bnua\b|\bnudes?\b|\bsafad[ao]\b.{0,20}\b(voc[eê]|vc|tu)\b|"
+    r"manda .{0,25}foto (sua|tua|de voc[eê])|🍆|👅|"
+    # Diminutivo de parte do corpo e fala sobre o corpo de ALGUEM, nunca spec de peca
+    # ("cobre a bunda" e produto; "essa bundinha ai" nao). Medido no corpus: a conversa
+    # de 78 msgs encaminhada como VENDA era exatamente "foto da bundinha de frente".
+    r"\bbundinha|\bpeitinho|\bbucetinha|\bxaninha", re.I)
+_RX_ABUSO_ROMANTICO = re.compile(
+    r"\bgostos[ao]\b|\bdel[ií]cia\b|\blind[ao]\b|\bsolteir[ao]\b|te conhecer|meu bem\b|minha princesa|"
+    r"\bte amo\b|\bbunda\b|\bseios?\b|\bcasa comigo|\bnamorar\b", re.I)
+_RX_DIRIGIDO = re.compile(r"\b(voc[eê]|vc|tu|te|tua|sua|contigo|com voc[eê])\b", re.I)
+_DICA_ABUSO = (
+    "[ALERTA: esta mensagem tem conteudo sexual/romantico DIRIGIDO A VOCE (assedio), "
+    "nao pedido de produto. Aplique o §15 caso 6 (encerrado_abuso): na 1a ocorrencia "
+    "redirecione UMA vez para as pecas, sem julgar; se ja houve uma antes, chame "
+    "transferir_para_atendente(motivo='encerrado_abuso'). NUNCA classifique como "
+    "fechamento_venda nem confusao_repetida. Nao mande card.] ")
+
+
+def _detecta_abuso(texto):
+    """True se a mensagem crua e assedio dirigido a Luna (ver camadas acima)."""
+    t = texto or ""
+    if _RX_ABUSO_EXPLICITO.search(t):
+        return True
+    return bool(_RX_ABUSO_ROMANTICO.search(t) and _RX_DIRIGIDO.search(t))
+
+
 def _inclui_unico(tokens_alvo):
     """True se a busca por `tokens_alvo` deve trazer TAMBEM as pecas de tamanho unico.
 
@@ -1541,6 +1574,7 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
                 f"categoria que o cliente pediu. NAO recomende nenhum destes itens como "
                 f"'{cabeca}': use produtos_recomendados = [] e seja honesta (§4). Voce "
                 f"pode PERGUNTAR se ele quer ver outra categoria, mas sem mandar card.")
+            filtro_aplicado["curadoria_ids"] = []          # guard no render: nada e da categoria
             print(f"[CURADORIA] ZERO itens com '{cabeca}' na lista — instrucao de lista vazia")
         elif len(na_cat) <= 2 < len(selecao):
             quais = "; ".join(f"id {p.get('id_produto')} = {(p.get('nome') or '')[:44]}"
@@ -1550,6 +1584,7 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
                 f"nome: {quais}. Recomende SOMENTE esse(s) id(s), e diga ao cliente que e "
                 f"o que voce tem dessa categoria agora. Os outros itens sao de OUTRA "
                 f"categoria: recomendar um deles e erro grave. NAO complete a lista ate 3.")
+            filtro_aplicado["curadoria_ids"] = [str(p.get("id_produto")) for p in na_cat]
             print(f"[CURADORIA] so {len(na_cat)} item(ns) com '{cabeca}' na lista — "
                   f"instrucao dinamica enviada")
 
@@ -2249,6 +2284,15 @@ def criar_tool_transferir(user_id):
             produtos_interesse: nomes/códigos dos produtos mencionados, separados
                                 por vírgula. Vazio se não aplicável.
         """
+        # A5-codigo (Rodada 3): 'fechamento_venda' exige produto. Sem produto E com
+        # assedio na mensagem crua do turno, o motivo certo e encerrado_abuso — na 1a
+        # campanha uma conversa de 78 msgs pedindo "foto da bundinha" foi encaminhada
+        # a atendente como VENDA. O rebaixamento cai no ramo silencioso abaixo.
+        if motivo == "fechamento_venda" and not (produtos_interesse or "").strip() \
+                and _detecta_abuso(getattr(_turn_ctx, "msg_cliente", None)):
+            print(f"🔁 motivo rebaixado: fechamento_venda sem produto + assedio -> encerrado_abuso | {user_id}")
+            motivo = "encerrado_abuso"
+
         # Idempotência: se já houve handoff nos últimos HANDOFF_SILENCIO_MIN minutos
         # para este user, não duplica WhatsApp nem row em conversation_handoffs.
         delta = _ultimo_handoff_em(user_id)
@@ -2674,6 +2718,51 @@ def _coerce_to_dict(obj):
         return str(obj)
     except Exception:
         return None
+
+
+def _curadoria_ids_do_turno(chat_history, n_inicial):
+    """Ids que a tool declarou como 'da categoria' NESTE turno, ou None se nao declarou.
+
+    Le so as partes acrescentadas ao chat depois do historico inicial (`n_inicial`),
+    senao um `curadoria_ids` de uma busca de 3 turnos atras filtraria a recomendacao
+    de agora. Devolve o ULTIMO declarado (a busca mais recente e a que o modelo esta
+    respondendo). None = a tool nao restringiu -> o guard nao age.
+    """
+    ids = None
+    for content in list(chat_history or [])[max(0, int(n_inicial or 0)):]:
+        for part in getattr(content, 'parts', None) or []:
+            fr = getattr(part, 'function_response', None)
+            if not fr or getattr(fr, 'name', None) not in ('consultar_estoque_supabase', 'buscar_por_preco'):
+                continue
+            rd = _coerce_to_dict(getattr(fr, 'response', None)) or {}
+            fa = (rd.get('result') or rd).get('filtro_aplicado') or {}
+            if isinstance(fa.get('curadoria_ids'), list):
+                ids = [str(x) for x in fa['curadoria_ids']]
+    return ids
+
+
+_RX_ID_CARD_RESPONDIDO = re.compile(r"id_produto=(\d+)")
+
+
+def _aplicar_guard_curadoria(ids_recomendados, permitidos, texto_turno):
+    """Descarta de `ids_recomendados` o que a tool disse NAO ser da categoria.
+
+    So age quando `permitidos` nao e None (a tool restringiu). Exceto o id do card que
+    o cliente RESPONDEU neste turno: revalidar/fechar esse item e legitimo mesmo que
+    a busca paralela tenha sido de outra categoria. Medido na 1a campanha e no gate:
+    a instrucao dinamica "recomende SOMENTE esses ids" era ignorada em ~4 de 7
+    rodadas — o modelo completava ate 3 com vizinhos (CONJUNTO RENDA para
+    'fantasia'). Fechar no codigo e deterministico; a §3.9 nao alcanca isto.
+    Devolve (ids_filtrados, descartados).
+    """
+    if permitidos is None:
+        return list(ids_recomendados or []), []
+    isentos = set(_RX_ID_CARD_RESPONDIDO.findall(texto_turno or ""))
+    ok_set = set(str(x) for x in permitidos) | isentos
+    mant, fora = [], []
+    for pid in ids_recomendados or []:
+        (mant if str(pid) in ok_set else fora).append(pid)
+    return mant, fora
 
 
 def extrair_produtos_de_tool_results(chat_history):
@@ -3186,6 +3275,11 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
         if _dica_preco(texto_completo):
             texto_completo = _DICA_PRECO + texto_completo
             print("[A2] dica de preco injetada no turno")
+        # A5-codigo (Rodada 3): assedio dirigido a Luna -> §15 caso 6. Le a msg CRUA
+        # (msg_cliente), nao o texto ja prefixado com dicas.
+        if _detecta_abuso(getattr(_turn_ctx, "msg_cliente", None) or texto_completo):
+            texto_completo = _DICA_ABUSO + texto_completo
+            print("[A5] dica de abuso injetada no turno")
 
         t_inicio = time.perf_counter()
         # Gemini as vezes trava/estoura o deadline (504), sobretudo em turns com cadeia
@@ -3248,6 +3342,14 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
 
         fallback_usado = False
         if json_ok:
+            # Extra 1 (PLANO_CAMPANHA_2, Rodada 3): guard de curadoria no codigo.
+            try:
+                _permitidos = _curadoria_ids_do_turno(chat_history_obj, len(history))
+                ids_recomendados, _fora = _aplicar_guard_curadoria(ids_recomendados, _permitidos, texto_completo)
+                if _fora:
+                    print(f"[CURADORIA-GUARD] descartados por estarem fora da categoria: {_fora} | mantidos={ids_recomendados}")
+            except Exception as _e_g:
+                print(f"[CURADORIA-GUARD] falhou ({_e_g}) — seguindo sem guard")
             modo_efetivo = _modo_preco_efetivo(user_id, modo_preco, texto_completo)
             print(f"✅ JSON parse ok | ids={ids_recomendados} | modo_preco={modo_preco}->{modo_efetivo} | cache_size={len(cache_produtos)}")
             renderizar_mensagem_estruturada(user_id, resposta_limpa, ids_recomendados, cache_produtos, modo_efetivo)
@@ -3284,7 +3386,10 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
         # Degradacao graciosa: NUNCA deixar o cliente sem resposta (nem em bloqueio/timeout).
         _low = str(e).lower()
         if any(k in _low for k in ("block", "prohibited", "safety", "finish_reason", "blocked")):
-            _fallback = "Desculpa, nao consegui processar essa mensagem agora 😅 Pode reformular ou me dizer de outro jeito? Se preferir, ja chamo uma atendente pra te ajudar 💕"
+            # Bloqueio do filtro central do Gemini = conteudo sexual explicito (medido 2x na
+            # 1a campanha: audio pedindo foto "peladinha" e imagem de genital). Oferecer
+            # atendente aqui e a oferta ERRADA; a mensagem e a do §15 caso 6.
+            _fallback = "Por aqui eu ajudo só com as peças da loja 💕 Quando quiser ver algo do catálogo, é só me chamar!"
         else:
             _fallback = "Ops, tive um probleminha tecnico aqui 😅 Pode reenviar sua ultima mensagem, por favor?"
         try:
@@ -4030,6 +4135,12 @@ def health():
         "sync_last_run_utc": last.isoformat() if last else None,
         "sync_age_min": round(age, 1),
         "sync_last_ok": sync_erp.LAST_RUN_OK,
+        # Canario de IA (watchdog, IA_CANARIO_MIN). None = ainda nao checou desde o boot.
+        "ia_ok": _IA_CANARIO["ok"],
+        "ia_latencia_ms": _IA_CANARIO["latencia_ms"],
+        "ia_checada_utc": _IA_CANARIO["at"].isoformat() if _IA_CANARIO["at"] else None,
+        "ia_erro": _IA_CANARIO["erro"],
+        "ia_modelo": _IA_CANARIO["modelo"],
         "sync_last_info": sync_erp.LAST_RUN_INFO,
         "threshold_min": tol,
         # ALARME: >0 persistente em repouso = buffer orfao, o vazamento voltou.
@@ -4075,6 +4186,62 @@ def _disparar_alerta(assunto, corpo):
         except Exception as e:
             print(f"[ALERTA] whatsapp falhou: {e}")
     _enviar_email_alerta(assunto, corpo)
+
+
+# Extra 3 (Rodada 3): canario de IA. O /health so olhava sync e embeddings; em 16/08
+# o teto de gasto do Gemini estourou, TODA cliente recebeu "probleminha tecnico" e o
+# /health seguiu 200 status:ok — nenhum alarme. Roda no WATCHDOG (nao na sonda): o
+# /health e liveness do Railway e devolver 503 aqui reiniciaria o container quando o
+# Gemini caisse, sem resolver nada. 144 chamadas minusculas/dia.
+_IA_CANARIO = {"ok": None, "latencia_ms": None, "at": None, "erro": None, "modelo": None}
+_alert_state_ia = {"alerting": False, "last_alert_at": None}
+IA_CANARIO_MIN = int(os.getenv("IA_CANARIO_MIN", "10"))
+
+
+def _checar_ia():
+    """Uma chamada minima ao modelo de venda. Atualiza _IA_CANARIO; nunca levanta."""
+    t0 = time.perf_counter()
+    try:
+        m = genai.GenerativeModel(GEMINI_MODEL)
+        r = m.generate_content("responda so: ok", request_options={"timeout": 20})
+        ok = bool((getattr(r, "text", "") or "").strip())
+        _IA_CANARIO.update(ok=ok, latencia_ms=int((time.perf_counter() - t0) * 1000),
+                           at=datetime.now(timezone.utc), erro=None if ok else "resposta vazia",
+                           modelo=GEMINI_MODEL)
+    except Exception as e:
+        _IA_CANARIO.update(ok=False, latencia_ms=int((time.perf_counter() - t0) * 1000),
+                           at=datetime.now(timezone.utc), erro=f"{type(e).__name__}: {str(e)[:160]}",
+                           modelo=GEMINI_MODEL)
+    return _IA_CANARIO["ok"]
+
+
+def _verificar_ia_e_alertar():
+    """Watchdog da IA: alerta (cooldown 3h) quando o modelo nao responde; avisa ao normalizar."""
+    try:
+        ok = _checar_ia()
+        now = datetime.now(timezone.utc)
+        if not ok:
+            la = _alert_state_ia["last_alert_at"]
+            if not _alert_state_ia["alerting"] or la is None or (now - la).total_seconds() > 3 * 3600:
+                _disparar_alerta(
+                    "IA do bot Sangali fora do ar",
+                    "O modelo do Gemini nao respondeu ao canario — TODA cliente esta recebendo "
+                    "'probleminha tecnico' agora.\n"
+                    f"Modelo: {GEMINI_MODEL}\nErro: {_IA_CANARIO['erro']}\n"
+                    "Se for 429 'spending cap': https://ai.studio/spend. O /health continua 200; "
+                    "este alarme e o unico sinal.")
+                _alert_state_ia.update(alerting=True, last_alert_at=now)
+                print(f"[WATCHDOG-IA] alerta enviado: {_IA_CANARIO['erro']}")
+            else:
+                print(f"[WATCHDOG-IA] IA fora, alerta em cooldown: {_IA_CANARIO['erro']}")
+        else:
+            if _alert_state_ia["alerting"]:
+                _disparar_alerta("IA do bot Sangali normalizada",
+                                 f"O modelo voltou a responder ({_IA_CANARIO['latencia_ms']} ms).")
+                print("[WATCHDOG-IA] IA normalizada")
+            _alert_state_ia["alerting"] = False
+    except Exception as e:
+        print(f"[WATCHDOG-IA] erro: {e}")
 
 
 def _verificar_sync_e_alertar():
@@ -4165,6 +4332,8 @@ if __name__ == '__main__':
     scheduler.add_job(_job_purge_bot_turns, 'cron', hour=7, minute=0, misfire_grace_time=3600)
     scheduler.add_job(_verificar_sync_e_alertar, 'interval', minutes=15,
                       misfire_grace_time=300, coalesce=True, max_instances=1)
+    scheduler.add_job(_verificar_ia_e_alertar, 'interval', minutes=IA_CANARIO_MIN,
+                      misfire_grace_time=300, next_run_time=datetime.now(timezone.utc))
     scheduler.add_job(_verificar_embeddings_e_alertar, 'interval', minutes=60,
                       misfire_grace_time=600, coalesce=True, max_instances=1)
     scheduler.start()

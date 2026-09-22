@@ -130,7 +130,16 @@ try:
            "U7 instrucao manda NAO descartar (senao o §4 faria o modelo curar fora)",
            instr[:80])
 
-    r56 = bot.consultar_estoque_supabase("camisola", tamanho="56", id_loja=LOJAS)
+    # A sonda era fixa em '56'. Em 22/09 nao havia mais camisola 56 com estoque nas
+    # 2 lojas (so PLUS 50/52) e o teste pulava sem provar nada. Agora usa o PRIMEIRO
+    # tamanho acima do corte de regulagem que exista hoje — o que se testa e "tamanho
+    # acima de 46 nao traz unico", nao o numero 56.
+    r56 = {"status": "vazio"}
+    for _t in ("56", "54", "52", "50", "48"):
+        r56 = bot.consultar_estoque_supabase("camisola", tamanho=_t, id_loja=LOJAS)
+        if r56.get("status") == "sucesso":
+            print(f"  (sonda de tamanho grande: {_t})")
+            break
     if r56.get("status") == "sucesso":
         ps56 = r56.get("produtos") or []
         ok(all(not eh_unico(p.get("tamanho")) for p in ps56),

@@ -291,6 +291,34 @@ Não-regressão (31): handoff 10/10, tamanho 18/0, anti-injeção/atacado-id/deg
 **Modelo:** `GEMINI_MODEL` (env) → `gemini-3.8-flash`; `GEMINI_EMBEDDING_MODEL` (env,
 default ainda 001). Juiz do gate em modelo distinto (`EVAL_JUDGE_MODEL`).
 
+## Modelos — trocas executadas em 22/09
+
+**Chat:** `gemini-3-flash-preview` (hardcoded ×4) → `GEMINI_MODEL` env, default
+`gemini-3.8-flash` (GA). Aceitação 20/20 graves; latência mediana **9,2s** (preview no
+mesmo dia: 13–86s, chamadas travando até 914s). A crônica de fantasia passou no 3.8 (n=1).
+Juiz do gate segue em modelo distinto (`EVAL_JUDGE_MODEL`).
+
+**Embedding:** `gemini-embedding-001` → `gemini-embedding-2` (768 dims, coluna e RPC
+intocadas). Não é toggle: catálogo inteiro re-embedado. Sequência executada:
+backup dos 6.916 vetores (68 MB, fora do git) → cache dos 1.564 textos distintos (todas
+as lojas; o emb-2 tem cota de RPM apertada, 1 job por vez com backoff) → escrita via
+`regenerar_embeddings.py --from-cache` (1.602 pares, **3min12s, 0 erros**, sem API) →
+default em `embedding_text.py` → push → Railway 18:05:47. **Janela de busca degradada:
+~5 min, após as 18h.** Vetores verificados (`cos(velho,novo)≈0,04–0,06`).
+
+Por quê: o KNN do 001 não trazia o `BABY DOLL DE LIGANETE` ao pool para "camisola de
+liganete" (limite do A3); o embedding-2 o coloca em #2/#3. Material (renda, bojo, fio
+duplo) mais preciso. Alerta medido: "enfermeira" puxa itens cirúrgicos (a curadoria barra).
+
+**Recalibração que veio junto (obrigatória em qualquer troca de embedding):** a escala de
+similaridade mudou; com `JANELA_SIMILARIDADE=0,05` só 5/11 campeãs elegíveis eram
+promovidas (001: 9/11). Deltas campeã→topo medidos:
+`[0,02 0,02 0,039 0,039 0,043 0,052 0,052 0,071 0,071 0,085 0,115]` → default **0,08**
+(devolve 9/11; `test_ranking` 10/14 pares com destaque). `test_ranking_comercial` com
+`VETORES_RANKING_ARQ=tests/vetores_ranking_emb2.json` passou. Rollback disponível:
+`restaurar_embeddings.py --backup=migrations/backup/backup_embeddings_001_2026-09-22.json`
++ reverter `2c466dc`/`510e794`.
+
 ## Ordem de execução
 
 | Rodada | Ataques | Natureza | Gate |
