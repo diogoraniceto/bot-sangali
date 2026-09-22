@@ -15,3 +15,6 @@ venv/
 .venv/
 reembed_total.log
 tests/results_*.csv
+
+# Backups de vetores/embeddings (dezenas de MB, repo publico). O .sql de backup da RPC continua rastreado.
+migrations/backup/*.json
