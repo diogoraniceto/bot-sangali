@@ -995,5 +995,105 @@
         "severity": "leve"
       }
     ]
+  },
+  {
+    "id": "preco-liganete-17-50-atacado",
+    "dimension": "preco",
+    "origin": "campanha1",
+    "description": "A2+A3 (PLANO_CAMPANHA_2): mensagem pre-preenchida REAL do anuncio. Existe 10B BABY DOLL DE LIGANETE URDA a R$17,50 atacado. Na 1a campanha a Luna respondeu 'a partir de R$31,50' olhando 8 amostras e descartou o baby doll de liganete pela regra do substantivo. Agora: chama buscar_por_preco, recomenda a peca, nao diz 'a partir de' errado.",
+    "messages": [
+      "É verdade que tem camisolas de liganete por R$17,50 no atacado?"
+    ],
+    "asserts": [
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "Respondeu.",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "tool_chamada",
+        "expect": "Consultou o catalogo por preco em vez de chutar.",
+        "params": "{\"nome\":\"buscar_por_preco\"}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "primeiro_turno_recomenda",
+        "expect": "Mostrou a peca que o anuncio prometeu.",
+        "params": "{\"min\":1}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "recommended_only_in_category",
+        "expect": "So peca de liganete (material pedido conta como categoria — A3).",
+        "params": "{\"categoria\":\"liganete\"}",
+        "severity": "media"
+      },
+      {
+        "checkType": "texto_nao_contem",
+        "expect": "Nao nega nem inventa piso de preco.",
+        "params": "{\"termos\":[\"a partir de r$ 31\",\"a partir de r$31\",\"nao tenho por\",\"nesse valor nao tenho\",\"nao temos por\"]}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "tone_appropriate",
+        "expect": "Confirma com entusiasmo, sem desmentir o anuncio.",
+        "params": "{}",
+        "severity": "leve"
+      }
+    ]
+  },
+  {
+    "id": "preco-baby-doll-25",
+    "dimension": "preco",
+    "origin": "campanha1",
+    "description": "A2: mensagem pre-preenchida REAL do anuncio. Existem baby dolls a R$25,00 varejo. Na 1a campanha: 'Nesse valor exato eu nao tenho nenhum' e 'a partir de R$50'. Agora: buscar_por_preco, mostra, nao nega.",
+    "messages": [
+      "Gostaria de ver baby dolls de R$25,00."
+    ],
+    "asserts": [
+      {
+        "checkType": "sent_at_least_one_message",
+        "expect": "Respondeu.",
+        "params": "{}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "tool_chamada",
+        "expect": "Consultou por preco.",
+        "params": "{\"nome\":\"buscar_por_preco\"}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "primeiro_turno_recomenda",
+        "expect": "Mostrou baby doll no valor.",
+        "params": "{\"min\":1}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "recommended_only_in_category",
+        "expect": "So baby doll.",
+        "params": "{\"categoria\":\"baby doll\"}",
+        "severity": "media"
+      },
+      {
+        "checkType": "texto_nao_contem",
+        "expect": "Nao nega o valor que existe.",
+        "params": "{\"termos\":[\"nesse valor exato\",\"nao tenho nenhum\",\"nao tenho por\",\"a partir de r$ 50\",\"a partir de r$50\",\"a partir de r$ 35\"]}",
+        "severity": "grave"
+      },
+      {
+        "checkType": "no_price_in_free_text",
+        "expect": "Preco no card; texto pode citar o valor que o cliente deu.",
+        "params": "{}",
+        "severity": "leve"
+      },
+      {
+        "checkType": "tone_appropriate",
+        "expect": "Cordial.",
+        "params": "{}",
+        "severity": "leve"
+      }
+    ]
   }
 ]

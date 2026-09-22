@@ -152,6 +152,17 @@ INFANTIL_SO_SE_PEDIR = os.getenv("INFANTIL_SO_SE_PEDIR", "1") not in (
 # numerico abaixo de 33 (medido: 33,35,37,40,42..58), entao "tamanho 10" so pode
 # ser crianca — e um sinal seguro, nao um chute.
 INFANTIL_IDADE_MAX = int(os.getenv("INFANTIL_IDADE_MAX", "16"))
+# A3 (PLANO_CAMPANHA_2): material/modelo que o cliente pediu conta como categoria na
+# curadoria. "camisola de liganete" -> 'BABY DOLL DE LIGANETE URDA' E a peca pedida,
+# e a regra do substantivo-cabeca (CAMISOLA) a descartava — o anuncio prometia
+# liganete a R$17,50 e o bot negava a peca que existia. Allowlist MEDIDA no catalogo
+# vivo (22/09, 660 produtos): ALGODAO 34, RENDA 26, COTTON 16, MALHA 9, POLIAMIDA 5.
+# FORA de proposito: COSTURA (puxaria 'SUTIA SEM COSTURA' para "calcinha sem
+# costura"), marcas (RUCCI, TRIFIL, DULOREN, TALIDU) e DUPLO. Env para ajustar.
+_MATERIAIS_CURADORIA = {m.strip().upper() for m in os.getenv(
+    "CURADORIA_MATERIAIS",
+    "LIGANETE,RENDA,ALGODAO,COTTON,MALHA,POLIAMIDA,MICROFIBRA,MICRO,LYCRA,SUEDE,TULE,CETIM,SEDA"
+).split(",") if m.strip()}
 # [BLOQUEADO §10.3 item 6] No ATACADO, o revendedor ve primeiro os campeoes de
 # venda ("campeao", default) ou os de grade mais funda ("grade")? Em "grade" a
 # profundidade reordena DENTRO de cada tier — o escopo de categoria (tier) e
@@ -526,6 +537,35 @@ def _cliente_quer_infantil(termo_cliente, tokens_tamanho=None):
         if str(t).isdigit() and int(t) <= INFANTIL_IDADE_MAX:
             return True
     return False
+
+
+# ---- A3: material/modelo pedido pelo cliente conta como categoria ----------
+def _qualificadores_material(termo):
+    """Tokens do termo do cliente que sao material/modelo da allowlist, normalizados.
+
+    'camisola de liganete' -> ['LIGANETE']; 'calcinha sem costura' -> [] (COSTURA
+    esta fora da lista de proposito). So a allowlist qualifica: aceitar qualquer
+    token traria de volta o vizinho de categoria que a curadoria existe para barrar.
+    """
+    toks = re.findall(r"[A-Z]{4,}", _norm_txt(termo))
+    return [t for t in toks if t in _MATERIAIS_CURADORIA]
+
+
+# ---- A2: dica dinamica quando o cliente cita PRECO ------------------------
+_RX_PRECO = re.compile(
+    r"R\$\s?\d|\d+\s?(?:reais|conto|pila)\b|\bmais barat|\bat[eé]\s+\d|\bpor\s+\d+[,.]?\d*\s*(?:reais|$)",
+    re.I)
+_DICA_PRECO = (
+    "[cliente citou PRECO/VALOR: antes de afirmar QUALQUER coisa sobre preco ('a partir "
+    "de', 'nao tenho por', 'o mais barato e', 'nesse valor nao tenho'), chame "
+    "buscar_por_preco com o termo e o valor que ele citou. Se ele falou em atacado/"
+    "revenda, modo='atacado'. A resposta traz `menor_preco`: use-o para falar de 'a "
+    "partir de'.] ")
+
+
+def _dica_preco(texto):
+    """True se a mensagem cita valor em R$ / reais / 'mais barato' / 'ate X'."""
+    return bool(_RX_PRECO.search(texto or ""))
 
 
 def _inclui_unico(tokens_alvo):
@@ -1465,8 +1505,15 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
         if len(p_up) > 2:
             cabeca = p_up[:-1] if (p_up.endswith("S") and len(p_up) > 3) else p_up
             break
+    quals = _qualificadores_material(termo_cliente)   # A3: material pedido conta
+
+    def _eh_da_categoria(p):
+        n = (p.get("nome") or "").upper()
+        return cabeca in n or any(q in _norm_txt(n) for q in quals)
+
+    rotulo_cat = cabeca + ("/" + "/".join(quals) if quals else "")
     if cabeca and selecao:
-        na_cat = [p for p in selecao if cabeca in (p.get("nome") or "").upper()]
+        na_cat = [p for p in selecao if _eh_da_categoria(p)]
         if not na_cat:
             # O caso PIOR, e o que mais falhava: a lista veio cheia e NENHUM item e da
             # categoria. Acontece muito com filtro de tamanho — a unica fantasia da
@@ -1474,7 +1521,7 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
             # por "fantasia M" devolve 8 itens, zero fantasias. Sem esta instrucao o
             # modelo recomenda os vizinhos (medido: SEX SHOP, BABY DOLL INFANTIL).
             filtro_aplicado["instrucao_curadoria"] = (
-                f"NENHUM item desta lista tem '{cabeca}' no nome — a busca nao achou a "
+                f"NENHUM item desta lista tem '{rotulo_cat}' no nome — a busca nao achou a "
                 f"categoria que o cliente pediu. NAO recomende nenhum destes itens como "
                 f"'{cabeca}': use produtos_recomendados = [] e seja honesta (§4). Voce "
                 f"pode PERGUNTAR se ele quer ver outra categoria, mas sem mandar card.")
@@ -1483,7 +1530,7 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
             quais = "; ".join(f"id {p.get('id_produto')} = {(p.get('nome') or '')[:44]}"
                               for p in na_cat)
             filtro_aplicado["instrucao_curadoria"] = (
-                f"De todos os itens desta lista, apenas {len(na_cat)} tem '{cabeca}' no "
+                f"De todos os itens desta lista, apenas {len(na_cat)} tem '{rotulo_cat}' no "
                 f"nome: {quais}. Recomende SOMENTE esse(s) id(s), e diga ao cliente que e "
                 f"o que voce tem dessa categoria agora. Os outros itens sao de OUTRA "
                 f"categoria: recomendar um deles e erro grave. NAO complete a lista ate 3.")
@@ -1501,6 +1548,140 @@ def consultar_estoque_supabase(termo_cliente: str, tamanho: str = None, id_loja:
             "produtos": selecao}
 
 # ================= FERRAMENTAS DE CONSULTA DETERMINÍSTICA =================
+
+_STOP_TERMO_PRECO = {"PARA", "COM", "SEM", "DE", "DA", "DO", "EM", "NO", "NA", "UMA", "UM",
+                     "QUERO", "VER", "TEM", "POR", "ATE", "REAIS", "ATACADO", "VAREJO",
+                     "REVENDA", "REVENDER", "PRECO", "VALOR", "MAIS", "BARATO", "BARATA"}
+
+
+def buscar_por_preco(termo: str, preco_max: float, modo: str = "varejo",
+                     id_loja: str = "244033,94134"):
+    """Lista os produtos do termo que custam ATÉ `preco_max`, do mais barato ao mais caro.
+
+    Use SEMPRE que o cliente citar um valor ("tem por R$25?", "camisola de liganete a
+    R$17,50 no atacado?", "qual a mais barata?", "até 30 reais"). É a ÚNICA fonte
+    confiável para falar de preço: a busca semântica devolve 8 amostras por
+    similaridade, não o catálogo, e concluir "a partir de R$X" ou "não tenho por R$X"
+    a partir dela já fez a Luna negar produto que existia e desmentir o anúncio.
+
+    Args:
+        termo: o que o cliente quer (categoria e/ou material). Ex: "camisola liganete",
+               "baby doll", "calcinha renda".
+        preco_max: valor máximo em reais que o cliente citou. Ex: 25 ou 17.5.
+        modo: "varejo" (padrão) ou "atacado" — se o cliente falou em atacado/revenda,
+              use "atacado" (compara com o preço de atacado à vista).
+        id_loja: "244033,94134" (as duas unidades). Não omita.
+
+    Retorna `produtos` (mesmo formato da busca semântica — pode ir direto em
+    `produtos_recomendados`), `menor_preco` (o preço real mais baixo do termo nas lojas,
+    para você poder dizer "a partir de R$X" com verdade) e `filtro_aplicado`.
+    Se `status` for "vazio", NÃO existe item do termo até esse valor: diga isso e ofereça
+    o mais próximo com `consultar_estoque_supabase`.
+    """
+    modo_n = (modo or "varejo").strip().lower()
+    col = "preco_atacado" if modo_n.startswith("atacad") else "preco_varejo"
+    try:
+        pmax = float(str(preco_max).replace(",", "."))
+    except (TypeError, ValueError):
+        return {"status": "erro", "msg": f"preco_max invalido: {preco_max!r}"}
+    lojas = [x for x in re.sub(r"\s+", "", str(id_loja or "244033,94134")).split(",") if x]
+    toks = [t for t in re.findall(r"[A-Z0-9]{3,}", _norm_txt(termo))
+            if t not in _STOP_TERMO_PRECO]
+    print(f"[PRECO] termo={toks} ate R${pmax:.2f} coluna={col} lojas={lojas}")
+    try:
+        # Sem ilike de proposito: ilike e cego a acento ('ALGODAO' nao casa 'ALGODÃO',
+        # 'SUTIA' nao casa 'SUTIÃ'). Loja + estoque + preco ja reduzem a poucas centenas
+        # de linhas; os tokens sao filtrados aqui, normalizados dos dois lados.
+        rows = (supabase.table("produtos_estoque")
+                .select("id_unico, id_produto, nome, tamanho, preco, preco_varejo, "
+                        "preco_atacado, estoque")
+                .in_("id_loja", lojas).gt("estoque", 0).lte(col, pmax)
+                .order(col, desc=False).limit(1000).execute().data or [])
+    except Exception as e:
+        print(f"❌ Erro buscar_por_preco: {e}")
+        return {"status": "erro", "msg": "Erro ao consultar precos."}
+    # Material presente ("camisola liganete") -> o MATERIAL e obrigatorio e o
+    # substantivo vira preferencia de ordem, nao filtro. Exigir os dois derrubava o
+    # '10B BABY DOLL DE LIGANETE URDA' (R$17,50) porque ele nao se chama camisola —
+    # a mesma rigidez do substantivo que o A3 existe para quebrar, reproduzida
+    # dentro do A2 (pego por test_rodada2 Q4 em 22/09). Sem material, todos os tokens.
+    quals = [q for q in _qualificadores_material(termo) if q in toks]
+    obrig = quals if quals else toks
+    prefer = [t for t in toks if t not in obrig]
+    cand = [r for r in rows if all(t in _norm_txt(r.get("nome")) for t in obrig)]
+    if prefer:   # estavel: quem tem o substantivo vem antes, dentro do mesmo preco crescente
+        cand.sort(key=lambda r: 0 if all(t in _norm_txt(r.get("nome")) for t in prefer) else 1)
+    # Mesma politica de publico da busca semantica: infantil so se o cliente pediu.
+    if INFANTIL_SO_SE_PEDIR and not _cliente_quer_infantil(termo, None):
+        cand = [r for r in cand if not _produto_infantil(r.get("nome"))]
+    # 1 linha por produto, ficando com a mais barata (rows ja vem ordenado por `col`).
+    por_pid = {}
+    for r in cand:
+        por_pid.setdefault(str(r["id_produto"]), r)
+    sel = list(por_pid.values())[:LIMITE_PRODUTOS]
+    # Menor preco REAL do termo nas lojas (sem o teto), para "a partir de" verdadeiro.
+    menor = None
+    try:
+        base = (supabase.table("produtos_estoque").select("nome," + col)
+                .in_("id_loja", lojas).gt("estoque", 0).order(col, desc=False)
+                .limit(1000).execute().data or [])
+        for r in base:
+            if all(t in _norm_txt(r.get("nome")) for t in obrig) and \
+               (not INFANTIL_SO_SE_PEDIR or _cliente_quer_infantil(termo, None)
+                or not _produto_infantil(r.get("nome"))):
+                menor = float(r[col]); break
+    except Exception as e:
+        print(f"[PRECO] menor_preco indisponivel: {e}")
+    filtro = {"termo_tokens": toks, "preco_max": pmax, "modo": modo_n, "coluna": col,
+              "id_loja": ",".join(lojas), "n_ate_o_teto": len(por_pid)}
+    if not sel:
+        return {"status": "vazio", "filtro_aplicado": filtro, "menor_preco": menor,
+                "msg": (f"Nenhum produto com {' '.join(toks) or termo} ate R${pmax:.2f} "
+                        f"({col}). " + (f"O mais barato desse termo custa R${menor:.2f}."
+                                        if menor is not None else
+                                        "Nao ha item desse termo com estoque."))}
+    # Fotos: mesmo join da busca semantica (id ASC = principal).
+    try:
+        ids = [p["id_produto"] for p in sel]
+        imgs = (supabase.table("produtos_imagens")
+                .select("produto_id, imagem_url, imagem_mini_url")
+                .in_("produto_id", ids).order("id", desc=False).execute().data or [])
+        mapa = {}
+        for img in imgs:
+            url = img.get("imagem_url") or img.get("imagem_mini_url")
+            if url:
+                lst = mapa.setdefault(str(img["produto_id"]), [])
+                if url not in lst:
+                    lst.append(url)
+    except Exception as e:
+        print(f"[PRECO] leitura de produtos_imagens falhou: {str(e)[:100]}")
+        mapa = {}
+    produtos = []
+    for r in sel:
+        fotos = mapa.get(str(r["id_produto"])) or []
+        produtos.append({
+            "id_unico": r.get("id_unico"), "id_produto": r.get("id_produto"),
+            "nome": r.get("nome"), "tamanho": r.get("tamanho"),
+            # `preco` = VAREJO: o card em modo atacado calcula varejo*(1-desconto),
+            # exatamente como a busca semantica. 25,00*0,70 = 17,50 bate com o banco.
+            "preco": float(r.get("preco_varejo") or r.get("preco") or 0),
+            "preco_varejo": float(r.get("preco_varejo") or 0),
+            "preco_atacado": float(r.get("preco_atacado") or 0),
+            "estoque": r.get("estoque"),
+            "imagem": fotos[0] if fotos else None, "n_fotos": len(fotos),
+            "tem_foto": bool(fotos), "destaque": False,
+        })
+    print(f"[PRECO] {len(produtos)} produto(s) ate R${pmax:.2f} | menor_preco={menor}")
+    return {"status": "sucesso", "filtro_aplicado": filtro, "menor_preco": menor,
+            "instrucao_preco": (
+                f"Esta lista tem TODOS os itens de '{' '.join(toks) or termo}' ate "
+                f"R${pmax:.2f} ({'atacado' if col == 'preco_atacado' else 'varejo'}), do "
+                f"mais barato ao mais caro. O menor preco desse termo nas lojas e "
+                f"R${menor:.2f}. Use esses numeros; nao invente 'a partir de'."
+                if menor is not None else
+                f"Esta lista tem TODOS os itens ate R${pmax:.2f}."),
+            "produtos": produtos}
+
 
 def consultar_produto_por_id(id_produto: int):
     """
@@ -2496,13 +2677,14 @@ def extrair_produtos_de_tool_results(chat_history):
             # `mostrar_fotos_produto` fica FORA desta tupla de propósito: se o pid dela
             # entrasse no cache e o modelo o listasse em `produtos_recomendados`, o
             # renderizador reenviaria o CARD com a foto principal — foto duplicada.
-            if tool_name not in ('consultar_estoque_supabase', 'consultar_produto_por_id'):
+            if tool_name not in ('consultar_estoque_supabase', 'buscar_por_preco',
+                                 'consultar_produto_por_id'):
                 continue
             response_dict = _coerce_to_dict(getattr(fr, 'response', None))
             if not response_dict:
                 continue
             payload = response_dict.get('result') or response_dict
-            if tool_name == 'consultar_estoque_supabase':
+            if tool_name in ('consultar_estoque_supabase', 'buscar_por_preco'):
                 for prod in payload.get('produtos', []) or []:
                     pid = prod.get('id_produto')
                     try:
@@ -2916,6 +3098,7 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
 
         _tools = [
             consultar_estoque_supabase,
+            buscar_por_preco,
             consultar_produto_por_id,
             calcular_total,
             verificar_promocao_hoje,
@@ -2980,6 +3163,13 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
         if _dica_abertura_atacado(texto_completo, _ja_vistos):
             texto_completo = _DICA_ABERTURA_ATACADO + texto_completo
             print("[A1] dica de abertura de atacado injetada no turno")
+        # A2 (PLANO_CAMPANHA_2): cliente citou valor -> forca buscar_por_preco antes de
+        # qualquer afirmacao de preco. Medido na 1a campanha: 11 "a partir de R$" e 4
+        # negacoes de valor, todos olhando 8 amostras da busca semantica; o anuncio
+        # dizia R$17,50 e existia, e a Luna respondeu "a partir de R$31,50".
+        if _dica_preco(texto_completo):
+            texto_completo = _DICA_PRECO + texto_completo
+            print("[A2] dica de preco injetada no turno")
 
         t_inicio = time.perf_counter()
         # Gemini as vezes trava/estoura o deadline (504), sobretudo em turns com cadeia

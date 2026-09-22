@@ -87,7 +87,7 @@ def _reset_capture():
 _PRICE_RE = re.compile(r"R\$\s*\d|\b\d{1,3}(?:\.\d{3})*,\d{2}\b")
 _PRICE_VAL_RE = re.compile(r"R\$\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)|\b(\d{1,3}(?:\.\d{3})*,\d{2})\b")
 _CARD_RE = re.compile(r"c[óo]d:\s*\d+", re.IGNORECASE)
-SEARCH_TOOLS = ("consultar_estoque_supabase", "consultar_produto_por_id")
+SEARCH_TOOLS = ("consultar_estoque_supabase", "consultar_produto_por_id", "buscar_por_preco")
 
 # Valores monetarios que PODEM aparecer em texto livre mesmo sem calcular_total:
 # a politica de minimo do atacado (primeira compra R$600, proximas R$400 —
@@ -472,6 +472,21 @@ def check_modo_preco_primeiro_turno(tc, params):
     return ("pass" if ok else "fail"), f"{len(legendas)} cards, atacado na legenda={not ok} (modo cru={cru})"
 
 
+def check_tool_chamada(tc, params):
+    """A tool `nome` foi chamada em algum turno do cenario (A2: buscar_por_preco).
+
+    Sem isto o A2 seria infalsificavel: a Luna poderia acertar o preco por sorte ou
+    calar sobre ele. O check exige o CAMINHO certo, nao so o resultado.
+    """
+    nome = (params or {}).get("nome")
+    if not nome:
+        return "skipped", "sem params.nome"
+    chamadas = [c["name"] for c in tc.get("calls") or []]
+    if nome in chamadas:
+        return "pass", f"{nome} chamada {chamadas.count(nome)}x"
+    return "fail", f"{nome} NAO chamada; tools={chamadas}"
+
+
 def check_recommended_empty_when_no_search(tc, params):
     if tc["searched"]:
         return "pass", "houve busca no cenario (criterio nao se aplica)"
@@ -787,6 +802,8 @@ CHECKS = {
     "primeiro_turno_recomenda": check_primeiro_turno_recomenda,
     "texto_nao_contem": check_texto_nao_contem,
     "modo_preco_primeiro_turno": check_modo_preco_primeiro_turno,
+    # PLANO_CAMPANHA_2 / Rodada 2
+    "tool_chamada": check_tool_chamada,
 }
 
 JUDGE_CHECKS = {
@@ -818,6 +835,7 @@ SEVERITY = {
     "primeiro_turno_recomenda": "grave",
     "texto_nao_contem": "media",
     "modo_preco_primeiro_turno": "media",
+    "tool_chamada": "grave",
     # F2: os dois sao GRAVES — falso "nao tenho" e afirmacao sobre tamanho sem base
     # sao exatamente o defeito P3 (cliente desiste da compra).
     "tool_nao_retornou_vazio": "grave",
