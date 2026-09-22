@@ -21,6 +21,14 @@ FLAGS
                     (order by id_produto, nome), entao --skip retoma exatamente
                     de onde a execucao anterior morreu.
     --limit=N       processa no maximo N pares depois do skip.
+    --from-cache=F  NAO chama a API: le {texto: vetor} de um JSON gerado antes (ex.:
+                    pela comparacao de qualidade) e so GRAVA. Encolhe a janela de
+                    busca degradada de ~40 min (API sequencial + pausas) para o
+                    tempo dos updates. Texto sem vetor no cache e contado como erro
+                    e pulado — nunca cai para a API em silencio, senao a base
+                    ficaria com dois modelos misturados sem ninguem saber.
+                    O vetor do cache TEM de ter DIM_EMBEDDING dims; qualquer outro
+                    e recusado (a coluna e vector(768)).
 
 RESTRICOES DURAS (nao "simplifique" isto)
   * A escrita e `update` com dict UNICO, filtrada por (id_produto, nome).
@@ -80,10 +88,20 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 _cache_embedding = {}
 
 
+_FROM_CACHE = None   # dict texto->vetor quando --from-cache=F; None = usa a API
+
+
 def gerar_embedding(texto):
     """Gera embedding do texto canonico. Retorna None em falha (o chamador conta o erro)."""
     if texto in _cache_embedding:
         return _cache_embedding[texto]
+    if _FROM_CACHE is not None:
+        v = _FROM_CACHE.get(texto)
+        if v is None or len(v) != DIM_EMBEDDING:
+            print(f"  ❌ cache sem vetor valido para o texto ({'ausente' if v is None else f'{len(v)} dims'})")
+            return None
+        _cache_embedding[texto] = v
+        return v
     try:
         result = genai.embed_content(
             model=MODELO_EMBEDDING,
@@ -150,6 +168,13 @@ def carregar_pares(only_missing):
 def main():
     only_missing = "--only-missing" in sys.argv
     dry_run = "--dry-run" in sys.argv
+    global _FROM_CACHE
+    for a in sys.argv:
+        if a.startswith("--from-cache="):
+            import json as _json
+            with open(a.split("=", 1)[1], encoding="utf-8") as fh:
+                _FROM_CACHE = _json.load(fh)
+            print(f"[i] --from-cache: {len(_FROM_CACHE)} textos com vetor | modelo declarado no env: {MODELO_EMBEDDING}")
     skip = _arg_int("--skip=", 0)
     limite = _arg_int("--limit=", 0)
 
