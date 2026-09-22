@@ -579,6 +579,26 @@ def check_tool_nao_retornou_vazio(tc, params):
                     f"COM tamanho voltaram produtos")
 
 
+def _tamanho_dos_recomendados(tc):
+    """{id_produto: tamanho} dos itens recomendados, lido dos objetos JSON do digest.
+
+    Casa objeto a objeto ({...} sem chaves aninhadas) para nao misturar o 'tamanho'
+    de um item com o 'id_produto' do vizinho. Digest truncado -> id fica '?'."""
+    rec = {int(x) for x in tc["produtos_recomendados"] if str(x).isdigit()}
+    out = {}
+    for r in tc["responses"]:
+        if r["name"] not in SEARCH_TOOLS:
+            continue
+        for obj in re.finditer(r'\{[^{}]*"id_produto"\s*:\s*"?(\d+)"?[^{}]*\}', r.get("result_digest") or ""):
+            pid = int(obj.group(1))
+            if pid in rec:
+                m = re.search(r'"tamanho"\s*:\s*"([^"]*)"', obj.group(0))
+                out[pid] = m.group(1) if m else "?"
+    for pid in rec:
+        out.setdefault(pid, "?")
+    return out
+
+
 def check_nao_nega_estoque_sem_base(tc, params):
     """Frente 2 (juiz): a Luna nao pode negar/afirmar tamanho contra o que a tool disse."""
     resumo = []
@@ -593,15 +613,23 @@ def check_nao_nega_estoque_sem_base(tc, params):
                        "filtro_aplicado.tamanho": m_filtro.group(1) if m_filtro else "?",
                        "tamanhos dos itens": sorted(set(tams_itens))})
     pedidos = [(c["args"] or {}).get("tamanho") for c, _ in _buscas_com_tamanho(tc)]
-    fatos = f"tamanhos passados a tool={pedidos}; retornos da busca={resumo}"
+    # §3.11: o juiz precisa saber o tamanho dos itens que o CLIENTE RECEBEU (cards),
+    # nao so o conjunto de tamanhos que a tool devolveu. Sem isso ele reprovava
+    # "separei opcoes no tamanho M" quando os 3 cards eram M puro e um item P/M
+    # NAO recomendado estava na lista (22/09, 2x seguidas, gate pos-flip + aceitacao R3).
+    rec_tam = _tamanho_dos_recomendados(tc)
+    fatos = (f"tamanhos passados a tool={pedidos}; retornos da busca={resumo}; "
+             f"tamanho de CADA item que a Luna RECOMENDOU (cards enviados ao cliente)={rec_tam}")
     rubrica = ("Julgue o texto da Luna contra o que a FERRAMENTA devolveu. 'fail' se ela "
                "(1) afirmou que nao tem no tamanho pedido embora a ferramenta tenha "
                "retornado produtos; ou (2) afirmou algo sobre um tamanho diferente do que "
-               "consta em filtro_aplicado.tamanho; ou (3) disse que um item e do tamanho X "
-               "quando o campo 'tamanho' daquele item e COMPOSTO ('P/M','G/GG'). "
-               "Oferecer outro tamanho como alternativa, PERGUNTAR o tamanho, ou dizer que "
-               "vai verificar NAO e violacao. Se a ferramenta voltou vazia de fato, dizer "
-               "que nao tem e correto -> 'pass'.")
+               "consta em filtro_aplicado.tamanho; ou (3) disse que um item que ela "
+               "RECOMENDOU (ou citou pelo nome) e do tamanho X quando o campo 'tamanho' "
+               "DESSE item e COMPOSTO ('P/M','G/GG'). Itens compostos que a ferramenta "
+               "devolveu mas a Luna NAO recomendou nem citou NAO contam: julgue o que o "
+               "cliente recebeu. Oferecer outro tamanho como alternativa, PERGUNTAR o "
+               "tamanho, ou dizer que vai verificar NAO e violacao. Se a ferramenta voltou "
+               "vazia de fato, dizer que nao tem e correto -> 'pass'.")
     return _judge(rubrica, tc["cliente_hist"], _all_bot_text(tc), fatos)
 
 

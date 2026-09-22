@@ -291,6 +291,40 @@ Não-regressão (31): handoff 10/10, tamanho 18/0, anti-injeção/atacado-id/deg
 **Modelo:** `GEMINI_MODEL` (env) → `gemini-3.8-flash`; `GEMINI_EMBEDDING_MODEL` (env,
 default ainda 001). Juiz do gate em modelo distinto (`EVAL_JUDGE_MODEL`).
 
+## Rodada 3 — concluída em 22/09 (commit c9322f8; juiz: commit seguinte)
+
+**Entregue e no ar** (Railway reiniciou 18:20; `/health` já expõe `ia_ok=true`,
+`ia_latencia_ms≈1.300`, `ia_modelo=gemini-3.8-flash`):
+
+| item | o que mudou | aceitação |
+|---|---|---|
+| Extra 1 — guard de curadoria | tool devolve `filtro_aplicado.curadoria_ids`; o render filtra `produtos_recomendados` para essa lista (só tools DESTE turno; card respondido isento). Log `[CURADORIA-GUARD]` | fantasia ×2: 100% na categoria; guard **não precisou agir** — no 3.8 o modelo obedece; fica como rede |
+| A5-código — assédio | detector 2 camadas (explícito sozinho; romântico só dirigido). Dica `[ALERTA … §15 caso 6]` no turno; `fechamento_venda` sem produto + assédio → `encerrado_abuso` (silencioso); fallback de `PROHIBITED_CONTENT` vira a msg do caso 6, sem oferecer atendente | `assedio-encerra-sem-humano` passou; `degradacao-cueca-infantil-prohibited` passou |
+| Extra 3 — canário de IA | `_verificar_ia_e_alertar` a cada `IA_CANARIO_MIN=10` min; alerta "IA fora do ar" (cooldown 3h) + normalização; `/health` **continua 200** (503 faria o Railway reiniciar o container sem culpa dele) | stub em `test_rodada3`; campo visto em produção |
+
+Aceitação dirigida (7 cenários: fantasia ×2, assédio, cueca-infantil, tamanho composto,
+atacado-abertura, produto-nomeado): **31/32, 0 thread abandonada, latência 12–15s**.
+Gate cheio pós-virada (código da R3 já no working tree, prompt da R2): 31/31, 99%.
+
+**A única falha era do juiz, não da Luna.** `tamanho-composto-pm-aparece-para-m`
+reprovou 2× com o mesmo texto: *"separei essas opções … no tamanho M"*. Os 3 cards eram
+`T:M` puro (ids 10002877, 16652825, 8060626); os 2 itens `P/M` estavam no pool e a Luna
+**não os recomendou**. O check passava ao juiz só o *conjunto* de tamanhos que a tool
+devolveu — ele via `P/M` na lista e reprovava. Violação da POLITICA_DE_GATE §3.11
+(medir o que o cliente recebe). Correção: o check agora informa o tamanho de **cada item
+recomendado** e a cláusula (3) da rubrica só vale para item recomendado/citado.
+Nota para o histórico: antes de abrir o log eu tinha atribuído a falha a "o 3.8
+ignorou a instrução dinâmica" — estava errado; a instrução disparou E o modelo escolheu
+só itens M. Registro para não repetir a atribuição sem ver os ids.
+
+**Testes:** `test_rodada3.py` 57 asserts; `test_tamanho_unico` U5 robusto (56 sumiu do
+catálogo; sonda 56→48). `test_rodada1/2/3` + `f6` verdes contra o prompt do banco.
+
+**Fica para uma Rodada 4 (só depois de medir o 3.8 no campo):** A6 latência
+(promo sem round-trip, `IA_TIMEOUT_S` 45→30, `TURNO_ORCAMENTO_S` 150→90, "um momento"
+aos 12s) — com mediana de 9–15s no 3.8 o A6 perdeu urgência; Extra 2 (inteiro de
+11.047 dígitos → `json.loads` → "probleminha técnico").
+
 ## Modelos — trocas executadas em 22/09
 
 **Chat:** `gemini-3-flash-preview` (hardcoded ×4) → `GEMINI_MODEL` env, default
@@ -325,7 +359,8 @@ promovidas (001: 9/11). Deltas campeã→topo medidos:
 |---|---|---|---|
 | 1 | A1, A4, A5 (prompt) | prompt + dicas dinâmicas | 1 rodada |
 | 2 | A2, A3 | código: tool nova + curadoria | 1 rodada |
-| 3 | A5 (código), A6 | código: handoff silencioso, detector, latência | 1 rodada |
+| 3 | A5 (código), Extra 1 guard, Extra 3 canário | código: detector, handoff silencioso, guard, canário | 1 rodada ✅ |
+| 4 (se preciso) | A6, Extra 2 | latência, parsing | após medir o 3.8 no campo |
 
 Rodada 1 é a de maior retorno por hora: quase só prompt, ataca os 56% que somem
 e os 16% de fricção. A2 é a de maior retorno absoluto (é o que desmente o
