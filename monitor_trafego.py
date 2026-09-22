@@ -49,7 +49,7 @@ def canario_ia():
     try:
         import google.generativeai as genai
         genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-        m = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-3-flash-preview"))
+        m = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-3.8-flash"))
         t0 = time.time()
         r = m.generate_content("responda so: ok")
         return True, f"{(r.text or '').strip()[:12]} ({time.time()-t0:.1f}s)"

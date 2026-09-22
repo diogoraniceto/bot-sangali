@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import google.generativeai as genai
+from embedding_text import MODELO_EMBEDDING, DIM_EMBEDDING  # fonte unica do vetor
 
 # Safety relaxado: dominio lingerie/sexshop gera falso-positivo no filtro padrao.
 # (block_reason=PROHIBITED_CONTENT e filtro central NAO configuravel aqui -> tratado
@@ -152,6 +153,13 @@ INFANTIL_SO_SE_PEDIR = os.getenv("INFANTIL_SO_SE_PEDIR", "1") not in (
 # numerico abaixo de 33 (medido: 33,35,37,40,42..58), entao "tamanho 10" so pode
 # ser crianca — e um sinal seguro, nao um chute.
 INFANTIL_IDADE_MAX = int(os.getenv("INFANTIL_IDADE_MAX", "16"))
+# Modelo do Gemini para venda e multimodal. Era o 3-flash-preview HARDCODED em 4
+# lugares — trocar de modelo exigia deploy, e um preview que o Google descontinue
+# derrubaria o bot sem chave para virar. Knob de env: troca/rollback sem deploy.
+# 22/09: 'gemini-3.8-flash' (GA) a pedido do dono; canario ok em function calling
+# automatico, response_schema e os dois juntos. O juiz do gate fica em OUTRO modelo
+# (EVAL_JUDGE_MODEL) de proposito, para nao se auto-avaliar.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 # A3 (PLANO_CAMPANHA_2): material/modelo que o cliente pediu conta como categoria na
 # curadoria. "camisola de liganete" -> 'BABY DOLL DE LIGANETE URDA' E a peca pedida,
 # e a regra do substantivo-cabeca (CAMISOLA) a descartava — o anuncio prometia
@@ -699,11 +707,13 @@ def _avisar_cliente(user_id, texto):
 def get_embedding(text):
     """Gera o vetor semântico para a busca no banco."""
     try:
+        # Modelo e dimensao vem da FONTE UNICA (embedding_text) — o mesmo que o sync
+        # usa para gravar. Consulta e indexacao com modelos diferentes = busca cega.
         result = genai.embed_content(
-            model="models/gemini-embedding-001",
+            model=MODELO_EMBEDDING,
             content=text,
             task_type="retrieval_query",
-            output_dimensionality=768,
+            output_dimensionality=DIM_EMBEDDING,
             request_options={"timeout": 30}
         )
         return result['embedding']
@@ -3116,7 +3126,7 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
         # Tenta com response_schema; se a versão do SDK / modelo recusar
         # generation_config + tools, recria sem schema (cai no fallback regex).
         modelo_args = dict(
-            model_name='gemini-3-flash-preview',
+            model_name=GEMINI_MODEL,
             tools=_tools,
             system_instruction=system_instruction_dinamica,
             safety_settings=SAFETY_SETTINGS,
@@ -3246,7 +3256,7 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
             tool_calls=tool_calls_serializados,
             final_output=resposta_texto,
             latency_ms=latencia_ms,
-            model_name='gemini-3-flash-preview',
+            model_name=GEMINI_MODEL,
             output_format=("json" if json_ok else "text"),
             fallback_used=fallback_usado,
             tokens_in=tokens_in_count,
@@ -3289,7 +3299,7 @@ def _executar_turno(user_id, texto_completo, fotos_pendentes=None):
                 tool_calls=[],
                 final_output=_fallback,
                 latency_ms=0,
-                model_name='gemini-3-flash-preview',
+                model_name=GEMINI_MODEL,
                 output_format="error",
                 fallback_used=False,
                 error=str(e),
@@ -3349,7 +3359,7 @@ def _cloud_send_template(numero, nome_template, params, lang="pt_BR"):
 
 # ---- Midia RECEBIDA do cliente (audio/imagem): download + Gemini (multimodal) ----
 _CLOUD_MEDIA_MAX_BYTES = 16 * 1024 * 1024   # teto de midia da Cloud API
-MODEL_MULTIMODAL = "gemini-3-flash-preview"  # mesmo modelo do pipeline de venda
+MODEL_MULTIMODAL = os.getenv("GEMINI_MODEL_MULTIMODAL", GEMINI_MODEL)  # mesmo da venda, salvo override
 
 
 def _cloud_baixar_midia(media_id):

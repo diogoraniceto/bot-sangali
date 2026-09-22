@@ -34,7 +34,14 @@ por aqui — nao reescreva a regra no chamador.
 
 # Modelo e dimensao usados na ESCRITA do vetor (produtos_estoque.embedding e
 # vector(768), e o indice HNSW produtos_estoque_embedding_idx depende disso).
-MODELO_EMBEDDING = "models/gemini-embedding-001"
+# Knob de env (22/09). O DEFAULT continua 001: trocar o modelo de embedding exige
+# re-embedar o catalogo inteiro com o modelo novo — vetor de consulta de um modelo
+# contra vetor armazenado de outro e ruido, e a busca devolveria produto errado
+# com confianca. A virada e coordenada: `regenerar_embeddings.py` com o modelo novo
+# e, em seguida, o env em producao. DIM fica 768 (a coluna e vector(768) e o HNSW
+# depende disso); o embedding-2 aceita output_dimensionality=768.
+import os as _os
+MODELO_EMBEDDING = _os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
 DIM_EMBEDDING = 768
 
 
