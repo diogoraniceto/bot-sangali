@@ -132,6 +132,17 @@ ok("| 6 | `encerrado_abuso` |" in P, "R6 A5 §15: linha do caso 6")
 ok("NÃO acorda a atendente" in P, "R6 A5 §15: caso 6 diz que nao acorda humano")
 ok("NUNCA é fechamento de venda" in P, "R6 A5 §15: assedio nunca vira fechamento_venda")
 ok("VOCÊ NÃO CALCULA TOTAL DE CABEÇA. NUNCA." in P, "R6 §9 original preservado abaixo do 9.0")
+# Achado na aceitacao de 22/09: A1 mostrou os 3 conjuntos certos mas com modo_preco
+# 'varejo'. O §0 dizia "atacado_avista quando esta comprando a vista (pix)" e "em
+# duvida, varejo" — para um lead que so perguntou "vendem atacado?" isso e duvida,
+# e o §0 (contrato, lido primeiro) vencia o §9.0. A duvida legitima e a vista x
+# prazo, nunca atacado x varejo.
+ok("JÁ NA PRIMEIRA resposta com cards, mesmo que ele ainda não tenha dito como vai pagar" in P,
+   "R6 A1 §0: modo_preco atacado ja na 1a resposta, sem esperar forma de pagamento")
+ok("Em dúvida, use `\"varejo\"`" not in P,
+   "R6 A1 §0: a cautela 'em duvida, varejo' SAIU (era o que derrubava o §9.0)")
+ok("NUNCA resolva \"atacado ou varejo?\" a favor do varejo" in P,
+   "R6 A1 §0: a duvida legitima e a vista x prazo, nao atacado x varejo")
 ok("Se for LINGERIE/PIJAMA e faltar tamanho → perguntar." not in P,
    "R6 A4: a regra antiga de porta de tamanho SAIU (nao pode coexistir)")
 
