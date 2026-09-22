@@ -174,6 +174,28 @@ O gate #3 teve 26× 504, 15× `DeadlineExceeded`, 13 retries e — o que mata �
 
 E reportar sempre `graves X/Y` com o Y explícito: "44/44 com 4 pulados" e "46/48" não são comparáveis, e o primeiro parece melhor.
 
+
+### 3.11. Um check mede o que o CLIENTE recebe, não um campo intermediário
+
+Caso de 22/09 (Rodada 1 do PLANO_CAMPANHA_2). O check `modo_preco_primeiro_turno`
+lia o `modo_preco` cru do JSON do modelo e acusou, em duas rodadas seguidas, que a
+abertura de atacado saiu em `varejo`. Era falso para o cliente: `_modo_preco_efetivo`
+(bot.py) detecta "atacado" no texto e promove para `atacado_avista` na renderização
+— log `modo_preco=varejo->atacado_avista` — e os 3 cards chegaram ao WhatsApp com
+"💵 Atacado à vista: R$X/un". Gastei uma correção de prompt e duas medições atrás
+de um defeito que não existia na camada que importa.
+
+Regra: quando existe transformação entre o que o modelo emite e o que é enviado
+(resolvedor, guard, renderizador, fallback), o check lê a **saída enviada**
+(`messages_sent`, `media_sent[].caption`) e só cai para o campo cru quando não há
+saída — e diz isso na `info`. Medir o campo cru é medir a intenção do modelo, não o
+comportamento do bot; os dois divergem justamente onde o código está fazendo o seu
+trabalho.
+
+Corolário para ler resultado: uma "falha" num check que lê campo intermediário
+exige confirmar na saída real antes de virar correção. Se a saída está certa, o
+defeito é do check.
+
 ## 4. Pendências desta política — NÃO ESQUECER
 
 Levantadas junto com este documento e ainda **não implementadas**:
