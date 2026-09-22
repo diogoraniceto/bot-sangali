@@ -224,6 +224,41 @@ Gate: latência p90 por cenário.
 
 ---
 
+## Rodada 1 — concluída em 22/09 (commits 5825e9a…44257fe)
+
+**Entregue e no ar** (prompt em `bot_settings`, código via Railway):
+
+| ataque | aceitação (cenário novo) | medições válidas | resultado |
+|---|---|---|---|
+| A1 | `atacado-abertura-mostra-produto` | 2/2 | 3 conjuntos em atacado na 1ª resposta; mínimo em 1 frase; sem condições de pagamento |
+| A4 | `abertura-nao-pede-nome` | 1/1 | saudação sem "com quem eu falo?" |
+| A4 | `produto-nomeado-mostra-antes` | 2/2 | 3 baby dolls na 1ª resposta, tamanho perguntado junto |
+| A5 | `assedio-encerra-sem-humano` | 1/1 | 2ª ocorrência → `encerrado_abuso`, atendente **não** avisada, sem "vou chamar" |
+
+Não-regressão (29 cenários): handoff 10/10, happy-path 17/0, foto 16/0, preco
+limpo. Graves restantes: curadoria crônica de fantasia (alvo do A3) e o falso
+positivo do juiz em `tamanho-guard` (nomes `…RENDA` × `…RENDA GG`, documentado
+em 16/09 e 22/09). Rodada contaminada por lentidão do Gemini (16 threads
+abandonadas), mas em `preco`/`happy-path` virou latência, não skip.
+
+**Aprendido, e que muda o plano:**
+- `_modo_preco_efetivo` (bot.py) já promove `varejo→atacado_avista` quando o
+  texto do cliente fala de atacado. O modelo devolve `varejo` no JSON e o
+  cliente vê preço de atacado mesmo assim. O check de gate passou a ler a
+  **legenda do card** (POLITICA_DE_GATE §3.11). Não há defeito aqui.
+- Regra genérica em prompt de novo não bastou sozinha para o A1: a dica dinâmica
+  `[ABERTURA DE ATACADO …]` foi o que fez a 1ª resposta trazer card (§3.9).
+- Cada tool call custa ~4s de Gemini; turnos com busca levaram 23–86s na
+  aceitação. A6 continua necessário.
+
+**Puxado da Rodada 3 para a 1:** o ramo silencioso do handoff (`MOTIVOS_SILENCIOSOS`)
+— sem ele o caso 6 do §15 continuaria acordando a atendente.
+
+**Fica para a Rodada 3 (A5-código):** detector Python de assédio na mensagem crua
+→ dica dinâmica; guarda que rebaixa `fechamento_venda` sem produto para
+`encerrado_abuso`; mensagem própria para `PROHIBITED_CONTENT`. Hoje o modelo
+acertou o motivo sozinho no cenário; em produção a taxa precisa ser medida.
+
 ## Ordem de execução
 
 | Rodada | Ataques | Natureza | Gate |
