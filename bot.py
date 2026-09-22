@@ -123,7 +123,13 @@ ANCORA_SEMANTICA = int(os.getenv("ANCORA_SEMANTICA", "2"))
 # Janela absoluta de cosseno para um campeao de venda ser promovido. Medido na
 # base: a distancia do melhor campeao DA CATEGORIA ao topo fica em 0,0000-0,0316
 # nos 14 pares termo x loja; 0,05 cobre todos com folga.
-JANELA_SIMILARIDADE = float(os.getenv("JANELA_SIMILARIDADE", "0.05"))
+# Recalibrada em 22/09 com a virada para gemini-embedding-2: a escala de similaridade
+# mudou e 0,05 passou a promover 5 de 11 campeas elegiveis (no 001 eram 9/11). Medido
+# par a par nos 14 (termo, loja) do test_ranking: deltas campea->topo
+# [0.02, 0.02, 0.039, 0.039, 0.043, 0.052, 0.052, 0.071, 0.071, 0.085, 0.115];
+# 0,08 devolve os mesmos 9/11 de antes — mesma politica comercial na nova escala.
+# Continua env: se a loja quiser mais/menos campea no topo, ajusta sem deploy.
+JANELA_SIMILARIDADE = float(os.getenv("JANELA_SIMILARIDADE", "0.08"))
 # Grade minima (soma de estoque do produto na loja) para promover um campeao.
 # [BLOQUEADO §10.3 item 5] 3 e escolha, nao medida — por isso e env, nao codigo.
 RANKING_MINIMO_GRADE = float(os.getenv("RANKING_MINIMO_GRADE", "3"))
