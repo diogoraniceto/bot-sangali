@@ -259,6 +259,38 @@ abandonadas), mas em `preco`/`happy-path` virou latência, não skip.
 `encerrado_abuso`; mensagem própria para `PROHIBITED_CONTENT`. Hoje o modelo
 acertou o motivo sozinho no cenário; em produção a taxa precisa ser medida.
 
+## Rodada 2 — concluída em 22/09 (commits 45bbf71, 8e598c2, 1c7d5c7)
+
+**Entregue e no ar:**
+
+| ataque | aceitação (cenário novo, msg REAL do anúncio) | resultado |
+|---|---|---|
+| A2 | `preco-liganete-17-50-atacado` | `buscar_por_preco` chamada; 3 cards com `BABY DOLL DE URDA LIGANETE`; *"É verdade sim! Temos modelos em liganete a partir de R$ 17,5"* (13s) |
+| A2 | `preco-baby-doll-25` | tool chamada; 2 cards (`10B BABY DOLL DE LIGANETE URDA`); *"Encontrei opções ótimas nesse valor!"* |
+| A3 | `curadoria-fantasia-off-category` | 3 fantasias, 100% na categoria |
+| A3 | `curadoria-fora-categoria-fantasia` | **crônica continua** (6 ids, depois 1 fora) — instrução dinâmica dispara e o modelo ignora; termo sem material, allowlist não entra |
+
+Não-regressão (31): handoff 10/10, tamanho 18/0, anti-injeção/atacado-id/degradação
+100%. Únicas falhas fora dos novos: as 2 crônicas (fantasia, photo_transparency).
+
+**Aprendido:**
+- `ilike` é cego a acento (ALGODAO≠ALGODÃO, SUTIA≠SUTIÃ): a tool filtra tokens em
+  Python, normalizados dos dois lados.
+- "camisola liganete" exige o **material** e trata o substantivo como preferência —
+  exigir os dois derrubava a peça do anúncio (test_rodada2 Q4).
+- **Limite do A3**: em M nas 2 lojas a única liganete é o baby doll, e o KNN do
+  `embedding-001` não o traz ao pool de 60 para "camisola de liganete" —
+  `palavras_chave` já tem LIGANETE, é o ranking. Medido: o **`gemini-embedding-2`
+  coloca `BABY DOLL DE LIGANETE` em #2/#3** para o mesmo termo. A virada de embedding
+  (em preparação) resolve o lado semântico que a Rodada 2 declarou fora de escopo.
+- A desobediência de curadoria em fantasia apareceu em 4 de 7 medições hoje — mais
+  que o ~1/3 estimado. Instrução dinâmica não basta: **guard no código** (filtrar
+  `produtos_recomendados` para os ids que a tool apontou) é o fechamento; proposto,
+  aguardando decisão.
+
+**Modelo:** `GEMINI_MODEL` (env) → `gemini-3.8-flash`; `GEMINI_EMBEDDING_MODEL` (env,
+default ainda 001). Juiz do gate em modelo distinto (`EVAL_JUDGE_MODEL`).
+
 ## Ordem de execução
 
 | Rodada | Ataques | Natureza | Gate |
