@@ -41,7 +41,7 @@ por aqui — nao reescreva a regra no chamador.
 # e, em seguida, o env em producao. DIM fica 768 (a coluna e vector(768) e o HNSW
 # depende disso); o embedding-2 aceita output_dimensionality=768.
 import os as _os
-MODELO_EMBEDDING = _os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
+MODELO_EMBEDDING = _os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-2")
 DIM_EMBEDDING = 768
 
 
