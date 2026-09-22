@@ -440,17 +440,36 @@ def check_texto_nao_contem(tc, params):
 
 
 def check_modo_preco_primeiro_turno(tc, params):
-    """`modo_preco` da PRIMEIRA resposta e o esperado (A1: atacado_avista)."""
+    """O preco que o CLIENTE VIU nos cards da 1a resposta e o do modo esperado.
+
+    Le a LEGENDA dos cards (`media_sent[].caption`), nao o `modo_preco` cru do JSON
+    do modelo. Motivo, medido em 22/09: o modelo devolveu 'varejo' 2 de 2 vezes na
+    abertura de atacado, mas `_modo_preco_efetivo` (bot.py) detecta "atacado" no
+    texto do cliente e promove para atacado_avista na renderizacao — o cliente viu
+    "💵 Atacado a vista: R$X/un". O check antigo lia o campo cru e acusou uma falha
+    que nao chegava ao WhatsApp. Aqui vale o que o cliente recebe.
+    Sem card no turno 1, cai para o campo cru (unico sinal disponivel) e diz isso.
+    """
     t = _turno(tc, 1)
     if t is None:
         return "skipped", "sem turno 1 capturado"
     esperado = (params or {}).get("valor")
     if not esperado:
         return "skipped", "sem params.valor"
-    got = t.get("modo_preco")
-    if got == esperado:
-        return "pass", f"modo_preco={got}"
-    return "fail", f"modo_preco={got!r}, esperado {esperado!r}"
+    legendas = [_norm(m.get("caption") or "") for m in (t.get("media_sent") or [])]
+    cru = t.get("modo_preco")
+    if not legendas:
+        if cru == esperado:
+            return "pass", f"sem card no turno 1; modo_preco cru={cru}"
+        return "fail", f"sem card no turno 1; modo_preco cru={cru!r}, esperado {esperado!r}"
+    marca = {"atacado_avista": "atacadoavista", "atacado_aprazo": "atacadoparcelado"}.get(esperado)
+    if marca:
+        ok = all(marca in l for l in legendas)
+        det = f"{sum(marca in l for l in legendas)}/{len(legendas)} cards com '{esperado}' na legenda (modo cru do modelo={cru})"
+        return ("pass" if ok else "fail"), det
+    # esperado == varejo: nenhuma legenda pode trazer preco de atacado
+    ok = not any("atacado" in l for l in legendas)
+    return ("pass" if ok else "fail"), f"{len(legendas)} cards, atacado na legenda={not ok} (modo cru={cru})"
 
 
 def check_recommended_empty_when_no_search(tc, params):
